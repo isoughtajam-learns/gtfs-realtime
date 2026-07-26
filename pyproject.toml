@@ -1,0 +1,22 @@
+[project]
+name = "gtfs-realtime"
+version = "0.1.0"
+description = "Python server implementation using gRPC to retrieve and stream realtime transit data using GTFS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.139.2",
+    "grpcio",
+    "grpcio-tools",
+    "gtfs-realtime-bindings",
+    "psycopg2>=2.9.12",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.0.51",
+    "sse-starlette>=3.4.6",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[tool.mypy]
+plugins = ["pydantic.mypy"]
+strict = true
+ignore_missing_imports = true
