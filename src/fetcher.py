@@ -13,6 +13,7 @@ import shutil
 import zipfile
 from datetime import datetime, date
 from pathlib import Path
+from typing import List
 
 import requests
 
@@ -46,6 +47,10 @@ class Fetcher:
 
     def should_update(self) -> bool:
         files_exist = os.path.isfile(self.real_file(TRIPS_FILE)) and os.path.isfile(self.tmp_file(STOPS_FILE))
+        metadata_exists = os.path.isfile(self.tmp_file(METADATA_FILE))
+        if not metadata_exists:
+            print(f"No feed_info.txt file found for GTFS Schedule - {self.transit_system}")
+            return False
         with open(f"{self.tmp_dir()}{METADATA_FILE}", mode= "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -55,33 +60,46 @@ class Fetcher:
                     return True
         return False
 
-    def update_metadata(self, file_name: str) -> None:
+    def update_metadata(self, file_names: List[str]) -> None:
         if not os.path.isdir(self.real_dir()):
             os.makedirs(self.real_dir())
-        tmp_file = Path(f"{self.tmp_file(file_name)}")
-        real_file = Path(f"{self.real_file(file_name)}")
-        tmp_file.rename(real_file)
+        for file_name in file_names:
+            tmp_file = Path(f"{self.tmp_file(file_name)}")
+            real_file = Path(f"{self.real_file(file_name)}")
+            tmp_file.rename(real_file)
 
     def push_updated_metadata_file(self) -> None:
         with open(self.real_file(UPDATED_METADATA_FILE), "w") as f:
             f.write(datetime.today().strftime("%Y%m%d"))
+
+    def updated_recently(self):
+        updated_metadata_file = self.real_file(UPDATED_METADATA_FILE)
+        updated_file_exists = os.path.isfile(updated_metadata_file)
+        if updated_file_exists:
+            with open(updated_metadata_file, "r") as f:
+                line = f.readline()
+                if datetime.today().strftime("%Y%m%d") in line:
+                    return True
+        return False
 
     def remove_tmp(self) -> None:
         if os.path.isdir(self.tmp_dir()):
             shutil.rmtree(Path(self.tmp_dir()))
 
     def fetch_metadata_update(self) -> None:
+        if self.updated_recently():
+            return
+
         response = requests.get(self.url)
-        # Extract contents directly in memory
         if response.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                 z.extractall(f"{TMP_DIR}{self.transit_system}")
+
         if not self.should_update():
             print(f"No updates needed from GTFS Schedule data - {self.transit_system}")
             return
 
-        self.update_metadata(TRIPS_FILE)
-        self.update_metadata(STOPS_FILE)
+        self.update_metadata([TRIPS_FILE, STOPS_FILE])
         self.push_updated_metadata_file()
         self.remove_tmp()
 
