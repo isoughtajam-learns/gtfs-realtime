@@ -10,20 +10,30 @@ def get_location(stop_times) -> SimplePosition | None:
             prev = next
             continue
 
+        should_publish = False
         if prev.departure.time < datetime.now().timestamp() < next.arrival.time:
-            return SimplePosition(
-                stop_id=next.stop_id,
-                last_arrival=prev.departure.time,
-                next_arrival=next.arrival.time,
-                status=Status.IN_TRANSIT
-            )
+            before = prev.departure.time
+            after = next.arrival.time
+            status = Status.IN_TRANSIT
+            should_publish = True
+            if prev.departure.time > datetime.now().timestamp():
+                print("Departure too late")
+                import pdb
+                pdb.set_trace()
 
-        elif next.arrival.time < datetime.now().timestamp() < next.departure.time:
+        elif prev.arrival.time < datetime.now().timestamp() < next.departure.time:
+            before = prev.arrival.time
+            after = next.departure.time
+            status = Status.AT_STOP
+            should_publish = True
+
+
+        if should_publish:
             return SimplePosition(
                 stop_id=next.stop_id,
-                last_arrival=next.arrival.time,
-                next_arrival=next.departure.time,
-                status=Status.AT_STOP,
+                last_arrival=before,
+                next_arrival=after,
+                status=status,
             )
         prev = next
     return None

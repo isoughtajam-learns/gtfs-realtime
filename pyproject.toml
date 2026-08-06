@@ -5,6 +5,7 @@ description = "Python server implementation using gRPC to retrieve and stream re
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.18.5",
     "fastapi[standard]>=0.139.2",
     "grpcio",
     "grpcio-tools",

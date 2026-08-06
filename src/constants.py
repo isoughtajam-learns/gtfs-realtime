@@ -10,5 +10,6 @@ GTFS_METADATA = {
     "Provence-Alpes": "https://www.data.gouv.fr/api/1/datasets/r/0a554ecc-a9b7-490c-a4ad-bbd8a0dc0ded",
 }
 
-
-
+DEFAULT_SCHEDULE_URL_BY_SYSTEM = {
+    "BART": "https://www.bart.gov/schedules",
+}
