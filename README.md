@@ -19,7 +19,7 @@ python -m grpc_tools.protoc -I./protos --python_out=generated/ --pyi_out=generat
 ```
 # Run the server
 ```
-uv run fastapi dev
+uv run uvicorn src.main:app
 ```
 
 ## Usage
@@ -85,7 +85,7 @@ This repository includes a `docker-compose.yml` to run the entire backend cluste
 
 To start everything up:
 ```bash
-docker compose up
+docker compose up --build
 ```
 
 ### Container Dependencies and Startup
