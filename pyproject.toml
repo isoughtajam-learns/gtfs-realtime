@@ -6,11 +6,14 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.18.5",
+    "celery>=5.4.0",
     "fastapi[standard]>=0.139.2",
     "grpcio",
     "grpcio-tools",
     "gtfs-realtime-bindings",
     "psycopg2>=2.9.12",
+    "psycopg2-binary",
+    "redis>=5.2.1",
     "requests>=2.34.2",
     "sqlalchemy>=2.0.51",
     "sse-starlette>=3.4.6",

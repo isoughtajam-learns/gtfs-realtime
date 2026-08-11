@@ -4,10 +4,17 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
+from src.settings import get_settings
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+section = config.config_ini_section
+config_section = config.get_section(section)
+injected_env_url = get_settings().database_url
+print(f"post-injection sqlalchemy.url {injected_env_url}")
+config.set_section_option(section, "sqlalchemy.url", injected_env_url)
+
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

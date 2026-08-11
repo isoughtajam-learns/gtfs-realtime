@@ -5,6 +5,7 @@ Current scope:
 trips.txt for trip_id and headsign
 stops.txt for stop_id and stop_name
 """
+import argparse
 import csv
 import io
 import os
@@ -19,9 +20,9 @@ import requests
 from sqlalchemy import select, Connection
 from sqlalchemy.dialects.postgresql import insert
 
-from database import engine
-from constants import GTFS_URLS, GTFS_METADATA, DEFAULT_SCHEDULE_URL_BY_SYSTEM
-from models import TransitSystem, Trip, Stop, Route
+from src.database import engine
+from src.constants import GTFS_URLS, GTFS_METADATA, DEFAULT_SCHEDULE_URL_BY_SYSTEM
+from src.models import TransitSystem, Trip, Stop, Route
 
 
 TMP_DIR = "src/tmp/"
@@ -98,16 +99,19 @@ class Fetcher:
         if os.path.isdir(self.tmp_dir()):
             shutil.rmtree(Path(self.tmp_dir()))
 
-    def fetch_metadata_update(self) -> None:
-        if self.updated_recently():
+    def fetch_metadata_update(self, force: bool = False) -> None:
+        if not force and self.updated_recently():
             return
+
+        if force:
+            self.remove_tmp()
 
         response = requests.get(self.url)
         if response.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                 z.extractall(f"{TMP_DIR}{self.transit_system}")
 
-        if not self.should_update():
+        if not force and not self.should_update():
             print(f"No updates needed from GTFS Schedule data - {self.transit_system}")
             return
 
@@ -202,23 +206,67 @@ class Fetcher:
         )
         connection.execute(upsert_stmt)
 
+    def _build_stop_headsigns_by_trip(self) -> dict[str, str]:
+        """One-pass over stop_times.txt: earliest-stop_sequence non-empty stop_headsign per trip."""
+        headsign_by_trip: dict[str, str] = {}
+        min_seq_by_trip: dict[str, int] = {}
+        with open(self.real_file(STOP_TIMES_FILE), "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trip_id = row.get("trip_id")
+                headsign = row.get("stop_headsign")
+                if not trip_id or not headsign:
+                    continue
+                try:
+                    seq = int(row.get("stop_sequence", "0"))
+                except (TypeError, ValueError):
+                    continue
+                if seq < min_seq_by_trip.get(trip_id, float("inf")):
+                    min_seq_by_trip[trip_id] = seq
+                    headsign_by_trip[trip_id] = headsign
+        return headsign_by_trip
+
+    def _build_route_long_names(self) -> dict[str, str]:
+        long_name_by_route: dict[str, str] = {}
+        with open(self.real_file(ROUTES_FILE), "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                route_id = row.get("route_id")
+                long_name = row.get("route_long_name")
+                if route_id and long_name:
+                    long_name_by_route[route_id] = long_name
+        return long_name_by_route
+
     def upsert_trips(self, connection: Connection) -> None:
         rows_to_write = []
         transit_system_id = self.select_transit_system(connection)
+        stop_headsigns_by_trip = self._build_stop_headsigns_by_trip()
+        route_long_names = self._build_route_long_names()
 
         with open(self.real_file(TRIPS_FILE), "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 trip_id = row.get("trip_id")
-                name = row.get("trip_headsign")
                 route_id = row.get("route_id")
-                if not trip_id or not name:
+                if not trip_id:
                     continue
+                name = (
+                    row.get("trip_headsign")
+                    or stop_headsigns_by_trip.get(trip_id)
+                    or route_long_names.get(route_id)
+                    or None
+                )
+                direction_raw = row.get("direction_id")
+                try:
+                    direction_id = int(direction_raw) if direction_raw else None
+                except (TypeError, ValueError):
+                    direction_id = None
                 rows_to_write.append({
-                    "trip_id": int(trip_id),
+                    "trip_id": trip_id,
                     "transit_system_id": transit_system_id,
                     "name": name,
-                    "route_id": int(route_id),
+                    "route_id": route_id,
+                    "direction_id": direction_id,
                 })
         if not rows_to_write:
             return
@@ -227,6 +275,7 @@ class Fetcher:
             constraint="uq_trip",
             set_=dict(
                 name=insert_stmt.excluded.name,
+                direction_id=insert_stmt.excluded.direction_id,
             ),
         )
         connection.execute(upsert_stmt)
@@ -240,6 +289,7 @@ class Fetcher:
             for row in reader:
                 trip_stops[row.get('stop_id')] = {
                     "trip_id": row.get('trip_id'),
+                    "stop_headsign": row.get('stop_headsign') or None,
                 }
         with open(self.real_file(STOPS_FILE), "r") as f:
             reader = csv.DictReader(f)
@@ -264,7 +314,8 @@ class Fetcher:
             transit_system_id=transit_system_id,
             trip_id=v.get("trip_id"),
             name=v.get("name"),
-            zone_id=v.get("zone_id")
+            zone_id=v.get("zone_id"),
+            stop_headsign=v.get("stop_headsign"),
         ) for k, v in trip_stops.items() if all([
             v.get("trip_id"),
             v.get("name"),
@@ -276,12 +327,23 @@ class Fetcher:
             constraint="uq_transit_stop_id",
             set_=dict(
                 name=insert_stmt.excluded.name,
+                stop_headsign=insert_stmt.excluded.stop_headsign,
             ),
         )
         connection.execute(upsert_stmt)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Fetch GTFS Schedule data and upsert it into the database."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run do_upserts() even if local schedule data is not stale.",
+    )
+    args = parser.parse_args()
+
     # Example usage with BART
     fetcher = Fetcher("http://www.bart.gov/dev/schedules/google_transit.zip", "BART")
-    fetcher.fetch_metadata_update()
+    fetcher.fetch_metadata_update(force=args.force)

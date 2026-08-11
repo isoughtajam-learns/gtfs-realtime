@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local env override (use committed .env._dev / .env.dev_docker / .env.prod)
+.env
+
 # IDE
 .idea/*
 src/tmp/

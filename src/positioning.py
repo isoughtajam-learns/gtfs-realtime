@@ -1,39 +1,45 @@
 from datetime import datetime
 
+from generated import gtfs_realtime_pb2
 from src.models import SimplePosition, Status
+
+StopTimeEvent = gtfs_realtime_pb2.TripUpdate.StopTimeEvent
+
+
+def _event_time(event: StopTimeEvent | None) -> int | None:
+    if event is not None and event.HasField("time"):
+        return event.time
+    return None
 
 
 def get_location(stop_times) -> SimplePosition | None:
+    now = datetime.now().timestamp()
     prev = None
-    for next in stop_times:
-        if not prev:
-            prev = next
-            continue
+    for stop in stop_times:
+        arrival = _event_time(stop.arrival if stop.HasField("arrival") else None)
+        departure = _event_time(stop.departure if stop.HasField("departure") else None)
 
-        should_publish = False
-        if prev.departure.time < datetime.now().timestamp() < next.arrival.time:
-            before = prev.departure.time
-            after = next.arrival.time
-            status = Status.IN_TRANSIT
-            should_publish = True
-            if prev.departure.time > datetime.now().timestamp():
-                print("Departure too late")
-                import pdb
-                pdb.set_trace()
-
-        elif prev.arrival.time < datetime.now().timestamp() < next.departure.time:
-            before = prev.arrival.time
-            after = next.departure.time
-            status = Status.AT_STOP
-            should_publish = True
-
-
-        if should_publish:
+        if arrival is not None and departure is not None and arrival < now < departure:
             return SimplePosition(
-                stop_id=next.stop_id,
-                last_arrival=before,
-                next_arrival=after,
-                status=status,
+                stop_id=stop.stop_id,
+                previous=arrival,
+                next=departure,
+                status=Status.AT_STOP,
             )
-        prev = next
+        if prev is not None:
+            prev_departure = _event_time(
+                prev.departure if prev.HasField("departure") else None
+            )
+            if (
+                prev_departure is not None
+                and arrival is not None
+                and prev_departure < now < arrival
+            ):
+                return SimplePosition(
+                    stop_id=stop.stop_id,
+                    previous=prev_departure,
+                    next=arrival,
+                    status=Status.IN_TRANSIT,
+                )
+        prev = stop
     return None
