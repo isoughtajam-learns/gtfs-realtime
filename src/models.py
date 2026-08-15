@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import StrEnum
 from typing import Optional
 
@@ -39,6 +40,12 @@ class TransitSystem(ORMBase):
     name: Mapped[str] = mapped_column(unique=True)
     realtime_url: Mapped[str]
     schedule_url: Mapped[Optional[str]]
+    # Set by fetcher.py on every successful fetch attempt. Durable (DB-backed)
+    # daily-fetch gate - the fetcher's local file-based checks live in the
+    # celery-worker container's ephemeral filesystem and get wiped on every
+    # restart/redeploy, so they can't be trusted to prevent repeat fetches
+    # across container churn. This column can.
+    last_fetched_at: Mapped[Optional[datetime]]
     __table_args__ = (
         UniqueConstraint('name', name='uq_name'),
     )
@@ -89,25 +96,3 @@ class Stop(ORMBase):
     __table_args__ = (
         UniqueConstraint('stop_id', 'transit_system_id', name='uq_transit_stop_id'),
     )
-
-
-# class StaticTransitFeed(ORMBase):
-#     """
-#     Static fields used by transit feed, allowing a single query to hydrate feed events
-#     """
-#     __tablename__ = "static_transit_feed"
-#     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-#     transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
-#     trip_id: Mapped[int] = mapped_column(primary_key=True)
-#     trip_headsign: Mapped[str]
-#     stop_id: Mapped[int]
-#     stop_name: Mapped[str]
-#     route_id: Mapped[str]
-#     route_color: Mapped[str]
-#     route_text_color: Mapped[str]
-#     __table_args__ = (
-#         UniqueConstraint(
-#             'transit_system_id', 'trip_id', 'route_id',
-#             name='uq_transit_log_natural_key',
-#         ),
-#     )

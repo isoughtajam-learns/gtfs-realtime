@@ -16,3 +16,10 @@ wheels/
 .idea/*
 src/tmp/
 src/metadata/
+
+# Terraform local state/cache - contains secrets (RDS password, app secret key), never commit
+deployment/.terraform/
+deployment/*.tfstate
+deployment/*.tfstate.*
+deployment/tfplan*
+deployment/*.tfvars

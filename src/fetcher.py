@@ -9,6 +9,7 @@ import argparse
 import csv
 import io
 import os
+import re
 import shutil
 import zipfile
 from collections import defaultdict
@@ -21,7 +22,8 @@ from sqlalchemy import select, Connection
 from sqlalchemy.dialects.postgresql import insert
 
 from src.database import engine
-from src.constants import GTFS_URLS, GTFS_METADATA, DEFAULT_SCHEDULE_URL_BY_SYSTEM
+from src.constants import GTFS_URLS, GTFS_METADATA, \
+    DEFAULT_SCHEDULE_URL_BY_SYSTEM, DISALLOWED_CHARS_PATTERN
 from src.models import TransitSystem, Trip, Stop, Route
 
 
@@ -34,6 +36,24 @@ STOP_TIMES_FILE = "stop_times.txt"
 ROUTES_FILE = "routes.txt"
 METADATA_FILE_LIST = [TRIPS_FILE, STOPS_FILE, STOP_TIMES_FILE, ROUTES_FILE]
 UPDATED_METADATA_FILE = "updated_metadata.txt"
+
+# Upsert rows in fixed-size batches rather than one statement per file, so a
+# single very large source (more stops/trips/routes than this) can't build
+# one enormous SQL statement or hold the whole insert payload at once.
+UPSERT_BATCH_SIZE = 2000
+
+
+def _upsert_batched(connection: Connection, table, rows: list[dict], constraint: str, update_columns: list[str]) -> int:
+    total = 0
+    for start in range(0, len(rows), UPSERT_BATCH_SIZE):
+        batch = rows[start:start + UPSERT_BATCH_SIZE]
+        insert_stmt = insert(table).values(batch)
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            constraint=constraint,
+            set_={col: getattr(insert_stmt.excluded, col) for col in update_columns},
+        )
+        total += connection.execute(upsert_stmt).rowcount
+    return total
 
 
 class Fetcher:
@@ -95,18 +115,30 @@ class Fetcher:
                     return True
         return False
 
+    def fetched_today(self) -> bool:
+        """DB-backed daily gate. `updated_recently()` above lives in the
+        container's ephemeral filesystem and gets wiped on every
+        restart/redeploy, so it can't reliably prevent repeat fetches across
+        container churn - this checks TransitSystem.last_fetched_at instead,
+        which survives restarts."""
+        with engine.begin() as connection:
+            last_fetched_at = connection.execute(
+                select(TransitSystem.last_fetched_at).where(TransitSystem.name == self.transit_system)
+            ).scalar()
+        return last_fetched_at is not None and last_fetched_at.date() == datetime.utcnow().date()
+
     def remove_tmp(self) -> None:
         if os.path.isdir(self.tmp_dir()):
             shutil.rmtree(Path(self.tmp_dir()))
 
     def fetch_metadata_update(self, force: bool = False) -> None:
-        if not force and self.updated_recently():
+        if not force and (self.fetched_today() or self.updated_recently()):
             return
 
         if force:
             self.remove_tmp()
 
-        response = requests.get(self.url)
+        response = requests.get(self.url, timeout=60)
         if response.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                 z.extractall(f"{TMP_DIR}{self.transit_system}")
@@ -137,8 +169,14 @@ class Fetcher:
         with engine.begin() as connection:
             try:
                 self.upsert_transit_system(connection)
-                self.upsert_trips(connection)
-                self.upsert_stops(connection)
+                # stop_times.txt is by far the largest GTFS file (one row per
+                # stop visit per trip) - scan it once and share the result,
+                # rather than upsert_trips and upsert_stops each parsing it
+                # independently. Reading it twice is what exhausted memory on
+                # large sources (e.g. Helsinki) on a small instance.
+                headsign_by_trip, stop_meta = self._scan_stop_times()
+                self.upsert_trips(connection, headsign_by_trip)
+                self.upsert_stops(connection, stop_meta)
                 self.upsert_routes(connection)
             except Exception as ex:
                 print(f"Error: {ex}")
@@ -152,14 +190,17 @@ class Fetcher:
             name=self.transit_system,
             realtime_url=realtime_url,
             schedule_url=schedule_url,
+            last_fetched_at=datetime.utcnow(),
         )
         upsert_stmt = stmt.on_conflict_do_update(
             constraint="uq_name",
             set_=dict(
                 realtime_url=stmt.excluded.realtime_url,
-                schedule_url=stmt.excluded.schedule_url),
+                schedule_url=stmt.excluded.schedule_url,
+                last_fetched_at=stmt.excluded.last_fetched_at),
         )
-        connection.execute(upsert_stmt)
+        result = connection.execute(upsert_stmt)
+        print(f"upsert transit system result: {result.keys()}")
 
     def upsert_routes(self, connection: Connection) -> None:
         transit_system_id = self.select_transit_system(connection)
@@ -193,38 +234,47 @@ class Fetcher:
                 })
         if not routes:
             return
-        insert_stmt = insert(Route).values(routes)
-        upsert_stmt = insert_stmt.on_conflict_do_update(
-            constraint="uq_short_name",
-            set_=dict(
-                short_name=insert_stmt.excluded.short_name,
-                long_name=insert_stmt.excluded.long_name,
-                url=insert_stmt.excluded.url,
-                color=insert_stmt.excluded.color,
-                text_color=insert_stmt.excluded.text_color,
-            ),
+        total = _upsert_batched(
+            connection, Route, routes, "uq_short_name",
+            ["short_name", "long_name", "url", "color", "text_color"],
         )
-        connection.execute(upsert_stmt)
+        print(f"upsert routes result: {total} rows")
 
-    def _build_stop_headsigns_by_trip(self) -> dict[str, str]:
-        """One-pass over stop_times.txt: earliest-stop_sequence non-empty stop_headsign per trip."""
+    def _scan_stop_times(self) -> tuple[dict[str, str], dict[str, dict]]:
+        """Single streaming pass over stop_times.txt, producing what both
+        upsert_trips and upsert_stops need - previously each parsed this file
+        independently, doubling memory/CPU on what is typically the largest
+        GTFS file by far.
+
+        Returns (headsign_by_trip, stop_meta):
+          headsign_by_trip: trip_id -> earliest-stop_sequence non-empty stop_headsign.
+          stop_meta: stop_id -> {"trip_id", "stop_headsign"} (last row wins,
+            matching the original upsert_stops behavior).
+        """
         headsign_by_trip: dict[str, str] = {}
         min_seq_by_trip: dict[str, int] = {}
+        stop_meta: dict[str, dict] = {}
         with open(self.real_file(STOP_TIMES_FILE), "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                row = dict([(re.sub(DISALLOWED_CHARS_PATTERN, "", k), v) for k, v in row.items()])
                 trip_id = row.get("trip_id")
                 headsign = row.get("stop_headsign")
-                if not trip_id or not headsign:
-                    continue
-                try:
-                    seq = int(row.get("stop_sequence", "0"))
-                except (TypeError, ValueError):
-                    continue
-                if seq < min_seq_by_trip.get(trip_id, float("inf")):
-                    min_seq_by_trip[trip_id] = seq
-                    headsign_by_trip[trip_id] = headsign
-        return headsign_by_trip
+                if trip_id and headsign:
+                    try:
+                        seq = int(row.get("stop_sequence", "0"))
+                    except (TypeError, ValueError):
+                        seq = None
+                    if seq is not None and seq < min_seq_by_trip.get(trip_id, float("inf")):
+                        min_seq_by_trip[trip_id] = seq
+                        headsign_by_trip[trip_id] = headsign
+                stop_id = row.get("stop_id")
+                if stop_id:
+                    stop_meta[stop_id] = {
+                        "trip_id": trip_id,
+                        "stop_headsign": headsign or None,
+                    }
+        return headsign_by_trip, stop_meta
 
     def _build_route_long_names(self) -> dict[str, str]:
         long_name_by_route: dict[str, str] = {}
@@ -237,10 +287,9 @@ class Fetcher:
                     long_name_by_route[route_id] = long_name
         return long_name_by_route
 
-    def upsert_trips(self, connection: Connection) -> None:
+    def upsert_trips(self, connection: Connection, stop_headsigns_by_trip: dict[str, str]) -> None:
         rows_to_write = []
         transit_system_id = self.select_transit_system(connection)
-        stop_headsigns_by_trip = self._build_stop_headsigns_by_trip()
         route_long_names = self._build_route_long_names()
 
         with open(self.real_file(TRIPS_FILE), "r") as f:
@@ -270,27 +319,15 @@ class Fetcher:
                 })
         if not rows_to_write:
             return
-        insert_stmt = insert(Trip).values(rows_to_write)
-        upsert_stmt = insert_stmt.on_conflict_do_update(
-            constraint="uq_trip",
-            set_=dict(
-                name=insert_stmt.excluded.name,
-                direction_id=insert_stmt.excluded.direction_id,
-            ),
+        total = _upsert_batched(
+            connection, Trip, rows_to_write, "uq_trip", ["name", "direction_id"],
         )
-        connection.execute(upsert_stmt)
+        print(f"upsert trips result: {total} rows")
 
-    def upsert_stops(self, connection: Connection) -> None:
+    def upsert_stops(self, connection: Connection, stop_meta: dict[str, dict]) -> None:
         transit_system_id = self.select_transit_system(connection)
 
-        trip_stops = defaultdict(dict)
-        with open(self.real_file(STOP_TIMES_FILE), "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                trip_stops[row.get('stop_id')] = {
-                    "trip_id": row.get('trip_id'),
-                    "stop_headsign": row.get('stop_headsign') or None,
-                }
+        trip_stops = defaultdict(dict, stop_meta)
         with open(self.real_file(STOPS_FILE), "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -319,18 +356,13 @@ class Fetcher:
         ) for k, v in trip_stops.items() if all([
             v.get("trip_id"),
             v.get("name"),
-            v.get("zone_id")
+            v.get("zone_id"),
         ])]
 
-        insert_stmt = insert(Stop).values(rows_to_write)
-        upsert_stmt = insert_stmt.on_conflict_do_update(
-            constraint="uq_transit_stop_id",
-            set_=dict(
-                name=insert_stmt.excluded.name,
-                stop_headsign=insert_stmt.excluded.stop_headsign,
-            ),
+        total = _upsert_batched(
+            connection, Stop, rows_to_write, "uq_transit_stop_id", ["name", "stop_headsign"],
         )
-        connection.execute(upsert_stmt)
+        print(f"upsert stops result: {total} rows")
 
 
 if __name__ == "__main__":
@@ -342,8 +374,29 @@ if __name__ == "__main__":
         action="store_true",
         help="Run do_upserts() even if local schedule data is not stale.",
     )
+    parser.add_argument(
+        "--transit-system",
+        default="BART",
+        help="Name of transit system to fetch. Ignored if --all is passed.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Fetch every transit system in GTFS_METADATA instead of a single one.",
+    )
     args = parser.parse_args()
 
-    # Example usage with BART
-    fetcher = Fetcher("http://www.bart.gov/dev/schedules/google_transit.zip", "BART")
-    fetcher.fetch_metadata_update(force=args.force)
+    systems = list(GTFS_METADATA.items()) if args.all else [(args.transit_system, GTFS_METADATA.get(args.transit_system))]
+    for transit_system, schedule_url in systems:
+        if not schedule_url:
+            raise Exception("Invalid transit system: {}".format(transit_system))
+        fetcher = Fetcher(schedule_url, transit_system)
+        if args.all:
+            # One slow/unreachable feed shouldn't block the rest, or the
+            # startup command (fetcher.py && uvicorn) from ever reaching uvicorn.
+            try:
+                fetcher.fetch_metadata_update(force=args.force)
+            except Exception as ex:
+                print(f"Error fetching for {transit_system}: {ex}")
+        else:
+            fetcher.fetch_metadata_update(force=args.force)

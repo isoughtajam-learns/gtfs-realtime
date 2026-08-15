@@ -35,6 +35,11 @@ Pass `--force` to bypass the daily-freshness checks — re-downloads the Schedul
 uv run fetcher.py --force
 ```
 
+Pass `--all` to fetch every system in `GTFS_METADATA` instead of the `--transit-system` default (`BART`); one bad/slow feed won't block the others:
+```
+uv run fetcher.py --all
+```
+
 ## GTFS Schedule ingestion
 
 The fetcher pulls each transit system's GTFS Schedule zip from `GTFS_METADATA` in `src/constants.py`, extracts it under `src/tmp/<transit_system>/`, promotes the files into `src/metadata/<transit_system>/` once validated, and upserts the parsed rows into Postgres. Files read: `trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`, `feed_info.txt`.
@@ -92,12 +97,60 @@ docker compose up --build
 
 The containers are orchestrated to work together:
 - The **backend**, **celery-worker**, and **celery-beat** containers all depend on both the **db** and **redis** containers starting first.
-- At startup, the **backend** container's command automatically applies any pending Alembic migrations (`alembic upgrade head`), and triggers an initial GTFS metadata fetch (`python src/fetcher.py --force`) before starting the FastAPI server. This ensures the database is initialized and seeded with data before the API is accessible.
+- At startup, the **backend** container's command automatically applies any pending Alembic migrations (`alembic upgrade head`) before starting the FastAPI server. It does *not* fetch GTFS Schedule data itself - that's celery-beat's job (see below), or trigger it manually (see "Manually triggering a GTFS Schedule fetch in production"). An earlier version ran the fetcher synchronously at startup; this was removed because it forced every restart to re-download and re-parse every configured system's full Schedule data, rather than respecting the once-daily freshness check.
 
 ## Background Tasks (Celery)
 
 We use Celery to periodically fetch fresh GTFS Schedule metadata to keep the database up-to-date.
 - **Tasks Definition**: The tasks and schedule are defined in `src/tasks.py`.
-- **Schedule**: The `celery-beat` scheduler triggers the `fetch_all_systems` task every 4 hours, starting at 2 AM UTC (i.e. hours 2, 6, 10, 14, 18, 22).
-- **Worker Execution**: The `celery-worker` container listens to the Redis queue and executes the task, updating the PostgreSQL database.
+- **`fetch_all_systems`**: fetches every system in `GTFS_METADATA` (`force=False`). Runs every 4 hours, starting at 2 AM UTC (hours 2, 6, 10, 14, 18, 22).
+- **`ensure_schedule_data`**: safety net. Runs every 15 minutes; checks each configured system's trip+stop counts and triggers a fetch (`force=False`) for any system with none - catches a newly-added system or a fetch that failed partway through before the next scheduled `fetch_all_systems` run. Safe to run this often because of the daily gate below: an already-healthy system costs one indexed SELECT, not a network call.
+- **Worker Execution**: The `celery-worker` container listens to the Redis queue and executes tasks, updating the PostgreSQL database.
 - **Shared Architecture**: Because they share the same Redis and Database connection strings (passed in `docker-compose.yml`), the worker seamlessly updates the same database queried by the FastAPI server.
+- **Daily fetch cap (restart-proof)**: `Fetcher.fetch_metadata_update` won't re-fetch a system more than once per UTC day, gated by `TransitSystem.last_fetched_at` in Postgres - not a local file, which would get wiped on every celery-worker restart/redeploy and defeat the cap. Pass `force=True` to bypass it.
+- **Registering a new task**: Celery's auto-generated task name is module-qualified based on how the app is invoked (`celery -A src.tasks worker` → `src.tasks.<funcname>`, not just `tasks.<funcname>`). Verify the actual name in the worker's startup `[tasks]` log banner before wiring it into `beat_schedule` - a mismatched name fails silently (the task is just never dispatched, no error).
+
+# AWS Deployment
+### ECR instructions
+
+```
+$ aws login
+$ aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 537735702437.dkr.ecr.us-east-2.amazonaws.com
+$ docker tag gtfs-realtime-backend:latest 537735702437.dkr.ecr.us-east-2.amazonaws.com/portfolio/gtfs-realtime/backend:latest
+$ docker push 537735702437.dkr.ecr.us-east-2.amazonaws.com/portfolio/gtfs-realtime/backend:latest
+```
+
+### Manually triggering a GTFS Schedule fetch in production
+
+The backend's startup command only runs `alembic upgrade head` - it does **not** fetch GTFS Schedule data. Schedule data is only populated by celery-beat's `fetch_all_systems` task, scheduled every 4 hours (2/6/10/14/18/22 UTC, see `src/tasks.py`). To populate a system's data immediately instead of waiting for the next scheduled run (e.g. right after adding a new `GTFS_URLS`/`GTFS_METADATA` entry, or after a fix like the one that re-enabled Helsinki):
+
+```bash
+ssh -i ~/.ssh/<key-name>.pem ec2-user@<instance-ip>
+docker exec $(docker ps -qf name=backend) python -m src.fetcher --transit-system <System_Name> --force
+```
+
+`--force` bypasses the once-daily freshness check and always re-downloads + re-parses. Omit it to respect the daily gate (matches what celery-beat does on its own schedule).
+
+To fetch every configured system at once (same as what celery-beat's scheduled task does, but on demand):
+```bash
+docker exec $(docker ps -qf name=backend) python -m src.fetcher --all --force
+```
+
+**Before enabling a new large transit system**, check its `stop_times.txt` size — `fetcher.py` holds derived per-trip/per-stop data for the whole file in memory during a fetch. Test locally first with a memory-constrained container to confirm it fits comfortably within the production instance's budget:
+```bash
+docker compose up -d db
+docker compose run --rm backend python3 -c "
+import resource, time
+from src.fetcher import Fetcher
+t0 = time.time()
+f = Fetcher('<schedule_zip_url>', '<System_Name>')
+f.fetch_metadata_update(force=True)
+print(f'{time.time()-t0:.1f}s, peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.1f} MB')
+"
+```
+(If the system isn't in `GTFS_URLS`/`GTFS_METADATA` yet, monkey-patch those dicts in the same script before importing `Fetcher` - see the fetch that validated Helsinki for the pattern.)
+
+After a manual production fetch, the running backend's in-memory `ScheduleCache` (`src/schedule_cache.py`, 6-hour TTL) won't see the new data until its TTL expires. Force a restart to pick it up immediately:
+```bash
+aws ecs update-service --cluster gtfs-realtime-cluster --service gtfs-realtime-backend --force-new-deployment --region us-east-2
+```
