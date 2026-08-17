@@ -101,6 +101,10 @@ async def transit_feed(transit_system: str):
                     retry=5000)
         await asyncio.sleep(30)
 
+@app.get("/transit_systems")
+async def get_transit_systems():
+    return list(GTFS_URLS.keys())
+
 @app.get("/info")
 async def info():
     settings = get_settings()
