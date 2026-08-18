@@ -43,7 +43,20 @@ UPDATED_METADATA_FILE = "updated_metadata.txt"
 UPSERT_BATCH_SIZE = 2000
 
 
-def _upsert_batched(connection: Connection, table, rows: list[dict], constraint: str, update_columns: list[str]) -> int:
+def _upsert_batched(
+    connection: Connection, table, rows: list[dict], constraint: str,
+    conflict_columns: list[str], update_columns: list[str],
+) -> int:
+    # A single ON CONFLICT DO UPDATE statement can't touch the same row twice
+    # (Postgres raises CardinalityViolation), so two source rows sharing a
+    # conflict key can't land in the same batch. Some real feeds do this
+    # legitimately - e.g. MBTA reuses generic route_short_names like "Red
+    # Line Shuttle" across dozens of distinct route_ids. Dedupe up front,
+    # keeping the last occurrence (matching normal upsert "last write wins"
+    # semantics), rather than trying to keep duplicates apart across batches.
+    deduped = {tuple(row[col] for col in conflict_columns): row for row in rows}
+    rows = list(deduped.values())
+
     total = 0
     for start in range(0, len(rows), UPSERT_BATCH_SIZE):
         batch = rows[start:start + UPSERT_BATCH_SIZE]
@@ -235,7 +248,7 @@ class Fetcher:
         if not routes:
             return
         total = _upsert_batched(
-            connection, Route, routes, "uq_short_name",
+            connection, Route, routes, "uq_short_name", ["short_name"],
             ["short_name", "long_name", "url", "color", "text_color"],
         )
         print(f"upsert routes result: {total} rows")
@@ -320,7 +333,8 @@ class Fetcher:
         if not rows_to_write:
             return
         total = _upsert_batched(
-            connection, Trip, rows_to_write, "uq_trip", ["name", "direction_id"],
+            connection, Trip, rows_to_write, "uq_trip", ["transit_system_id", "trip_id"],
+            ["name", "direction_id"],
         )
         print(f"upsert trips result: {total} rows")
 
@@ -360,7 +374,8 @@ class Fetcher:
         ])]
 
         total = _upsert_batched(
-            connection, Stop, rows_to_write, "uq_transit_stop_id", ["name", "stop_headsign"],
+            connection, Stop, rows_to_write, "uq_transit_stop_id", ["stop_id", "transit_system_id"],
+            ["name", "stop_headsign"],
         )
         print(f"upsert stops result: {total} rows")
 

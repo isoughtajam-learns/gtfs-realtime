@@ -20,11 +20,19 @@ locals {
   container_port = 8000
 
   # Every backend service (backend, celery-worker, celery-beat) runs the
-  # single image built from ../gtfs-realtime's Dockerfile.
-  image = "${aws_ecr_repository.app.repository_url}:${var.image_tag}"
+  # single image built from ../gtfs-realtime's Dockerfile, at the git tag
+  # named by var.backend_image_tag.
+  image = "${aws_ecr_repository.app.repository_url}:${var.backend_image_tag}"
 
-  # The dashboard (nginx + static build) from the sibling ../gtfs-dashboard repo.
-  frontend_image = "${aws_ecr_repository.frontend.repository_url}:${var.image_tag}"
+  # Provisioned by hand via the Secrets Manager console, not by Terraform -
+  # referenced by ecs_secrets_access below (which grants the shared execution
+  # role access to them) rather than duplicated, so the two can't silently
+  # drift apart. The frontend task definition itself now lives in
+  # ../gtfs-dashboard/deployment (its own Terraform stack) and looks these
+  # secrets up by name via a data source - but it uses THIS role, so this
+  # stack still owns granting it access.
+  tls_cert_arn = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert"
+  tls_key_arn  = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key"
 
   common_environment = [
     { name = "ENV", value = "prod" },
@@ -41,11 +49,9 @@ locals {
   common_secrets = [
     { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
     { name = "SECRET_KEY", valueFrom = aws_secretsmanager_secret.app_secret_key.arn },
-    { name = "TLC_CERT", valueFrom = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert" },
-    { name = "TLC_KEY", valueFrom = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key" },
   ]
 
-  log_config = { for prefix in ["backend", "celery-worker", "celery-beat", "frontend"] : prefix => {
+  log_config = { for prefix in ["backend", "celery-worker", "celery-beat"] : prefix => {
     logDriver = "awslogs"
     options = {
       "awslogs-group"         = aws_cloudwatch_log_group.ecs_logs.name
@@ -87,6 +93,14 @@ resource "aws_security_group" "ec2" {
     description = "Dashboard (frontend) inbound"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Dashboard (frontend) HTTPS inbound - Cloudflare origin connection"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -143,11 +157,6 @@ resource "aws_security_group" "redis" {
 # ------------------------------------------------------------------------------
 resource "aws_ecr_repository" "app" {
   name                 = var.app_name
-  image_tag_mutability = "MUTABLE"
-}
-
-resource "aws_ecr_repository" "frontend" {
-  name                 = "${var.app_name}-frontend"
   image_tag_mutability = "MUTABLE"
 }
 
@@ -272,6 +281,8 @@ resource "aws_iam_role_policy" "ecs_secrets_access" {
         Resource = [
           aws_secretsmanager_secret.database_url.arn,
           aws_secretsmanager_secret.app_secret_key.arn,
+          local.tls_cert_arn,
+          local.tls_key_arn,
         ]
       }
     ]
@@ -352,10 +363,12 @@ resource "aws_eip" "ecs" {
 
 # ------------------------------------------------------------------------------
 # 10. Task Definitions - backend/celery-worker/celery-beat run the single
-#     image from ../gtfs-realtime's Dockerfile; frontend runs the dashboard
-#     image from the sibling ../gtfs-dashboard repo. EC2 launch type + host
-#     networking: all four land on the one container instance and can reach
-#     each other via localhost (frontend's nginx proxies /api/ to the backend).
+#     image from this repo's Dockerfile, EC2 launch type + host networking.
+#     The frontend task definition/service now live in
+#     ../gtfs-dashboard/deployment (its own Terraform stack) - it shares this
+#     stack's EC2 instance/ECS cluster/execution role (looked up by name, not
+#     a state reference) and reaches the backend via localhost since it's on
+#     the same host.
 # ------------------------------------------------------------------------------
 resource "aws_ecs_task_definition" "backend" {
   family                   = "${var.app_name}-backend"
@@ -377,7 +390,7 @@ resource "aws_ecs_task_definition" "backend" {
       memoryReservation = 256
       command = [
         "sh", "-c",
-        "alembic upgrade head && echo \"$TLS_CERT\" > /tmp/tls.crt && echo \"$TLS_KEY\" > /tmp/tls.key && uvicorn src.main:app --host 0.0.0.0 --port 8000 --ssl-certfile /tmp/tls.crt --ssl-keyfile /tmp/tls.key"
+        "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"
       ]
       portMappings = [
         {
@@ -445,41 +458,6 @@ resource "aws_ecs_task_definition" "celery_beat" {
   ])
 }
 
-resource "aws_ecs_task_definition" "frontend" {
-  family                   = "${var.app_name}-frontend"
-  network_mode             = "host"
-  requires_compatibilities = ["EC2"]
-  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
-
-  runtime_platform {
-    operating_system_family = "LINUX"
-    cpu_architecture        = "ARM64"
-  }
-
-  container_definitions = jsonencode([
-    {
-      name              = "frontend"
-      image             = local.frontend_image
-      essential         = true
-      cpu               = 128
-      memoryReservation = 128
-      portMappings = [
-        {
-          containerPort = 80
-          hostPort      = 80
-          protocol      = "tcp"
-        }
-      ]
-      # nginx.conf's envsubst template proxies /api/ to this at container start.
-      # Literal IP, not "localhost": nginx's resolver-based DNS lookup for the
-      # dynamic proxy_pass needs Docker's embedded DNS (127.0.0.11), which only
-      # exists in bridge-mode containers - not present under host networking.
-      environment      = [{ name = "BACKEND_URL", value = "http://127.0.0.1:${local.container_port}" }]
-      logConfiguration = local.log_config["frontend"]
-    }
-  ])
-}
-
 # ------------------------------------------------------------------------------
 # 11. ECS Services - EC2 launch type, no network_configuration/load balancer;
 #     tasks are placed directly on the one container instance.
@@ -519,18 +497,6 @@ resource "aws_ecs_service" "celery_beat" {
   # instance would enqueue duplicate jobs.
   desired_count = 1
   launch_type   = "EC2"
-
-  force_new_deployment               = true
-  deployment_minimum_healthy_percent = 0
-  deployment_maximum_percent         = 100
-}
-
-resource "aws_ecs_service" "frontend" {
-  name            = "${var.app_name}-frontend"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.frontend.arn
-  desired_count   = var.frontend_desired_count
-  launch_type     = "EC2"
 
   force_new_deployment               = true
   deployment_minimum_healthy_percent = 0
