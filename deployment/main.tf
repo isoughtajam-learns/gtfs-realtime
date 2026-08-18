@@ -26,6 +26,12 @@ locals {
   # The dashboard (nginx + static build) from the sibling ../gtfs-dashboard repo.
   frontend_image = "${aws_ecr_repository.frontend.repository_url}:${var.image_tag}"
 
+  # Provisioned by hand via the Secrets Manager console, not by Terraform -
+  # referenced here (and by ecs_secrets_access below) rather than duplicated,
+  # so the two can't silently drift apart.
+  tls_cert_arn = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert"
+  tls_key_arn  = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key"
+
   common_environment = [
     { name = "ENV", value = "prod" },
     { name = "APP_NAME", value = var.app_name },
@@ -41,9 +47,15 @@ locals {
   common_secrets = [
     { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
     { name = "SECRET_KEY", valueFrom = aws_secretsmanager_secret.app_secret_key.arn },
-    { name = "TLC_CERT", valueFrom = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert" },
-    { name = "TLC_KEY", valueFrom = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key" },
   ]
+
+  # Only the frontend terminates TLS (Cloudflare's edge connects to it on 443
+  # under "Full (strict)" mode) - the private key has no reason to also be
+  # injected into backend/celery-worker/celery-beat.
+  frontend_secrets = concat(local.common_secrets, [
+    { name = "TLS_CERT", valueFrom = local.tls_cert_arn },
+    { name = "TLS_KEY", valueFrom = local.tls_key_arn },
+  ])
 
   log_config = { for prefix in ["backend", "celery-worker", "celery-beat", "frontend"] : prefix => {
     logDriver = "awslogs"
@@ -87,6 +99,14 @@ resource "aws_security_group" "ec2" {
     description = "Dashboard (frontend) inbound"
     from_port   = 80
     to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Dashboard (frontend) HTTPS inbound - Cloudflare origin connection"
+    from_port   = 443
+    to_port     = 443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -272,6 +292,8 @@ resource "aws_iam_role_policy" "ecs_secrets_access" {
         Resource = [
           aws_secretsmanager_secret.database_url.arn,
           aws_secretsmanager_secret.app_secret_key.arn,
+          local.tls_cert_arn,
+          local.tls_key_arn,
         ]
       }
     ]
@@ -377,7 +399,7 @@ resource "aws_ecs_task_definition" "backend" {
       memoryReservation = 256
       command = [
         "sh", "-c",
-        "alembic upgrade head && echo \"$TLS_CERT\" > /tmp/tls.crt && echo \"$TLS_KEY\" > /tmp/tls.key && uvicorn src.main:app --host 0.0.0.0 --port 8000 --ssl-certfile /tmp/tls.crt --ssl-keyfile /tmp/tls.key"
+        "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"
       ]
       portMappings = [
         {
@@ -468,13 +490,23 @@ resource "aws_ecs_task_definition" "frontend" {
           containerPort = 80
           hostPort      = 80
           protocol      = "tcp"
+        },
+        {
+          containerPort = 443
+          hostPort      = 443
+          protocol      = "tcp"
         }
       ]
       # nginx.conf's envsubst template proxies /api/ to this at container start.
       # Literal IP, not "localhost": nginx's resolver-based DNS lookup for the
       # dynamic proxy_pass needs Docker's embedded DNS (127.0.0.11), which only
       # exists in bridge-mode containers - not present under host networking.
-      environment      = [{ name = "BACKEND_URL", value = "http://127.0.0.1:${local.container_port}" }]
+      environment = [{ name = "BACKEND_URL", value = "http://127.0.0.1:${local.container_port}" }]
+      # TLS_CERT/TLS_KEY land as env vars; the image's own entrypoint script
+      # (see ../gtfs-dashboard's Dockerfile) writes them to files and enables
+      # the 443 listener only when both are present, so this same image still
+      # works unmodified for local HTTP-only dev.
+      secrets          = local.frontend_secrets
       logConfiguration = local.log_config["frontend"]
     }
   ])
