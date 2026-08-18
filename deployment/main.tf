@@ -28,9 +28,11 @@ locals {
 
   # Provisioned by hand via the Secrets Manager console, not by Terraform -
   # referenced here (and by ecs_secrets_access below) rather than duplicated,
-  # so the two can't silently drift apart.
-  tls_cert_arn = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert"
-  tls_key_arn  = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key"
+  # so the two can't silently drift apart. Full ARN including the random
+  # suffix Secrets Manager appends - IAM's policy match is exact, an ARN
+  # without it silently fails to authorize GetSecretValue at task launch.
+  tls_cert_arn = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert-bWmXtO"
+  tls_key_arn  = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key-eyM9A7"
 
   common_environment = [
     { name = "ENV", value = "prod" },
