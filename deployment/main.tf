@@ -41,6 +41,8 @@ locals {
   common_secrets = [
     { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
     { name = "SECRET_KEY", valueFrom = aws_secretsmanager_secret.app_secret_key.arn },
+    { name = "TLC_CERT", valueFrom = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert" },
+    { name = "TLC_KEY", valueFrom = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key" },
   ]
 
   log_config = { for prefix in ["backend", "celery-worker", "celery-beat", "frontend"] : prefix => {
@@ -375,7 +377,7 @@ resource "aws_ecs_task_definition" "backend" {
       memoryReservation = 256
       command = [
         "sh", "-c",
-        "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"
+        "alembic upgrade head && echo \"$TLS_CERT\" > /tmp/tls.crt && echo \"$TLS_KEY\" > /tmp/tls.key && uvicorn src.main:app --host 0.0.0.0 --port 8000 --ssl-certfile /tmp/tls.crt --ssl-keyfile /tmp/tls.key"
       ]
       portMappings = [
         {
