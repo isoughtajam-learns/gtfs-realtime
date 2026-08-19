@@ -27,22 +27,28 @@ Update GTFS_URLS in src/constants.py with new GTFS-Realtime trip update sources.
 
 ## Update transit system metadata
 ```
-uv run fetcher.py
+uv run python -m src.commands.fetcher
 ```
 
 Pass `--force` to bypass the daily-freshness checks — re-downloads the Schedule zip, replaces `src/tmp/<transit_system>/`, and re-runs the DB upserts even if local data isn't stale:
 ```
-uv run fetcher.py --force
+uv run python -m src.commands.fetcher --force
 ```
 
 Pass `--all` to fetch every system in `GTFS_METADATA` instead of the `--transit-system` default (`BART`); one bad/slow feed won't block the others:
 ```
-uv run fetcher.py --all
+uv run python -m src.commands.fetcher --all
+```
+
+Pass `--diagnose` to download and report on a feed's data quality *without* writing to the database or promoting anything into `src/metadata/` - see "Diagnosing a source" below. Useful before adding a new system to `GTFS_METADATA` at all:
+```
+uv run python -m src.commands.fetcher --diagnose --transit-system BART
+uv run python -m src.commands.fetcher --diagnose --transit-system SomeNewAgency --schedule-url https://example.com/gtfs.zip
 ```
 
 ## GTFS Schedule ingestion
 
-The fetcher pulls each transit system's GTFS Schedule zip from `GTFS_METADATA` in `src/constants.py`, extracts it under `src/tmp/<transit_system>/`, promotes the files into `src/metadata/<transit_system>/` once validated, and upserts the parsed rows into Postgres. Files read: `trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`, `feed_info.txt`.
+The fetcher pulls each transit system's GTFS Schedule zip from `GTFS_METADATA` in `src/constants.py`, extracts it under `src/tmp/<transit_system>/`, **diagnoses it in place** (see below - this is where `--diagnose` and the automatic pre-promotion gate share the same code path, so the check you can run ahead of time is exactly the check every real fetch runs), promotes the files into `src/metadata/<transit_system>/` only if that diagnosis passes, and upserts the parsed rows into Postgres. Files read: `trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`, `feed_info.txt`.
 
 Tables populated (see `src/models.py`):
 - `transit_system` — one row per system, holds realtime + schedule URLs.
@@ -52,15 +58,23 @@ Tables populated (see `src/models.py`):
 
 ### Headsign fallback chain
 
-`Trip.name` is populated greedily so downstream code always has *something* to show:
+`Trip.name` is populated greedily so downstream code always has *something* to show. The precedence rule itself lives in `src.services.schedule_utils.resolve_trip_headsign` (a pure function, unit tested in `src/tests/services/test_schedule_utils.py`) - `src/commands/fetcher.py` just calls it:
 1. `trips.trip_headsign` (primary)
-2. First non-empty `stop_times.stop_headsign` at the min `stop_sequence` for the trip
+2. First non-empty `stop_times.stop_headsign` at the min `stop_sequence` for the trip (`schedule_utils.is_earlier_stop_sequence`)
 3. `routes.route_long_name` as a last-ditch fallback
 4. `None` if none of the above are available
 
-This is done once at ingest time so the runtime lookup path stays a single dict read.
+This is done once at ingest time so the runtime lookup path stays a single dict read. The other ingest-time fallback/completeness rules (route URL fallback, which required route/stop fields must be present to insert a row) live in the same module for the same reason - see its docstrings for the full list.
 
-### Runtime hydration (`src/schedule_cache.py`)
+### Diagnosing a source
+
+`Fetcher.diagnose()` reports whether a GTFS Schedule feed has the data the tables above expect, and if not, exactly where it falls short - per-field counts of what's missing on `routes`/`stops`, which fallback level resolved (or failed to resolve) each trip's headsign, `feed_info.txt` presence/validity, and `stop_times.txt`'s row count (a proxy for memory risk on a small instance). It's read-only: no DB writes, nothing promoted into `src/metadata/`.
+
+This isn't just a manual check - `fetch_metadata_update()` runs the exact same diagnosis on every real fetch, *before* deciding whether to promote `tmp/` into `real_dir()` and upsert. The one hard gate: a source needs at least one derivable stop with a name, or the app's core feature is unavailable for it entirely; anything else (missing route colors, unresolved headsigns, a large `stop_times.txt`) is reported but doesn't block ingestion - partial data is still useful (Helsinki has no route colors at all and stays enabled). `--force` bypasses the daily-freshness gate, not this one.
+
+Run it standalone with `--diagnose` (see above) before adding a new system to `GTFS_METADATA` at all - `--schedule-url` lets you point at a feed that isn't registered there yet.
+
+### Runtime hydration (`src/services/schedule_cache.py`)
 
 `ScheduleCache` preloads three per-system dicts on first request and refreshes on a 6-hour TTL:
 - `trip_id -> Trip.name`
@@ -126,22 +140,22 @@ The backend's startup command only runs `alembic upgrade head` - it does **not**
 
 ```bash
 ssh -i ~/.ssh/<key-name>.pem ec2-user@<instance-ip>
-docker exec $(docker ps -qf name=backend) python -m src.fetcher --transit-system <System_Name> --force
+docker exec $(docker ps -qf name=backend) python -m src.commands.fetcher --transit-system <System_Name> --force
 ```
 
 `--force` bypasses the once-daily freshness check and always re-downloads + re-parses. Omit it to respect the daily gate (matches what celery-beat does on its own schedule).
 
 To fetch every configured system at once (same as what celery-beat's scheduled task does, but on demand):
 ```bash
-docker exec $(docker ps -qf name=backend) python -m src.fetcher --all --force
+docker exec $(docker ps -qf name=backend) python -m src.commands.fetcher --all --force
 ```
 
-**Before enabling a new large transit system**, check its `stop_times.txt` size — `fetcher.py` holds derived per-trip/per-stop data for the whole file in memory during a fetch. Test locally first with a memory-constrained container to confirm it fits comfortably within the production instance's budget:
+**Before enabling a new large transit system**, run `--diagnose` first (see "Diagnosing a source" above) - it's quick, needs no DB, and immediately surfaces things like missing route colors or an absent `feed_info.txt`. Then, if `stop_times.txt`'s reported row count looks large, verify actual memory usage locally before trusting it in production - `fetcher.py` holds derived per-trip/per-stop data for the whole file in memory during a fetch:
 ```bash
 docker compose up -d db
 docker compose run --rm backend python3 -c "
 import resource, time
-from src.fetcher import Fetcher
+from src.commands.fetcher import Fetcher
 t0 = time.time()
 f = Fetcher('<schedule_zip_url>', '<System_Name>')
 f.fetch_metadata_update(force=True)
@@ -150,7 +164,7 @@ print(f'{time.time()-t0:.1f}s, peak RSS: {resource.getrusage(resource.RUSAGE_SEL
 ```
 (If the system isn't in `GTFS_URLS`/`GTFS_METADATA` yet, monkey-patch those dicts in the same script before importing `Fetcher` - see the fetch that validated Helsinki for the pattern.)
 
-After a manual production fetch, the running backend's in-memory `ScheduleCache` (`src/schedule_cache.py`, 6-hour TTL) won't see the new data until its TTL expires. Force a restart to pick it up immediately:
+After a manual production fetch, the running backend's in-memory `ScheduleCache` (`src/services/schedule_cache.py`, 6-hour TTL) won't see the new data until its TTL expires. Force a restart to pick it up immediately:
 ```bash
 aws ecs update-service --cluster gtfs-realtime-cluster --service gtfs-realtime-backend --force-new-deployment --region us-east-2
 ```

@@ -3,7 +3,7 @@ from celery.schedules import crontab
 from sqlalchemy import select, func
 
 from src.database import engine
-from src.fetcher import Fetcher
+from src.commands.fetcher import Fetcher
 from src.constants import GTFS_METADATA
 from src.models import TransitSystem, Trip, Stop
 from src.settings import get_settings
@@ -12,23 +12,24 @@ settings = get_settings()
 app = Celery("gtfs_tasks", broker=settings.celery_broker_url)
 
 app.conf.beat_schedule = {
-    'fetch-gtfs-schedule-every-4-hours': {
-        'task': 'src.tasks.fetch_all_systems',
+    "fetch-gtfs-schedule-every-4-hours": {
+        "task": "src.tasks.fetch_all_systems",
         # Every 4 hours starting at 2 AM
-        'schedule': crontab(minute=0, hour='2,6,10,14,18,22'),
+        "schedule": crontab(minute=0, hour="2,6,10,14,18,22"),
     },
-    'ensure-schedule-data-populated': {
-        'task': 'src.tasks.ensure_schedule_data',
+    "ensure-schedule-data-populated": {
+        "task": "src.tasks.ensure_schedule_data",
         # Runs often to catch a system with no data quickly, but each fetch
         # attempt is a cheap no-op once TransitSystem.last_fetched_at is set
         # for today (see Fetcher.fetched_today), so frequent runs are safe.
-        'schedule': crontab(minute='*/15'),
+        "schedule": crontab(minute="*/15"),
     },
 }
-app.conf.timezone = 'UTC'
+app.conf.timezone = "UTC"  # type: ignore[misc,assignment]  # celery-types wrongly requires tzinfo; celery accepts a zone name string
+
 
 @app.task
-def fetch_all_systems():
+def fetch_all_systems() -> None:
     """
     Iterate over all systems and fetch their metadata updates.
     """
@@ -43,7 +44,7 @@ def fetch_all_systems():
 
 
 @app.task
-def ensure_schedule_data():
+def ensure_schedule_data() -> None:
     """
     Safety net: catches a transit system with no trip/stop data at all - e.g.
     a system that was just added to GTFS_METADATA, or a previous fetch that
@@ -55,13 +56,28 @@ def ensure_schedule_data():
     upstream GTFS endpoints.
     """
     with engine.begin() as connection:
-        systems = dict(connection.execute(select(TransitSystem.name, TransitSystem.id)).all())
-        trip_counts = dict(
-            connection.execute(select(Trip.transit_system_id, func.count(Trip.trip_id)).group_by(Trip.transit_system_id)).all()
-        )
-        stop_counts = dict(
-            connection.execute(select(Stop.transit_system_id, func.count(Stop.stop_id)).group_by(Stop.transit_system_id)).all()
-        )
+        systems: dict[str, int] = {
+            name: transit_system_id
+            for name, transit_system_id in connection.execute(
+                select(TransitSystem.name, TransitSystem.id)
+            )
+        }
+        trip_counts: dict[int, int] = {
+            transit_system_id: count
+            for transit_system_id, count in connection.execute(
+                select(Trip.transit_system_id, func.count(Trip.trip_id)).group_by(
+                    Trip.transit_system_id
+                )
+            )
+        }
+        stop_counts: dict[int, int] = {
+            transit_system_id: count
+            for transit_system_id, count in connection.execute(
+                select(Stop.transit_system_id, func.count(Stop.stop_id)).group_by(
+                    Stop.transit_system_id
+                )
+            )
+        }
 
     for system, url in GTFS_METADATA.items():
         transit_system_id = systems.get(system)

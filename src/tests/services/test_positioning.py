@@ -2,7 +2,7 @@ from datetime import datetime
 
 from generated import gtfs_realtime_pb2
 from src.models import Status
-from src.positioning import get_location
+from src.services.positioning import get_location
 
 StopTimeEvent = gtfs_realtime_pb2.TripUpdate.StopTimeEvent
 StopTimeUpdate = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate
@@ -12,7 +12,7 @@ def _now() -> int:
     return int(datetime.now().timestamp())
 
 
-def test_unset_arrival_time_does_not_match_at_stop():
+def test_unset_arrival_time_does_not_match_at_stop() -> None:
     now = _now()
     stop = StopTimeUpdate(
         stop_id="S1",
@@ -21,7 +21,7 @@ def test_unset_arrival_time_does_not_match_at_stop():
     assert get_location([stop]) is None
 
 
-def test_delay_only_arrival_does_not_match_at_stop():
+def test_delay_only_arrival_does_not_match_at_stop() -> None:
     now = _now()
     stop = StopTimeUpdate(stop_id="S1")
     stop.arrival.delay = 120
@@ -29,7 +29,7 @@ def test_delay_only_arrival_does_not_match_at_stop():
     assert get_location([stop]) is None
 
 
-def test_both_times_set_at_stop():
+def test_both_times_set_at_stop() -> None:
     now = _now()
     stop = StopTimeUpdate(
         stop_id="S1",
@@ -44,7 +44,7 @@ def test_both_times_set_at_stop():
     assert result.next == now + 30
 
 
-def test_in_transit_between_stops():
+def test_in_transit_between_stops() -> None:
     now = _now()
     prev_stop = StopTimeUpdate(
         stop_id="S1",
