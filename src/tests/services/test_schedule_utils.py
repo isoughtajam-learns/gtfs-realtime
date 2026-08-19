@@ -97,9 +97,15 @@ def test_missing_route_fields_hsl_style_all_colors_missing() -> None:
 
 
 def test_missing_stop_fields_empty_when_all_present() -> None:
-    assert missing_stop_fields("T1", "Union City", "1") == []
+    assert missing_stop_fields("T1", "Union City") == []
 
 
 def test_missing_stop_fields_reports_each_missing_field() -> None:
-    missing = missing_stop_fields(None, "Union City", None)
-    assert missing == ["trip_id (via stop_times.txt)", "zone_id"]
+    missing = missing_stop_fields(None, "Union City")
+    assert missing == ["trip_id (via stop_times.txt)"]
+
+
+def test_missing_stop_fields_kiev_style_zone_id_absent_is_still_usable() -> None:
+    """Real-world case: Kiev's stops.txt has no zone_id column at all, but
+    the stop is still usable - zone_id isn't a required field."""
+    assert missing_stop_fields("T1", "ТРЕД № 1") == []

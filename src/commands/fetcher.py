@@ -109,10 +109,15 @@ class Fetcher:
         ) as f:
             reader = csv.DictReader(f)
             for row in reader:
+                # .get(key, default) only falls back when the column is
+                # absent - some sources (e.g. Kiev) include the column but
+                # leave it blank, which needs the same fallback.
                 start = datetime.strptime(
-                    row.get("feed_start_date", "19700101"), "%Y%m%d"
+                    row.get("feed_start_date") or "19700101", "%Y%m%d"
                 )
-                end = datetime.strptime(row.get("feed_end_date", "19700101"), "%Y%m%d")
+                end = datetime.strptime(
+                    row.get("feed_end_date") or "19700101", "%Y%m%d"
+                )
                 if not files_exist or not start <= datetime.today() <= end:
                     return True
         return False
@@ -223,8 +228,8 @@ class Fetcher:
         if not rows:
             return {"present": True, "valid_today": False}
         row = rows[0]
-        start = datetime.strptime(row.get("feed_start_date", "19700101"), "%Y%m%d")
-        end = datetime.strptime(row.get("feed_end_date", "19700101"), "%Y%m%d")
+        start = datetime.strptime(row.get("feed_start_date") or "19700101", "%Y%m%d")
+        end = datetime.strptime(row.get("feed_end_date") or "20991231", "%Y%m%d")
         return {
             "present": True,
             "valid_today": start <= datetime.today() <= end,
@@ -308,7 +313,10 @@ class Fetcher:
         with open(path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if row.get("location_type") != "0":
+                # location_type is optional per the GTFS spec and defaults to
+                # "0" (a regular stop) when the column is absent/blank - some
+                # sources (e.g. Kiev) omit it entirely.
+                if (row.get("location_type") or "0") != "0":
                     continue
                 location_type_0_rows += 1
                 stop_id = row.get("stop_id")
@@ -322,20 +330,22 @@ class Fetcher:
                 )
         usable = 0
         missing_counts: dict[str, int] = defaultdict(int)
+        zone_id_missing = 0
         for v in trip_stops.values():
-            missing = missing_stop_fields(
-                v.get("trip_id"), v.get("name"), v.get("zone_id")
-            )
+            missing = missing_stop_fields(v.get("trip_id"), v.get("name"))
             if missing:
                 for field in missing:
                     missing_counts[field] += 1
             else:
                 usable += 1
+            if not v.get("zone_id"):
+                zone_id_missing += 1
         return {
             "present": True,
             "location_type_0_rows": location_type_0_rows,
             "usable_rows": usable,
             "missing_field_counts": dict(missing_counts),
+            "zone_id_missing_rows": zone_id_missing,
         }
 
     def _print_diagnosis(self, report: dict[str, Any]) -> None:
@@ -405,6 +415,11 @@ class Fetcher:
                 stops["missing_field_counts"].items(), key=lambda kv: -kv[1]
             ):
                 print(f"    missing {field}: {count} rows")
+            if stops["zone_id_missing_rows"]:
+                print(
+                    f"    missing zone_id (informational, doesn't block usability): "
+                    f"{stops['zone_id_missing_rows']}/{stops['location_type_0_rows']} rows"
+                )
 
     def fetch_metadata_update(self, force: bool = False) -> None:
         if not force and (self.fetched_today() or self.updated_recently()):
@@ -645,7 +660,9 @@ class Fetcher:
         with open(self.real_file(STOPS_FILE), "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                location_type = row.get("location_type")
+                # location_type is optional per the GTFS spec and defaults to
+                # "0" (a regular stop) when the column is absent/blank.
+                location_type = row.get("location_type") or "0"
                 if location_type != "0":
                     continue
                 stop_id = row.get("stop_id")
@@ -672,9 +689,7 @@ class Fetcher:
                 stop_headsign=v.get("stop_headsign"),
             )
             for k, v in trip_stops.items()
-            if not missing_stop_fields(
-                v.get("trip_id"), v.get("name"), v.get("zone_id")
-            )
+            if not missing_stop_fields(v.get("trip_id"), v.get("name"))
         ]
 
         total = _upsert_batched(

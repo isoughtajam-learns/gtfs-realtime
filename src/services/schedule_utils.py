@@ -96,17 +96,20 @@ def missing_route_fields(
     return [name for name, value in candidates.items() if not value]
 
 
-def missing_stop_fields(
-    trip_id: Optional[str], name: Optional[str], zone_id: Optional[str]
-) -> List[str]:
+def missing_stop_fields(trip_id: Optional[str], name: Optional[str]) -> List[str]:
     """
-    A derived `stop` row needs a linked trip_id (from stop_times.txt), a
-    stop_name, and a zone_id - all optional in raw GTFS, all required by
-    our schema. Returns the missing field names; empty list means usable.
+    A derived `stop` row needs a linked trip_id (from stop_times.txt) and a
+    stop_name to be usable - these are the fields the core "show stop_name
+    on the map" feature depends on. zone_id is deliberately excluded: it's
+    optional in the GTFS spec (legacy zone-based fares) and many agencies
+    (e.g. Kiev) never populate it at all, so requiring it would make the
+    whole stop unusable over a field nothing downstream depends on - the
+    same "partial data is still useful" reasoning that keeps a
+    route_color-less Helsinki enabled. Returns the missing field names;
+    empty list means usable.
     """
     candidates = {
         "trip_id (via stop_times.txt)": trip_id,
         "stop_name": name,
-        "zone_id": zone_id,
     }
     return [name for name, value in candidates.items() if not value]
