@@ -5,6 +5,7 @@ The realtime feed only supplies trip_id and stop_id. Hydrating each SSE event wi
 query would add a round-trip per entity — instead we preload the two dicts once per
 transit system and refresh on a TTL, since Schedule data updates at most daily.
 """
+
 import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
@@ -74,15 +75,19 @@ class ScheduleCache:
                 cls._loaded_at[transit_system] = datetime.utcnow()
                 return
             trip_rows = conn.execute(
-                select(Trip.trip_id, Trip.name, Trip.route_id, Trip.direction_id)
-                .where(Trip.transit_system_id == ts_id)
+                select(Trip.trip_id, Trip.name, Trip.route_id, Trip.direction_id).where(
+                    Trip.transit_system_id == ts_id
+                )
             ).all()
             stop_rows = conn.execute(
-                select(Stop.stop_id, Stop.name, Stop.trip_id).where(Stop.transit_system_id == ts_id)
+                select(Stop.stop_id, Stop.name, Stop.trip_id).where(
+                    Stop.transit_system_id == ts_id
+                )
             ).all()
             route_rows = conn.execute(
-                select(Route.route_id, Route.color, Route.text_color)
-                .where(Route.transit_system_id == ts_id)
+                select(Route.route_id, Route.color, Route.text_color).where(
+                    Route.transit_system_id == ts_id
+                )
             ).all()
 
         colors_by_route: Dict[str, Tuple[str, str]] = {
@@ -96,7 +101,9 @@ class ScheduleCache:
         for row in trip_rows:
             trips[row.trip_id] = row.name
             if row.name and row.route_id is not None:
-                headsigns_by_route_dir.setdefault((row.route_id, row.direction_id), row.name)
+                headsigns_by_route_dir.setdefault(
+                    (row.route_id, row.direction_id), row.name
+                )
                 headsigns_by_route_dir.setdefault((row.route_id, None), row.name)
             if row.route_id:
                 route_id_by_trip[row.trip_id] = row.route_id
@@ -105,11 +112,13 @@ class ScheduleCache:
                     colors_by_trip[row.trip_id] = route_colors
 
         colors_by_stop: Dict[str, Tuple[str, str]] = {}
-        for row in stop_rows:
-            route_id = route_id_by_trip.get(row.trip_id) if row.trip_id else None
+        for stop_row in stop_rows:
+            route_id = (
+                route_id_by_trip.get(stop_row.trip_id) if stop_row.trip_id else None
+            )
             route_colors = colors_by_route.get(route_id) if route_id else None
             if route_colors:
-                colors_by_stop[row.stop_id] = route_colors
+                colors_by_stop[stop_row.stop_id] = route_colors
 
         cls._trips[transit_system] = trips
         cls._headsigns_by_route_dir[transit_system] = headsigns_by_route_dir

@@ -22,7 +22,7 @@ services:
 
   backend:
     build: .
-    command: sh -c "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload"
     env_file:
       - .env.dev_docker
     ports:
@@ -30,28 +30,34 @@ services:
     depends_on:
       - db
       - redis
+    volumes:
+      - ./:/app
     networks:
       - gtfs-network
 
   celery-worker:
     build: .
-    command: celery -A src.tasks worker --loglevel=info
+    command: watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A src.tasks worker --loglevel=info
     env_file:
       - .env.dev_docker
     depends_on:
       - db
       - redis
+    volumes:
+      - ./:/app
     networks:
       - gtfs-network
 
   celery-beat:
     build: .
-    command: celery -A src.tasks beat --loglevel=info
+    command: watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A src.tasks beat --loglevel=info
     env_file:
       - .env.dev_docker
     depends_on:
       - db
       - redis
+    volumes:
+      - ./:/app
     networks:
       - gtfs-network
 

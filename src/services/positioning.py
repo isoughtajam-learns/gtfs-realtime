@@ -1,9 +1,11 @@
 from datetime import datetime
+from typing import Sequence
 
 from generated import gtfs_realtime_pb2
 from src.models import SimplePosition, Status
 
 StopTimeEvent = gtfs_realtime_pb2.TripUpdate.StopTimeEvent
+StopTimeUpdate = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate
 
 
 def _event_time(event: StopTimeEvent | None) -> int | None:
@@ -12,7 +14,7 @@ def _event_time(event: StopTimeEvent | None) -> int | None:
     return None
 
 
-def get_location(stop_times) -> SimplePosition | None:
+def get_location(stop_times: Sequence[StopTimeUpdate]) -> SimplePosition | None:
     now = datetime.now().timestamp()
     prev = None
     for stop in stop_times:

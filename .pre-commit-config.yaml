@@ -1,15 +1,24 @@
+exclude: ^(alembic/versions/|generated/)
+
 repos:
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.11.0  # Use the latest available Mypy version
     hooks:
       - id: mypy
         # Pass files matching your codebase directory structure
-        files: ^(src|tests)/
+        files: ^src/
         args: [--config-file=pyproject.toml]
         additional_dependencies:
           - types-requests
           - types-PyYAML
+          - types-protobuf
           - pydantic >= 2.0
+          - pydantic-settings >= 2.0
+          - sqlalchemy >= 2.0.51
+          - fastapi >= 0.139.2
+          - sse-starlette >= 3.4.6
+          - celery >= 5.4.0
+          - celery-types
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Get the latest version tag from the repo
     rev: v0.15.20

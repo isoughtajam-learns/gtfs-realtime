@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import ForeignKey, ForeignKeyConstraint, UniqueConstraint, Sequence
+from sqlalchemy import ForeignKey, ForeignKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -46,9 +46,7 @@ class TransitSystem(ORMBase):
     # restart/redeploy, so they can't be trusted to prevent repeat fetches
     # across container churn. This column can.
     last_fetched_at: Mapped[Optional[datetime]]
-    __table_args__ = (
-        UniqueConstraint('name', name='uq_name'),
-    )
+    __table_args__ = (UniqueConstraint("name", name="uq_name"),)
 
 
 class Route(ORMBase):
@@ -57,15 +55,17 @@ class Route(ORMBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
     route_id: Mapped[str]
-    short_name: Mapped[str] = mapped_column(primary_key=True, unique=True, autoincrement=False)
+    short_name: Mapped[str] = mapped_column(
+        primary_key=True, unique=True, autoincrement=False
+    )
     long_name: Mapped[str]
     url: Mapped[str]
     color: Mapped[str]
     text_color: Mapped[str]
 
     __table_args__ = (
-        UniqueConstraint('id', 'short_name', name='uq_route_short_name'),
-        UniqueConstraint('short_name', name='uq_short_name'),
+        UniqueConstraint("id", "short_name", name="uq_route_short_name"),
+        UniqueConstraint("short_name", name="uq_short_name"),
     )
 
 
@@ -80,7 +80,7 @@ class Trip(ORMBase):
     direction_id: Mapped[Optional[int]]
     __table_args__ = (
         ForeignKeyConstraint(["id", "trip_id"], ["trip.id", "trip.trip_id"]),
-        UniqueConstraint('transit_system_id', 'trip_id', name='uq_trip'),
+        UniqueConstraint("transit_system_id", "trip_id", name="uq_trip"),
     )
 
 
@@ -91,8 +91,11 @@ class Stop(ORMBase):
     transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
     trip_id: Mapped[str]
     name: Mapped[str]
-    zone_id: Mapped[str]
+    # Optional per the GTFS spec (legacy zone-based fares) - many agencies
+    # (e.g. Kiev) never populate it, so it can't be a hard requirement for a
+    # stop to be usable.
+    zone_id: Mapped[Optional[str]]
     stop_headsign: Mapped[Optional[str]]
     __table_args__ = (
-        UniqueConstraint('stop_id', 'transit_system_id', name='uq_transit_stop_id'),
+        UniqueConstraint("stop_id", "transit_system_id", name="uq_transit_stop_id"),
     )
