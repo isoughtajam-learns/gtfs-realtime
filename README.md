@@ -125,14 +125,32 @@ We use Celery to periodically fetch fresh GTFS Schedule metadata to keep the dat
 - **Registering a new task**: Celery's auto-generated task name is module-qualified based on how the app is invoked (`celery -A src.tasks worker` → `src.tasks.<funcname>`, not just `tasks.<funcname>`). Verify the actual name in the worker's startup `[tasks]` log banner before wiring it into `beat_schedule` - a mismatched name fails silently (the task is just never dispatched, no error).
 
 # AWS Deployment
-### ECR instructions
 
-```
-$ aws login
-$ aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 537735702437.dkr.ecr.us-east-2.amazonaws.com
-$ docker tag gtfs-realtime-backend:latest 537735702437.dkr.ecr.us-east-2.amazonaws.com/portfolio/gtfs-realtime/backend:latest
-$ docker push 537735702437.dkr.ecr.us-east-2.amazonaws.com/portfolio/gtfs-realtime/backend:latest
-```
+### Release & deploy workflow
+
+Deploys only ever build from a **tagged commit reachable from `origin/main`** - never the local working tree, and never an unmerged branch. This is enforced by `deployment/deploy.sh`, not just a convention: it verifies the tag with `git merge-base --is-ancestor` before building, and builds via `git archive <tag> | docker build -` (a clean export of that exact commit's tree) rather than `docker build .` against whatever's on disk.
+
+**The backend and frontend are two fully independent Terraform stacks**, each deployed by its own script, so they can move at their own pace without either blocking or accidentally dragging the other along:
+- `gtfs-realtime/deployment` - backend/celery-worker/celery-beat + all the shared infrastructure (EC2 instance, ECS cluster, RDS, ElastiCache, IAM, secrets).
+- `../gtfs-dashboard/deployment` - just the frontend (ECR repo, task definition, service). It looks up the shared ECS cluster/execution role/secrets *by name* (`data` sources), not by reading this stack's state file - the only thing coupling the two is that `var.app_name` must match between them.
+
+1. **Merge to `main`** on GitHub as usual (PR workflow), in whichever repo you're releasing.
+2. **Cut a release** - tags that repo's `origin/main` tip with the next version and pushes the tag. Defaults to a patch bump:
+   ```bash
+   ./deployment/tag-release.sh            # patch bump, e.g. v0.2.1 -> v0.2.2
+   ./deployment/tag-release.sh minor      # v0.2.2 -> v0.3.0
+   ./deployment/tag-release.sh major      # v0.3.0 -> v1.0.0
+   ```
+   (Same command in `../gtfs-dashboard/deployment/tag-release.sh` for a frontend release.)
+3. **Deploy just that side**:
+   ```bash
+   cd deployment && ./deploy.sh            # latest tag, or ./deploy.sh v0.2.2 to pin
+   ```
+   Builds and pushes the image from its verified tag, runs `terraform plan` against *that stack only*, and asks for confirmation before `terraform apply` rolls out the new task definition. The image is already in ECR by the time you're asked to confirm - answering no only skips the deploy, not the push.
+
+`var.backend_image_tag` / `../gtfs-dashboard`'s `var.frontend_image_tag` have no defaults on purpose - every apply must name an explicit version, so there's no floating `:latest` that could silently drift between what Terraform thinks is deployed and what's actually running (the same class of surprise as the AMI reference in `main.tf` floating to "latest recommended" - see the EC2 instance-replacement note in `deployment/main.tf`'s AMI data source).
+
+This wasn't always two stacks - it started as one Terraform stack managing both, split later via `terraform state rm` + `terraform import` (never destroy/recreate) once independent release cadences made the coupling painful. If you ever need to do something similar: import into the new state first and verify a clean `terraform plan` (zero unexpected diff) *before* removing the resource from the old stack's config/state, so a mistake mid-migration never leaves the resource unowned by either.
 
 ### Manually triggering a GTFS Schedule fetch in production
 

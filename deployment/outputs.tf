@@ -3,11 +3,6 @@ output "ecr_repository_url" {
   value       = aws_ecr_repository.app.repository_url
 }
 
-output "frontend_ecr_repository_url" {
-  description = "URL of the frontend ECR repository - push the image built from ../gtfs-dashboard's Dockerfile here"
-  value       = aws_ecr_repository.frontend.repository_url
-}
-
 output "ecs_cluster_name" {
   description = "Name of the deployed ECS Cluster"
   value       = aws_ecs_cluster.main.name
@@ -26,11 +21,6 @@ output "celery_worker_service_name" {
 output "celery_beat_service_name" {
   description = "Name of the celery beat ECS service"
   value       = aws_ecs_service.celery_beat.name
-}
-
-output "frontend_service_name" {
-  description = "Name of the frontend ECS service"
-  value       = aws_ecs_service.frontend.name
 }
 
 output "aws_region" {
