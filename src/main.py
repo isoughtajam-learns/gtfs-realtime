@@ -80,7 +80,6 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     if trip_descriptor.HasField("direction_id")
                     else None
                 )
-                vehicle = str(entity.trip_update.vehicle.label)
                 stop_time_updates = entity.trip_update.stop_time_update
                 position = get_location(stop_time_updates)
                 if not position:
@@ -115,7 +114,6 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                         stop_id=position.stop_id,
                         previous=position.previous,
                         next=position.next,
-                        vehicle=vehicle,
                         status=position.status,
                         trip_headsign=headsign,
                         stop_name=stop_names.get(position.stop_id),

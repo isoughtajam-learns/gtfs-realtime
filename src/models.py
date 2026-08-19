@@ -8,8 +8,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Status(StrEnum):
-    IN_TRANSIT = "In Transit"
-    AT_STOP = "Stopped"
+    IN_TRANSIT = "In Transit 💨"
+    AT_STOP = "Stopped 🛑"
 
 
 # BaseModels for transient, runtime data
@@ -23,7 +23,6 @@ class SimplePosition(BaseModel):
 
 class TripPosition(SimplePosition):
     trip_id: str
-    vehicle: str
     trip_headsign: Optional[str] = None
     color: Optional[str] = None
     text_color: Optional[str] = None
