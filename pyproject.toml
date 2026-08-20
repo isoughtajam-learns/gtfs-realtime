@@ -11,6 +11,7 @@ dependencies = [
     "grpcio",
     "grpcio-tools",
     "gtfs-realtime-bindings",
+    "posthog>=7.39.1",
     "psycopg2>=2.9.12",
     "psycopg2-binary",
     "redis>=5.2.1",
@@ -19,9 +20,17 @@ dependencies = [
     "sse-starlette>=3.4.6",
     "uvicorn[standard]>=0.51.0",
     "watchdog>=6.0.0",
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp",
 ]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
 strict = true
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

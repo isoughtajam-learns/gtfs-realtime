@@ -9,6 +9,7 @@ stops.txt for stop_id and stop_name
 import argparse
 import csv
 import io
+import logging
 import os
 import shutil
 import zipfile
@@ -24,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert
 from src.database import engine
 from src.constants import GTFS_URLS, GTFS_METADATA, DEFAULT_SCHEDULE_URL_BY_SYSTEM
 from src.models import ORMBase, TransitSystem, Trip, Stop, Route
+from src.telemetry import configure_posthog_logging
 from src.services.schedule_utils import (
     is_earlier_stop_sequence,
     missing_route_fields,
@@ -33,6 +35,7 @@ from src.services.schedule_utils import (
     resolve_trip_headsign,
 )
 
+logger = logging.getLogger(__name__)
 
 TMP_DIR = "src/tmp/"
 METADATA_DIR = "src/metadata/"
@@ -97,7 +100,7 @@ class Fetcher:
         )
         metadata_exists = os.path.isfile(self.tmp_file(METADATA_FILE))
         if not metadata_exists:
-            print(
+            logger.error(
                 f"No feed_info.txt file found for GTFS Schedule - {self.transit_system}"
             )
             return False
@@ -349,20 +352,20 @@ class Fetcher:
         }
 
     def _print_diagnosis(self, report: dict[str, Any]) -> None:
-        print(f"=== Diagnosis: {report['transit_system']} ===")
+        logger.debug(f"=== Diagnosis: {report['transit_system']} ===")
 
         fi = report["feed_info"]
         if not fi["present"]:
-            print(
+            logger.debug(
                 "  feed_info.txt: MISSING - should_update() always reports 'no update needed' without "
                 "it, so this system will never auto-ingest on celery-beat's schedule (force=True bypasses this)."
             )
         elif not fi["valid_today"]:
-            print(
+            logger.debug(
                 f"  feed_info.txt: present, but not valid today (window {fi['feed_start_date']}-{fi['feed_end_date']})"
             )
         else:
-            print(
+            logger.debug(
                 f"  feed_info.txt: OK (valid {fi['feed_start_date']}-{fi['feed_end_date']})"
             )
 
@@ -372,51 +375,53 @@ class Fetcher:
             if st["row_count"] > 200_000
             else ""
         )
-        print(f"  stop_times.txt: {st['row_count']:,} rows{size_note}")
+        logger.debug(f"  stop_times.txt: {st['row_count']:,} rows{size_note}")
 
         routes = report["routes"]
         if not routes["present"]:
-            print("  routes.txt: MISSING")
+            logger.debug("  routes.txt: MISSING")
         else:
-            print(
+            logger.debug(
                 f"  routes.txt: {routes['usable_rows']}/{routes['total_rows']} rows usable"
             )
             for field, count in sorted(
                 routes["missing_field_counts"].items(), key=lambda kv: -kv[1]
             ):
-                print(f"    missing {field}: {count}/{routes['total_rows']} rows")
+                logger.debug(
+                    f"    missing {field}: {count}/{routes['total_rows']} rows"
+                )
 
         trips = report["trips"]
         if not trips["present"]:
-            print("  trips.txt: MISSING")
+            logger.debug("  trips.txt: MISSING")
         else:
             by_source = trips["headsign_resolved_by"]
             resolved = (
                 ", ".join(f"{k}={v}" for k, v in by_source.items() if k != "unresolved")
                 or "none"
             )
-            print(
+            logger.debug(
                 f"  trips.txt: {trips['total_rows']} rows, headsign resolved via: {resolved}"
             )
             unresolved = by_source.get("unresolved", 0)
             if unresolved:
-                print(
+                logger.debug(
                     f"    unresolved (no headsign from any source): {unresolved}/{trips['total_rows']} rows"
                 )
 
         stops = report["stops"]
         if not stops["present"]:
-            print("  stops.txt: MISSING")
+            logger.debug("  stops.txt: MISSING")
         else:
-            print(
+            logger.debug(
                 f"  stops.txt: {stops['usable_rows']}/{stops['location_type_0_rows']} location_type=0 rows usable"
             )
             for field, count in sorted(
                 stops["missing_field_counts"].items(), key=lambda kv: -kv[1]
             ):
-                print(f"    missing {field}: {count} rows")
+                logger.debug(f"    missing {field}: {count} rows")
             if stops["zone_id_missing_rows"]:
-                print(
+                logger.debug(
                     f"    missing zone_id (informational, doesn't block usability): "
                     f"{stops['zone_id_missing_rows']}/{stops['location_type_0_rows']} rows"
                 )
@@ -434,7 +439,9 @@ class Fetcher:
                 z.extractall(f"{TMP_DIR}{self.transit_system}")
 
         if not force and not self.should_update():
-            print(f"No updates needed from GTFS Schedule data - {self.transit_system}")
+            logger.info(
+                f"No updates needed from GTFS Schedule data - {self.transit_system}"
+            )
             return
 
         # Scan stop_times.txt once, from tmp/ (before promotion) - diagnose()
@@ -446,7 +453,7 @@ class Fetcher:
         )
         report = self.diagnose(headsign_by_trip, stop_meta, stop_times_rows)
         if not self._diagnosis_passes(report):
-            print(
+            logger.warning(
                 f"Diagnosis failed for {self.transit_system} - not promoting or ingesting this fetch. See report above."
             )
             self.remove_tmp()
@@ -484,8 +491,8 @@ class Fetcher:
                 self.upsert_stops(connection, stop_meta)
                 self.upsert_routes(connection)
             except Exception as ex:
-                print(f"Error: {ex}")
-        print(f"Upserts completed for {', '.join(METADATA_FILE_LIST)}")
+                logger.error(f"Error: {ex}")
+        logger.info(f"Upserts completed for {', '.join(METADATA_FILE_LIST)}")
 
     def upsert_transit_system(self, connection: Connection) -> None:
         realtime_url = GTFS_URLS.get(self.transit_system)
@@ -506,7 +513,7 @@ class Fetcher:
             ),
         )
         result = connection.execute(upsert_stmt)
-        print(f"upsert transit system result: {result.keys()}")
+        logger.info(f"upsert transit system result: {result.keys()}")
 
     def upsert_routes(self, connection: Connection) -> None:
         transit_system_id = self.select_transit_system(connection)
@@ -547,7 +554,7 @@ class Fetcher:
             "uq_short_name",
             ["short_name", "long_name", "url", "color", "text_color"],
         )
-        print(f"upsert routes result: {total} rows")
+        logger.info(f"upsert routes result: {total} rows")
 
     def _scan_stop_times(
         self, file_path: str | None = None
@@ -649,7 +656,7 @@ class Fetcher:
             "uq_trip",
             ["name", "direction_id"],
         )
-        print(f"upsert trips result: {total} rows")
+        logger.info(f"upsert trips result: {total} rows")
 
     def upsert_stops(
         self, connection: Connection, stop_meta: dict[str, dict[str, Any]]
@@ -699,10 +706,21 @@ class Fetcher:
             "uq_transit_stop_id",
             ["name", "stop_headsign"],
         )
-        print(f"upsert stops result: {total} rows")
+        logger.info(f"upsert stops result: {total} rows")
 
 
 if __name__ == "__main__":
+    # WARNING by default so third-party libraries (requests/urllib3, etc.)
+    # stay quiet; DEBUG scoped to just this module's own logger so
+    # --diagnose's report (logged at DEBUG - see _print_diagnosis) actually
+    # prints. format="%(message)s" keeps it plain, matching a CLI report
+    # rather than a service log. Note: run via `python -m src.commands.fetcher`,
+    # this module's __name__ is "__main__", not "src.commands.fetcher" - so
+    # the level has to be set on `logger` directly, not by name.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    logger.setLevel(logging.DEBUG)
+    configure_posthog_logging()
+
     parser = argparse.ArgumentParser(
         description="Fetch GTFS Schedule data and upsert it into the database."
     )
@@ -767,6 +785,6 @@ if __name__ == "__main__":
             try:
                 fetcher.fetch_metadata_update(force=args.force)
             except Exception as ex:
-                print(f"Error fetching for {transit_system}: {ex}")
+                logger.error(f"Error fetching for {transit_system}: {ex}")
         else:
             fetcher.fetch_metadata_update(force=args.force)
