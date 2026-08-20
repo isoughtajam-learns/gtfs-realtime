@@ -1,20 +1,84 @@
 import asyncio
-from typing import Any, AsyncGenerator
+import atexit
+from contextlib import asynccontextmanager
+import logging
+from typing import Any, AsyncGenerator, AsyncIterator
 
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.sse import EventSourceResponse, ServerSentEvent
-from starlette import status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from posthog import Posthog
+from starlette import status
 
 from generated import gtfs_realtime_pb2
 from src.constants import GTFS_URLS
-from src.services.positioning import get_location
 from src.models import TripPosition
+from src.services.positioning import get_location
 from src.services.schedule_cache import ScheduleCache
 from src.settings import get_settings
+from src.telemetry import configure_posthog_logging
 
-app = FastAPI()
+configure_posthog_logging()
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Initialize and gracefully stop the shared PostHog client."""
+    settings = get_settings()
+    posthog_client: Posthog | None = None
+
+    if not settings.posthog_enabled:
+        yield
+        return
+
+    if not settings.posthog_project_token:
+        if not settings.debug:
+            raise RuntimeError(
+                "POSTHOG_PROJECT_TOKEN variable required by PostHog is missing or "
+                "un-configured, this causes events to be silently missed. This error "
+                "stops appearing once POSTHOG_PROJECT_TOKEN is configured"
+            )
+    elif not settings.posthog_host:
+        if not settings.debug:
+            raise RuntimeError(
+                "POSTHOG_HOST variable required by PostHog is missing or un-configured, "
+                "this causes events to be silently missed. This error stops appearing "
+                "once POSTHOG_HOST is configured"
+            )
+    else:
+        posthog_client = Posthog(
+            settings.posthog_project_token,
+            host=settings.posthog_host,
+            enable_exception_autocapture=True,
+        )
+        app.state.posthog_client = posthog_client
+        atexit.register(posthog_client.shutdown)
+
+    yield
+
+    if posthog_client:
+        posthog_client.flush()
+        posthog_client.shutdown()
+        atexit.unregister(posthog_client.shutdown)
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def capture_unhandled_exception(
+    request: Request, exc: Exception
+) -> PlainTextResponse:
+    """Send unhandled server exceptions to PostHog before returning a 500 response."""
+    posthog_client = getattr(request.app.state, "posthog_client", None)
+    if posthog_client:
+        posthog_client.capture_exception(exc)
+
+    return PlainTextResponse("Internal Server Error", status_code=500)
+
 
 # Define the origins that are allowed to make requests to your backend
 origins = [
@@ -49,7 +113,17 @@ async def _fetch_feed(gtfs_url: str) -> gtfs_realtime_pb2.FeedMessage:
 async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, None]:
     gtfs_url = GTFS_URLS.get(transit_system)
     if not gtfs_url:
+        logger.error(f"GTFS URL not found for {transit_system}")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    posthog_client = getattr(app.state, "posthog_client", None)
+    if posthog_client:
+        posthog_client.capture(
+            "trip_updates_stream_opened",
+            distinct_id=None,
+            properties={"transit_system": transit_system},
+        )
+
     while True:
         (
             trip_headsigns,
@@ -62,11 +136,11 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
         try:
             feed = await _fetch_feed(gtfs_url)
         except requests.exceptions.RequestException as ex:
-            print(f"Request error fetching feed for {transit_system}: {ex}")
+            logger.error(f"Request error fetching feed for {transit_system}: {ex}")
             await asyncio.sleep(30)
             continue
         except Exception as ex:
-            print(f"Parse error with Feed Message for {transit_system}: {ex}")
+            logger.error(f"Parse error with Feed Message for {transit_system}: {ex}")
             await asyncio.sleep(30)
             continue
 
@@ -127,7 +201,14 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
 
 
 @app.get("/transit_systems")
-async def get_transit_systems() -> list[str]:
+async def get_transit_systems(request: Request) -> list[str]:
+    posthog_client = getattr(request.app.state, "posthog_client", None)
+    if posthog_client:
+        posthog_client.capture(
+            "transit_systems_listed",
+            distinct_id=None,
+        )
+
     return list(GTFS_URLS.keys())
 
 

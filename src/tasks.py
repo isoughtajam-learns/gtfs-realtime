@@ -7,6 +7,9 @@ from src.commands.fetcher import Fetcher
 from src.constants import GTFS_METADATA
 from src.models import TransitSystem, Trip, Stop
 from src.settings import get_settings
+from src.telemetry import configure_posthog_logging
+
+configure_posthog_logging()
 
 settings = get_settings()
 app = Celery("gtfs_tasks", broker=settings.celery_broker_url)

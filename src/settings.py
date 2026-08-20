@@ -44,6 +44,17 @@ class Settings(BaseSettings):
         default="redis://localhost:6379/0",
         alias="CELERY_BROKER_URL",
     )
+    # Defaults on (prod's .env.prod doesn't need to set this) - dev/local
+    # environments that don't want PostHog running set POSTHOG_ENABLED=false
+    # explicitly, rather than just leaving the token/host blank, which would
+    # otherwise look like a misconfiguration (see lifespan()/telemetry.py -
+    # both raise in debug mode if enabled but unconfigured).
+    posthog_enabled: bool = Field(default=True, alias="POSTHOG_ENABLED")
+    posthog_project_token: str | None = Field(
+        default=None,
+        alias="POSTHOG_PROJECT_TOKEN",
+    )
+    posthog_host: str | None = Field(default=None, alias="POSTHOG_HOST")
 
 
 @lru_cache
