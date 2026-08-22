@@ -8,17 +8,23 @@ repos:
         # Pass files matching your codebase directory structure
         files: ^src/
         args: [--config-file=pyproject.toml]
+        # Pinned to exact versions, not just floors: an unpinned stub
+        # package (types-protobuf) resolved to different, incompatible
+        # versions locally vs. in CI within the same day, causing this
+        # hook to pass/fail nondeterministically depending purely on when
+        # its environment was (re)built. Bump these deliberately, not by
+        # accident.
         additional_dependencies:
-          - types-requests
-          - types-PyYAML
-          - types-protobuf
-          - pydantic >= 2.0
-          - pydantic-settings >= 2.0
-          - sqlalchemy >= 2.0.51
-          - fastapi >= 0.139.2
-          - sse-starlette >= 3.4.6
-          - celery >= 5.4.0
-          - celery-types
+          - types-requests==2.33.0.20260712
+          - types-PyYAML==6.0.12.20260815
+          - types-protobuf==7.35.1.20260822
+          - pydantic==2.13.4
+          - pydantic-settings==2.15.0
+          - sqlalchemy==2.0.52
+          - fastapi==0.141.1
+          - sse-starlette==3.4.8
+          - celery==5.6.3
+          - celery-types==0.26.0
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Get the latest version tag from the repo
     rev: v0.15.20
