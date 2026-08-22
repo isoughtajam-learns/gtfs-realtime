@@ -50,7 +50,7 @@ jobs:
       # or Dockerfile change early. Does not push anywhere; real deploys
       # stay exactly as they are today (deployment/tag-release.sh +
       # deploy.sh, manual and tag-gated).
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false
