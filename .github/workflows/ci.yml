@@ -1,0 +1,56 @@
+name: CI
+
+# pull_request fires on every push to a branch with an open PR (covers "PR
+# builds on each push"); push:main re-runs the same checks after merge, to
+# catch issues from combining PRs that were each individually fine.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Runs the exact same .pre-commit-config.yaml as local hooks (mypy +
+      # ruff + ruff-format) - single source of truth, no drift between what
+      # a contributor's machine enforces and what CI enforces.
+      - uses: pre-commit/action@v3.0.1
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # `uv run` syncs the environment (including the `dev` dependency
+      # group, which is where pytest lives) on demand - no separate sync
+      # step needed. Tests don't need a live Postgres: SQLAlchemy's
+      # create_engine() is lazy and .env.dev (committed) supplies a
+      # syntactically valid but unreachable DATABASE_URL, which is enough
+      # for every test in this suite (none of them execute a query).
+      - run: uv run pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Validates the Dockerfile still builds - catches a broken dependency
+      # or Dockerfile change early. Does not push anywhere; real deploys
+      # stay exactly as they are today (deployment/tag-release.sh +
+      # deploy.sh, manual and tag-gated).
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
