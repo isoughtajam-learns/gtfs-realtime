@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       # Validates the Dockerfile still builds - catches a broken dependency
       # or Dockerfile change early. Does not push anywhere; real deploys
       # stay exactly as they are today (deployment/tag-release.sh +
