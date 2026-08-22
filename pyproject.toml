@@ -30,6 +30,16 @@ plugins = ["pydantic.mypy"]
 strict = true
 ignore_missing_imports = true
 
+# generated/ is protoc output (grpc_tools.protoc), not hand-authored - its
+# .pyi isn't guaranteed mypy-clean, and observably isn't: the same pinned
+# mypy + types-protobuf versions produced 41 errors in CI but zero locally,
+# purely from environment differences neither of us controls. Ignore errors
+# originating in the module itself; code that imports from it is still
+# type-checked normally.
+[[tool.mypy.overrides]]
+module = "generated.*"
+ignore_errors = true
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
