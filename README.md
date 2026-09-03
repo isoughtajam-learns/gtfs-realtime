@@ -25,6 +25,25 @@ uv run uvicorn src.main:app
 ## Usage
 Update GTFS_URLS in src/constants.py with new GTFS-Realtime trip update sources.
 
+## API endpoints
+
+- `GET /trip_updates/{transit_system}` — SSE stream of live position events (`src/main.py`'s `transit_feed()`). Each event is one trip's *current* stop only - see `/trip_detail` below for the rest of a trip's stops.
+- `GET /transit_systems` — list of configured `GTFS_URLS` keys.
+- `GET /transit_systems/{transit_system}` — system-level metadata that changes rarely (currently just `timezone`, an IANA identifier like `"America/Los_Angeles"` from `agency.txt`'s `agency_timezone`). Its own endpoint rather than a field on every SSE event, since the frontend can fetch and cache it once instead of receiving the same static value on every streamed `trip_update`.
+- `GET /trip_detail/{transit_system}/{trip_id}` — everything the realtime feed says about one specific, currently-active trip, plus whatever GTFS Schedule data we have on its route/trip/stops. Meant to back a "trip detail" UI (e.g. clicking an event from the SSE stream).
+
+  Polls the realtime feed fresh on each request (no caching - a detail view is low-frequency, unlike the SSE hot path) and looks for an entity matching `trip_id`; `404`s if the trip isn't in the current feed (it may not be running right now), `502`s if the source itself is unreachable or the feed doesn't parse.
+
+  Returns, beyond what the SSE event already has:
+  - **Every remaining stop** on the trip (`stops[]`), not just the current one - each with its own arrival/departure time *and* delay, and `schedule_relationship` (e.g. `SKIPPED`).
+  - Trip-level `delay`/`timestamp` (overall lateness and feed freshness, distinct from per-stop delay), `start_time`/`start_date`, and `schedule_relationship`.
+  - `vehicle_id`/`vehicle_label`, where the source actually publishes a real per-vehicle identifier — verified reliable for MBTA and NY_Waterway; BART's `vehicle.label` is not a vehicle identity (it describes car configuration, e.g. `"3-door"`), and BART never sets `vehicle.id` at all. Helsinki sets neither.
+  - Route detail (`route_short_name`/`long_name`/`url`/`color`/`text_color`/`route_type`) and per-stop Schedule detail (`stop_lat`/`stop_lon`, `platform_code`/`platform_name`, `wheelchair_boarding`) sourced from `src/services/trip_detail.py`'s DB lookups, not the realtime feed.
+
+  `route_id` is resolved from **our own stored `Trip.route_id`**, not the live feed's `TripDescriptor.route_id` - some sources (BART) never populate the latter at all, even though the same trip's route is right there in the Schedule data we already ingested. Trusting the live feed for it would silently drop route info for those sources.
+
+- `GET /info` — app metadata (name, admin email, env, debug mode) from `Settings`.
+
 ## Update transit system metadata
 ```
 uv run python -m src.commands.fetcher
@@ -51,10 +70,12 @@ uv run python -m src.commands.fetcher --diagnose --transit-system SomeNewAgency 
 The fetcher pulls each transit system's GTFS Schedule zip from `GTFS_METADATA` in `src/constants.py`, extracts it under `src/tmp/<transit_system>/`, **diagnoses it in place** (see below - this is where `--diagnose` and the automatic pre-promotion gate share the same code path, so the check you can run ahead of time is exactly the check every real fetch runs), promotes the files into `src/metadata/<transit_system>/` only if that diagnosis passes, and upserts the parsed rows into Postgres. Files read: `trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`, `feed_info.txt`.
 
 Tables populated (see `src/models.py`):
-- `transit_system` — one row per system, holds realtime + schedule URLs.
-- `route` — from `routes.txt`; `route_id`, short/long names, url, colors.
-- `trip` — from `trips.txt`; `trip_id` (string), `route_id`, `direction_id`, and `name` (headsign) hydrated via the fallback chain below.
-- `stop` — from `stops.txt` (location_type=0) joined with `stop_times.txt`; captures `stop_headsign` per stop.
+- `transit_system` — one row per system, holds realtime + schedule URLs, and `timezone` (from `agency.txt`'s `agency_timezone` - see `GET /transit_systems/{transit_system}` above).
+- `route` — from `routes.txt`; `route_id`, short/long names, url, colors, `route_type` (GTFS numeric mode enum - bus/rail/ferry/etc).
+- `trip` — from `trips.txt`; `trip_id` (string), `route_id`, `direction_id`, `name` (headsign, hydrated via the fallback chain below), `trip_short_name` (rider-facing train/run number, e.g. MBTA commuter rail's "509" - distinct from `trip_id`), `wheelchair_accessible`, `bikes_allowed`.
+- `stop` — from `stops.txt` (location_type=0) joined with `stop_times.txt`; captures `stop_headsign`, `lat`/`lon`, `platform_code`/`platform_name`, `wheelchair_boarding` per stop.
+
+All of the fields listed above beyond the original core set (`route_type`, `trip_short_name`, `wheelchair_accessible`, `bikes_allowed`, `lat`/`lon`, `platform_code`/`platform_name`, `wheelchair_boarding`) are optional, same as `zone_id` - present when a source publishes them, `None` otherwise, and never gate whether a row is usable (see `missing_route_fields`/`missing_stop_fields` in `src/services/schedule_utils.py`). They exist to back `GET /trip_detail` (see "API endpoints" above), not the core "show a position on the map" feature.
 
 ### Headsign fallback chain
 
@@ -85,6 +106,18 @@ Run it standalone with `--diagnose` (see above) before adding a new system to `G
 1. `trip_headsigns.get(trip_id)`
 2. `headsigns_by_route_dir.get((route_id, direction_id))`
 3. Destination stop name — the last `stop_time_update`'s `stop_id` looked up in `stop_names`. Works even when realtime and Schedule share no `trip_id` namespace (e.g. BART).
+
+### Tracking a single trip: the `trip_id` dependency
+
+Everywhere we identify "this train" - `transit_feed()`'s SSE event key, `ScheduleCache` lookups, the `trip`/`stop` tables - is keyed on `trip_update.trip.trip_id` from the realtime feed. That works today for **BART, MBTA, and NY_Waterway**: each publishes a `trip_id` that's unique per entity and stable for the life of the trip (confirmed by polling live, including a stability check across a 15s gap). All three also publish absolute `arrival.time`/`departure.time` on `stop_time_update`, which `get_location()` (`src/services/positioning.py`) requires to place a trip between stops - a source that only publishes relative `arrival.delay` (no absolute `time`) can't be positioned this way at all; this was the reason Estonia was dropped rather than fixed (see `deployment` history / project memory).
+
+**Helsinki_Regional_Transport is a gap**: HSL never sets `trip_update.trip.trip_id` - it's an empty string on every entity, confirmed live (654/654 entities). HSL instead identifies a trip via the combination of `route_id` + `direction_id` + `start_time` + `start_date`. Since our code only keys on `trip_id`, every Helsinki entity is currently indistinguishable from every other one on our end, even though upstream they're genuinely different trains.
+
+**Fallback options, if this needs fixing later** (not yet implemented):
+- Synthesize a trip identifier from the composite key HSL actually uses: `route_id`/`direction_id`/`start_time`/`start_date`.
+- Or use the top-level `FeedEntity.id` field (distinct from `trip_update.trip.trip_id`) - confirmed live to be both unique per trip and stable across polls (934/934 unchanged across a 15s gap) for Helsinki. Not currently read anywhere in this codebase.
+
+Either would need `ScheduleCache`/`main.py`/the DB schema to accept a fallback key when `trip_id` is blank, rather than assuming `trip_id` is always present and unique.
 
 ## Database migrations
 

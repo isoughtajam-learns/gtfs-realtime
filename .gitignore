@@ -23,3 +23,5 @@ deployment/*.tfstate
 deployment/*.tfstate.*
 deployment/tfplan*
 deployment/*.tfvars
+
+celerybeat-schedule

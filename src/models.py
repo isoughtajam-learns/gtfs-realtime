@@ -28,6 +28,65 @@ class TripPosition(SimplePosition):
     text_color: Optional[str] = None
 
 
+class TripStopDetail(BaseModel):
+    """One stop_time_update from the live feed, joined against our stored
+    Schedule data for that stop. Unlike TripPosition (one "current" stop),
+    /trip_detail returns every remaining stop on the trip."""
+
+    stop_sequence: Optional[int] = None
+    stop_id: str
+    stop_name: Optional[str] = None
+    stop_lat: Optional[float] = None
+    stop_lon: Optional[float] = None
+    platform_code: Optional[str] = None
+    platform_name: Optional[str] = None
+    wheelchair_boarding: Optional[int] = None
+    arrival_time: Optional[int] = None
+    arrival_delay: Optional[int] = None
+    departure_time: Optional[int] = None
+    departure_delay: Optional[int] = None
+    schedule_relationship: str
+
+
+class TripDetail(BaseModel):
+    """Response for GET /trip_detail/{transit_system}/{trip_id} - everything
+    the realtime feed says about this one trip right now, plus whatever
+    Schedule data we have on its route/trip/stops."""
+
+    trip_id: str
+    route_id: Optional[str] = None
+    direction_id: Optional[int] = None
+    trip_headsign: Optional[str] = None
+    trip_short_name: Optional[str] = None
+    wheelchair_accessible: Optional[int] = None
+    bikes_allowed: Optional[int] = None
+    start_time: Optional[str] = None
+    start_date: Optional[str] = None
+    schedule_relationship: Optional[str] = None
+    delay: Optional[int] = None
+    timestamp: Optional[int] = None
+    vehicle_id: Optional[str] = None
+    vehicle_label: Optional[str] = None
+    route_short_name: Optional[str] = None
+    route_long_name: Optional[str] = None
+    route_url: Optional[str] = None
+    route_color: Optional[str] = None
+    route_text_color: Optional[str] = None
+    route_type: Optional[int] = None
+    stops: list[TripStopDetail] = []
+
+
+class TransitSystemDetail(BaseModel):
+    """Response for GET /transit_systems/{transit_system} - system-level
+    metadata that changes rarely (e.g. its GTFS Schedule timezone).
+    Deliberately its own endpoint rather than a field on every SSE event:
+    the frontend can fetch it once and cache it client-side instead of
+    receiving the same static value on every single streamed trip_update."""
+
+    name: str
+    timezone: Optional[str] = None
+
+
 class ORMBase(DeclarativeBase):
     pass
 
@@ -45,6 +104,12 @@ class TransitSystem(ORMBase):
     # restart/redeploy, so they can't be trusted to prevent repeat fetches
     # across container churn. This column can.
     last_fetched_at: Mapped[Optional[datetime]]
+    # From agency.txt's agency_timezone (required by the GTFS spec, though
+    # not every source complies) - an IANA identifier like
+    # "America/Los_Angeles". Optional here for the same reason every other
+    # Schedule-derived field is: some source failing to comply with the
+    # spec shouldn't block ingestion of everything else.
+    timezone: Mapped[Optional[str]]
     __table_args__ = (UniqueConstraint("name", name="uq_name"),)
 
 
@@ -61,6 +126,10 @@ class Route(ORMBase):
     url: Mapped[str]
     color: Mapped[str]
     text_color: Mapped[str]
+    # GTFS numeric mode enum (0=tram, 1=subway, 2=rail, 3=bus, 4=ferry, ...) -
+    # optional here for the same reason zone_id is: not every field we'd
+    # like to show needs to gate whether a route is usable at all.
+    route_type: Mapped[Optional[int]]
 
     __table_args__ = (
         UniqueConstraint("id", "short_name", name="uq_route_short_name"),
@@ -77,6 +146,13 @@ class Trip(ORMBase):
     route_id: Mapped[str]
     name: Mapped[Optional[str]]
     direction_id: Mapped[Optional[int]]
+    # trips.txt's rider-facing train/run number (e.g. MBTA commuter rail's
+    # "509") - distinct from trip_id, which is an internal identifier.
+    trip_short_name: Mapped[Optional[str]]
+    # GTFS 0/1/2 enums (no info / accessible / not accessible) - optional,
+    # not every source publishes them.
+    wheelchair_accessible: Mapped[Optional[int]]
+    bikes_allowed: Mapped[Optional[int]]
     __table_args__ = (
         ForeignKeyConstraint(["id", "trip_id"], ["trip.id", "trip.trip_id"]),
         UniqueConstraint("transit_system_id", "trip_id", name="uq_trip"),
@@ -95,6 +171,14 @@ class Stop(ORMBase):
     # stop to be usable.
     zone_id: Mapped[Optional[str]]
     stop_headsign: Mapped[Optional[str]]
+    # Needed for any map display in a trip detail view - not required for a
+    # stop to be "usable" (same reasoning as zone_id above), since the core
+    # feature (stop_name) doesn't depend on it.
+    lat: Mapped[Optional[float]]
+    lon: Mapped[Optional[float]]
+    platform_code: Mapped[Optional[str]]
+    platform_name: Mapped[Optional[str]]
+    wheelchair_boarding: Mapped[Optional[int]]
     __table_args__ = (
         UniqueConstraint("stop_id", "transit_system_id", name="uq_transit_stop_id"),
     )

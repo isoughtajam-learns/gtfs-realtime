@@ -9,7 +9,26 @@ Also used by fetcher.py's --diagnose mode to report exactly where a source
 falls short of what these rules expect.
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def dedupe_rows_by_columns(
+    rows: List[Dict[str, Any]], columns: List[str]
+) -> List[Dict[str, Any]]:
+    """Deduplicates row-dicts by `columns`, keeping the last occurrence for
+    each unique key - normal upsert "last write wins" semantics. Used
+    before a batched ON CONFLICT DO UPDATE: Postgres raises
+    CardinalityViolation if a single statement's VALUES would affect the
+    same row twice, which happens whenever two source rows share the same
+    conflict-target columns - a real, recurring case here, not a
+    theoretical one: MBTA's routes.txt reuses the same route_short_name
+    across many distinct route_ids for shuttle-bus replacements (e.g.
+    "Rockport Line Shuttle" appears dozens of times)."""
+    deduped: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for row in rows:
+        key = tuple(row[col] for col in columns)
+        deduped[key] = row
+    return list(deduped.values())
 
 
 def resolve_trip_headsign(
@@ -60,13 +79,28 @@ def resolve_route_url(
     return route_url or default_url
 
 
-def parse_direction_id(raw: Optional[str]) -> Optional[int]:
-    """trips.txt's direction_id is an optional "0"/"1" string; blank or
-    malformed values become None rather than failing the whole row."""
+def parse_optional_int(raw: Optional[str]) -> Optional[int]:
+    """Generic parser for the many small GTFS integer enums/codes that are
+    optional in practice (direction_id, route_type, wheelchair_accessible,
+    bikes_allowed, wheelchair_boarding, ...): blank or malformed values
+    become None rather than failing the whole row."""
     if not raw:
         return None
     try:
         return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_optional_float(raw: Optional[str]) -> Optional[float]:
+    """stops.txt's stop_lat/stop_lon are technically required by the GTFS
+    spec, but blank or malformed values show up in practice; treat them
+    the same permissive way as every other optional-in-practice field
+    here rather than failing the whole row."""
+    if not raw:
+        return None
+    try:
+        return float(raw)
     except (TypeError, ValueError):
         return None
 

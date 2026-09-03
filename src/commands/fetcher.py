@@ -27,10 +27,12 @@ from src.constants import GTFS_URLS, GTFS_METADATA, DEFAULT_SCHEDULE_URL_BY_SYST
 from src.models import ORMBase, TransitSystem, Trip, Stop, Route
 from src.telemetry import configure_posthog_logging
 from src.services.schedule_utils import (
+    dedupe_rows_by_columns,
     is_earlier_stop_sequence,
     missing_route_fields,
     missing_stop_fields,
-    parse_direction_id,
+    parse_optional_float,
+    parse_optional_int,
     resolve_route_url,
     resolve_trip_headsign,
 )
@@ -44,7 +46,8 @@ TRIPS_FILE = "trips.txt"
 STOPS_FILE = "stops.txt"
 STOP_TIMES_FILE = "stop_times.txt"
 ROUTES_FILE = "routes.txt"
-METADATA_FILE_LIST = [TRIPS_FILE, STOPS_FILE, STOP_TIMES_FILE, ROUTES_FILE]
+AGENCY_FILE = "agency.txt"
+METADATA_FILE_LIST = [TRIPS_FILE, STOPS_FILE, STOP_TIMES_FILE, ROUTES_FILE, AGENCY_FILE]
 UPDATED_METADATA_FILE = "updated_metadata.txt"
 
 # Upsert rows in fixed-size batches rather than one statement per file, so a
@@ -58,8 +61,26 @@ def _upsert_batched(
     table: type[ORMBase],
     rows: list[dict[str, Any]],
     constraint: str,
+    conflict_columns: list[str],
     update_columns: list[str],
 ) -> int:
+    """Deduplicates `rows` by `conflict_columns` (keeping the last
+    occurrence - normal upsert "last write wins" semantics) before
+    chunking into batches. Postgres's ON CONFLICT DO UPDATE raises
+    CardinalityViolation if a single statement's VALUES would affect the
+    same row twice - a real, recurring case here: MBTA's routes.txt reuses
+    the same route_short_name across many distinct route_ids for
+    shuttle-bus replacements (e.g. "Rockport Line Shuttle" appears
+    dozens of times). Deduping the full row list up front, rather than
+    only within whichever batch a collision happens to land in, is what
+    actually prevents this regardless of batch boundaries. Without this,
+    the whole upsert statement fails and - since do_upserts() runs
+    everything in one transaction - Postgres aborts the *entire*
+    transaction, silently discarding every prior upsert in the same fetch
+    (trips, stops, even the transit_system row) despite their row counts
+    having already been logged as if they'd succeeded."""
+    rows = dedupe_rows_by_columns(rows, conflict_columns)
+
     total = 0
     for start in range(0, len(rows), UPSERT_BATCH_SIZE):
         batch = rows[start : start + UPSERT_BATCH_SIZE]
@@ -130,6 +151,12 @@ class Fetcher:
             os.makedirs(self.real_dir())
         for file_name in file_names:
             tmp_file = Path(f"{self.tmp_file(file_name)}")
+            # agency.txt is required by the GTFS spec, but not every real
+            # source complies (we've already seen several spec violations
+            # from real feeds - Kiev's missing location_type, HSL's blank
+            # trip_id, etc.) - skip rather than crash the whole promotion.
+            if not tmp_file.exists():
+                continue
             real_file = Path(f"{self.real_file(file_name)}")
             tmp_file.rename(real_file)
 
@@ -497,12 +524,14 @@ class Fetcher:
     def upsert_transit_system(self, connection: Connection) -> None:
         realtime_url = GTFS_URLS.get(self.transit_system)
         schedule_url = GTFS_METADATA.get(self.transit_system)
+        timezone = self._parse_agency_timezone()
 
         stmt = insert(TransitSystem).values(
             name=self.transit_system,
             realtime_url=realtime_url,
             schedule_url=schedule_url,
             last_fetched_at=datetime.utcnow(),
+            timezone=timezone,
         )
         upsert_stmt = stmt.on_conflict_do_update(
             constraint="uq_name",
@@ -510,10 +539,28 @@ class Fetcher:
                 realtime_url=stmt.excluded.realtime_url,
                 schedule_url=stmt.excluded.schedule_url,
                 last_fetched_at=stmt.excluded.last_fetched_at,
+                timezone=stmt.excluded.timezone,
             ),
         )
         result = connection.execute(upsert_stmt)
         logger.info(f"upsert transit system result: {result.keys()}")
+
+    def _parse_agency_timezone(self) -> str | None:
+        """agency.txt's agency_timezone is required by the GTFS spec (an
+        IANA identifier like "America/Los_Angeles"), but not every source
+        includes the file at all - see update_metadata(). Takes the first
+        non-empty value; a feed with multiple agencies in different
+        timezones is a real (if rare) possibility the spec allows, but our
+        data model has one timezone per transit_system, not per agency."""
+        path = self.real_file(AGENCY_FILE)
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                timezone = row.get("agency_timezone")
+                if timezone:
+                    return timezone
+        return None
 
     def upsert_routes(self, connection: Connection) -> None:
         transit_system_id = self.select_transit_system(connection)
@@ -543,6 +590,7 @@ class Fetcher:
                         "url": url,
                         "color": color,
                         "text_color": text_color,
+                        "route_type": parse_optional_int(row.get("route_type")),
                     }
                 )
         if not routes:
@@ -552,7 +600,8 @@ class Fetcher:
             Route,
             routes,
             "uq_short_name",
-            ["short_name", "long_name", "url", "color", "text_color"],
+            ["short_name"],
+            ["short_name", "long_name", "url", "color", "text_color", "route_type"],
         )
         logger.info(f"upsert routes result: {total} rows")
 
@@ -637,7 +686,7 @@ class Fetcher:
                     stop_headsigns_by_trip.get(trip_id),
                     route_long_names.get(route_id) if route_id else None,
                 )
-                direction_id = parse_direction_id(row.get("direction_id"))
+                direction_id = parse_optional_int(row.get("direction_id"))
                 rows_to_write.append(
                     {
                         "trip_id": trip_id,
@@ -645,6 +694,11 @@ class Fetcher:
                         "name": name,
                         "route_id": route_id,
                         "direction_id": direction_id,
+                        "trip_short_name": row.get("trip_short_name") or None,
+                        "wheelchair_accessible": parse_optional_int(
+                            row.get("wheelchair_accessible")
+                        ),
+                        "bikes_allowed": parse_optional_int(row.get("bikes_allowed")),
                     }
                 )
         if not rows_to_write:
@@ -654,7 +708,14 @@ class Fetcher:
             Trip,
             rows_to_write,
             "uq_trip",
-            ["name", "direction_id"],
+            ["transit_system_id", "trip_id"],
+            [
+                "name",
+                "direction_id",
+                "trip_short_name",
+                "wheelchair_accessible",
+                "bikes_allowed",
+            ],
         )
         logger.info(f"upsert trips result: {total} rows")
 
@@ -681,6 +742,13 @@ class Fetcher:
                         "transit_system_id": transit_system_id,
                         "name": row.get("stop_name", ""),
                         "zone_id": row.get("zone_id", ""),
+                        "lat": parse_optional_float(row.get("stop_lat")),
+                        "lon": parse_optional_float(row.get("stop_lon")),
+                        "platform_code": row.get("platform_code") or None,
+                        "platform_name": row.get("platform_name") or None,
+                        "wheelchair_boarding": parse_optional_int(
+                            row.get("wheelchair_boarding")
+                        ),
                     }
                 )
         if not trip_stops:
@@ -694,6 +762,11 @@ class Fetcher:
                 name=v.get("name"),
                 zone_id=v.get("zone_id"),
                 stop_headsign=v.get("stop_headsign"),
+                lat=v.get("lat"),
+                lon=v.get("lon"),
+                platform_code=v.get("platform_code"),
+                platform_name=v.get("platform_name"),
+                wheelchair_boarding=v.get("wheelchair_boarding"),
             )
             for k, v in trip_stops.items()
             if not missing_stop_fields(v.get("trip_id"), v.get("name"))
@@ -704,7 +777,21 @@ class Fetcher:
             Stop,
             rows_to_write,
             "uq_transit_stop_id",
-            ["name", "stop_headsign"],
+            ["stop_id", "transit_system_id"],
+            # zone_id was missing here before too (a pre-existing gap, fixed
+            # in passing) - without it in update_columns, a re-fetch would
+            # never refresh a stop's zone_id (or any of the new fields
+            # below) once the row already existed.
+            [
+                "name",
+                "stop_headsign",
+                "zone_id",
+                "lat",
+                "lon",
+                "platform_code",
+                "platform_name",
+                "wheelchair_boarding",
+            ],
         )
         logger.info(f"upsert stops result: {total} rows")
 
