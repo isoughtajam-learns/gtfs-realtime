@@ -1,8 +1,10 @@
 from src.services.schedule_utils import (
+    dedupe_rows_by_columns,
     is_earlier_stop_sequence,
     missing_route_fields,
     missing_stop_fields,
-    parse_direction_id,
+    parse_optional_float,
+    parse_optional_int,
     resolve_route_url,
     resolve_trip_headsign,
 )
@@ -64,15 +66,26 @@ def test_resolve_route_url_none_when_no_default_configured() -> None:
     assert resolve_route_url(None, None) is None
 
 
-def test_parse_direction_id_valid_values() -> None:
-    assert parse_direction_id("0") == 0
-    assert parse_direction_id("1") == 1
+def test_parse_optional_int_valid_values() -> None:
+    assert parse_optional_int("0") == 0
+    assert parse_optional_int("1") == 1
 
 
-def test_parse_direction_id_blank_or_malformed_is_none() -> None:
-    assert parse_direction_id(None) is None
-    assert parse_direction_id("") is None
-    assert parse_direction_id("not-a-number") is None
+def test_parse_optional_int_blank_or_malformed_is_none() -> None:
+    assert parse_optional_int(None) is None
+    assert parse_optional_int("") is None
+    assert parse_optional_int("not-a-number") is None
+
+
+def test_parse_optional_float_valid_values() -> None:
+    assert parse_optional_float("37.7749") == 37.7749
+    assert parse_optional_float("-122.4194") == -122.4194
+
+
+def test_parse_optional_float_blank_or_malformed_is_none() -> None:
+    assert parse_optional_float(None) is None
+    assert parse_optional_float("") is None
+    assert parse_optional_float("not-a-number") is None
 
 
 def test_missing_route_fields_empty_when_all_present() -> None:
@@ -109,3 +122,62 @@ def test_missing_stop_fields_kiev_style_zone_id_absent_is_still_usable() -> None
     """Real-world case: Kiev's stops.txt has no zone_id column at all, but
     the stop is still usable - zone_id isn't a required field."""
     assert missing_stop_fields("T1", "ТРЕД № 1") == []
+
+
+def test_dedupe_rows_by_columns_no_duplicates_returns_all_rows() -> None:
+    rows = [{"id": "A", "v": 1}, {"id": "B", "v": 2}]
+    assert dedupe_rows_by_columns(rows, ["id"]) == rows
+
+
+def test_dedupe_rows_by_columns_keeps_last_occurrence() -> None:
+    rows = [
+        {"id": "A", "v": 1},
+        {"id": "A", "v": 2},
+        {"id": "B", "v": 3},
+    ]
+    assert dedupe_rows_by_columns(rows, ["id"]) == [
+        {"id": "A", "v": 2},
+        {"id": "B", "v": 3},
+    ]
+
+
+def test_dedupe_rows_by_columns_mbta_style_shuttle_short_name_collision() -> None:
+    """Real-world case: MBTA's routes.txt reuses the same route_short_name
+    across many distinct route_ids for shuttle-bus replacements - this is
+    the exact CardinalityViolation this function exists to prevent."""
+    rows = [
+        {
+            "route_id": "Shuttle-ManchesterRockport",
+            "short_name": "Rockport Line Shuttle",
+        },
+        {
+            "route_id": "Shuttle-RockportSalemExpress",
+            "short_name": "Rockport Line Shuttle",
+        },
+        {"route_id": "Red", "short_name": "Red Line"},
+    ]
+    deduped = dedupe_rows_by_columns(rows, ["short_name"])
+    assert len(deduped) == 2
+    assert {row["short_name"] for row in deduped} == {
+        "Rockport Line Shuttle",
+        "Red Line",
+    }
+
+
+def test_dedupe_rows_by_columns_composite_key() -> None:
+    # Trip/Stop upserts dedupe on a two-column conflict target
+    # (transit_system_id, trip_id) / (stop_id, transit_system_id), not a
+    # single column - same trip_id under two different systems must not
+    # collide with each other.
+    rows = [
+        {"transit_system_id": 1, "trip_id": "T1", "name": "old"},
+        {"transit_system_id": 1, "trip_id": "T1", "name": "new"},
+        {"transit_system_id": 2, "trip_id": "T1", "name": "different system"},
+    ]
+    deduped = dedupe_rows_by_columns(rows, ["transit_system_id", "trip_id"])
+    assert len(deduped) == 2
+    assert {row["name"] for row in deduped} == {"new", "different system"}
+
+
+def test_dedupe_rows_by_columns_empty_list() -> None:
+    assert dedupe_rows_by_columns([], ["id"]) == []

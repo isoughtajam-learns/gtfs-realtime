@@ -1,14 +1,16 @@
 import asyncio
 from datetime import datetime
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 import requests
+from fastapi import HTTPException
 from fastapi.sse import ServerSentEvent
 from google.protobuf.message import DecodeError
 
 from generated import gtfs_realtime_pb2
-from src.main import _fetch_feed, transit_feed
+from src.main import _fetch_feed, get_transit_system_detail, transit_feed, trip_detail
 from src.services.schedule_cache import ScheduleCache
 
 
@@ -170,3 +172,298 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
 
     assert call_count["n"] == 2
     assert event.data.trip_id == "T1"
+
+
+EMPTY_SCHEDULE_CONTEXT: dict[str, Any] = {"trip": None, "route": None, "stops": {}}
+
+
+def _feed_with_trip_detail_entity() -> bytes:
+    """Deliberately mirrors the real BART bug this endpoint was built
+    against: the live feed's TripDescriptor.route_id is left unset, even
+    though the trip is real and has a route in our own stored Schedule
+    data - trip_detail() must fall back to the DB's route_id, not just
+    trust (or silently drop) whatever the live feed does or doesn't say."""
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    entity = feed.entity.add()
+    entity.id = "e1"
+    entity.trip_update.trip.trip_id = "T1"
+    entity.trip_update.trip.direction_id = 1
+    entity.trip_update.trip.start_time = "08:00:00"
+    entity.trip_update.trip.start_date = "20260901"
+    entity.trip_update.vehicle.id = "V1"
+    entity.trip_update.vehicle.label = "Vehicle One"
+    entity.trip_update.delay = 120
+    entity.trip_update.timestamp = 1_700_000_000
+
+    stop1 = entity.trip_update.stop_time_update.add()
+    stop1.stop_sequence = 1
+    stop1.stop_id = "S1"
+    stop1.arrival.time = 1_700_000_100
+    stop1.arrival.delay = 60
+    stop1.departure.time = 1_700_000_130
+    stop1.departure.delay = 60
+
+    stop2 = entity.trip_update.stop_time_update.add()
+    stop2.stop_sequence = 2
+    stop2.stop_id = "S2"
+    stop2.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+
+    return bytes(feed.SerializeToString())
+
+
+def _mock_schedule_context() -> dict[str, Any]:
+    return {
+        "trip": {
+            "route_id": "R1",
+            "trip_headsign": "Downtown",
+            "direction_id": 1,
+            "trip_short_name": "509",
+            "wheelchair_accessible": 1,
+            "bikes_allowed": 2,
+        },
+        "route": {
+            "route_short_name": "Red",
+            "route_long_name": "Red Line",
+            "route_url": "https://agency.example/red",
+            "route_color": "FF0000",
+            "route_text_color": "FFFFFF",
+            "route_type": 1,
+        },
+        "stops": {
+            "S1": {
+                "stop_name": "First St",
+                "stop_lat": 37.1,
+                "stop_lon": -122.1,
+                "platform_code": "1",
+                "platform_name": None,
+                "wheelchair_boarding": 1,
+            },
+        },
+    }
+
+
+def test_trip_detail_404s_for_unknown_transit_system() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(trip_detail("NotASystem", "T1"))
+    assert exc_info.value.status_code == 404
+
+
+def test_trip_detail_502s_on_request_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(trip_detail("BART", "T1"))
+    assert exc_info.value.status_code == 502
+
+
+def test_trip_detail_502s_on_parse_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(b"not a protobuf, just garbage"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(trip_detail("BART", "T1"))
+    assert exc_info.value.status_code == 502
+
+
+def test_trip_detail_404s_when_trip_not_in_current_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: _mock_response(_valid_feed_bytes())
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(trip_detail("BART", "some-other-trip-id"))
+    assert exc_info.value.status_code == 404
+
+
+def test_trip_detail_merges_live_feed_with_schedule_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_trip_detail_entity()),
+    )
+    monkeypatch.setattr(
+        "src.main.get_trip_schedule_context",
+        lambda *a, **k: _mock_schedule_context(),
+    )
+    # This test isn't about the tail-stop backfill - stub it out so it can't
+    # accidentally pass or fail based on whatever real stop_times.txt happens
+    # to be sitting in src/metadata/BART/ on whichever machine runs it.
+    monkeypatch.setattr("src.main.get_scheduled_tail_stops", lambda *a, **k: [])
+
+    detail = asyncio.run(trip_detail("BART", "T1"))
+
+    assert detail.trip_id == "T1"
+    # TripDescriptor.route_id was never set on the live entity - this is
+    # only non-None because it fell back to the DB's stored route_id.
+    assert detail.route_id == "R1"
+    assert detail.direction_id == 1
+    assert detail.trip_headsign == "Downtown"
+    assert detail.trip_short_name == "509"
+    assert detail.wheelchair_accessible == 1
+    assert detail.bikes_allowed == 2
+    assert detail.start_time == "08:00:00"
+    assert detail.start_date == "20260901"
+    assert detail.schedule_relationship == "SCHEDULED"
+    assert detail.delay == 120
+    assert detail.timestamp == 1_700_000_000
+    assert detail.vehicle_id == "V1"
+    assert detail.vehicle_label == "Vehicle One"
+    assert detail.route_short_name == "Red"
+    assert detail.route_long_name == "Red Line"
+    assert detail.route_color == "FF0000"
+    assert detail.route_type == 1
+
+    assert len(detail.stops) == 2
+    first, second = detail.stops
+
+    assert first.stop_id == "S1"
+    assert first.stop_sequence == 1
+    assert first.stop_name == "First St"
+    assert first.stop_lat == 37.1
+    assert first.stop_lon == -122.1
+    assert first.platform_code == "1"
+    assert first.wheelchair_boarding == 1
+    assert first.arrival_time == 1_700_000_100
+    assert first.arrival_delay == 60
+    assert first.departure_time == 1_700_000_130
+    assert first.departure_delay == 60
+    assert first.schedule_relationship == "SCHEDULED"
+
+    # S2 has no Schedule-side match and no arrival/departure - every
+    # Schedule-derived field should degrade to None rather than error,
+    # and the live SKIPPED status must come through correctly.
+    assert second.stop_id == "S2"
+    assert second.stop_name is None
+    assert second.arrival_time is None
+    assert second.departure_time is None
+    assert second.schedule_relationship == "SKIPPED"
+
+
+def test_trip_detail_missing_schedule_context_degrades_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trip that's live right now but wasn't in our last Schedule fetch
+    (e.g. newly added) should still return a usable response - just
+    without the Schedule-derived fields, not a crash."""
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_trip_detail_entity()),
+    )
+    monkeypatch.setattr(
+        "src.main.get_trip_schedule_context",
+        lambda *a, **k: EMPTY_SCHEDULE_CONTEXT,
+    )
+    monkeypatch.setattr("src.main.get_scheduled_tail_stops", lambda *a, **k: [])
+
+    detail = asyncio.run(trip_detail("BART", "T1"))
+
+    assert detail.trip_id == "T1"
+    assert detail.route_id is None
+    assert detail.trip_headsign is None
+    assert detail.route_short_name is None
+    assert detail.stops[0].stop_name is None
+
+
+def test_trip_detail_backfills_tail_stops_missing_from_live_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the live feed stops short of the end of the line (confirmed
+    live: BART), the response should still cover the rest of the route
+    from our stored Schedule data - each backfilled stop marked NO_DATA
+    with no arrival/departure info, since none was ever published."""
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_trip_detail_entity()),
+    )
+    monkeypatch.setattr(
+        "src.main.get_scheduled_tail_stops",
+        lambda transit_system, trip_id, live_stop_ids: (
+            [(3, "S3"), (4, "S4")] if live_stop_ids == ["S1", "S2"] else []
+        ),
+    )
+
+    def _schedule_context(
+        transit_system: str, trip_id: str, stop_ids: list[str]
+    ) -> dict[str, Any]:
+        context = _mock_schedule_context()
+        # The endpoint must ask for tail stops too, not just the live ones.
+        assert set(stop_ids) == {"S1", "S2", "S3", "S4"}
+        context["stops"]["S3"] = {
+            "stop_name": "Third St",
+            "stop_lat": 37.3,
+            "stop_lon": -122.3,
+            "platform_code": "3",
+            "platform_name": None,
+            "wheelchair_boarding": 1,
+        }
+        return context
+
+    monkeypatch.setattr("src.main.get_trip_schedule_context", _schedule_context)
+
+    detail = asyncio.run(trip_detail("BART", "T1"))
+
+    assert len(detail.stops) == 4
+    third, fourth = detail.stops[2], detail.stops[3]
+
+    assert third.stop_id == "S3"
+    assert third.stop_sequence == 3
+    assert third.stop_name == "Third St"
+    assert third.stop_lat == 37.3
+    assert third.arrival_time is None
+    assert third.arrival_delay is None
+    assert third.departure_time is None
+    assert third.departure_delay is None
+    assert third.schedule_relationship == "NO_DATA"
+
+    # S4 has no Schedule-side match either - should degrade to None, not error.
+    assert fourth.stop_id == "S4"
+    assert fourth.stop_sequence == 4
+    assert fourth.stop_name is None
+    assert fourth.schedule_relationship == "NO_DATA"
+
+
+def test_transit_system_detail_404s_for_unknown_system() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(get_transit_system_detail("NotASystem"))
+    assert exc_info.value.status_code == 404
+
+
+def test_transit_system_detail_returns_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.main.get_transit_system_timezone",
+        lambda *a, **k: "America/Los_Angeles",
+    )
+
+    detail = asyncio.run(get_transit_system_detail("BART"))
+
+    assert detail.name == "BART"
+    assert detail.timezone == "America/Los_Angeles"
+
+
+def test_transit_system_detail_timezone_none_when_not_yet_fetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A system that's configured but hasn't had a successful Schedule fetch
+    # yet (or whose agency.txt didn't parse) should degrade to None, not
+    # error - matches how every other Schedule-derived field behaves.
+    monkeypatch.setattr("src.main.get_transit_system_timezone", lambda *a, **k: None)
+
+    detail = asyncio.run(get_transit_system_detail("BART"))
+
+    assert detail.name == "BART"
+    assert detail.timezone is None

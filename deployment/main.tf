@@ -30,9 +30,12 @@ locals {
   # drift apart. The frontend task definition itself now lives in
   # ../gtfs-dashboard/deployment (its own Terraform stack) and looks these
   # secrets up by name via a data source - but it uses THIS role, so this
-  # stack still owns granting it access.
-  tls_cert_arn = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-cert"
-  tls_key_arn  = "arn:aws:secretsmanager:us-east-2:537735702437:secret:gtfs-realtime/tls-key"
+  # stack still owns granting it access. Looked up via data source (not a
+  # hardcoded ARN literal) because Secrets Manager appends a random 6-char
+  # suffix to every secret's real ARN - a hand-typed ARN without it silently
+  # never matches anything.
+  tls_cert_arn = data.aws_secretsmanager_secret.tls_cert.arn
+  tls_key_arn  = data.aws_secretsmanager_secret.tls_key.arn
 
   common_environment = [
     { name = "ENV", value = "prod" },
@@ -59,6 +62,17 @@ locals {
       "awslogs-stream-prefix" = prefix
     }
   } }
+}
+
+# TLS cert/key are provisioned by hand in Secrets Manager (see locals above),
+# so their real ARN (with Secrets Manager's random suffix) has to be looked
+# up rather than guessed.
+data "aws_secretsmanager_secret" "tls_cert" {
+  name = "${var.app_name}/tls-cert"
+}
+
+data "aws_secretsmanager_secret" "tls_key" {
+  name = "${var.app_name}/tls-key"
 }
 
 # ------------------------------------------------------------------------------

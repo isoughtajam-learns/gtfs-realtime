@@ -14,9 +14,11 @@ from starlette import status
 
 from generated import gtfs_realtime_pb2
 from src.constants import GTFS_URLS
-from src.models import TripPosition
+from src.models import TransitSystemDetail, TripDetail, TripPosition, TripStopDetail
 from src.services.positioning import get_location
 from src.services.schedule_cache import ScheduleCache
+from src.services.transit_system_detail import get_transit_system_timezone
+from src.services.trip_detail import get_scheduled_tail_stops, get_trip_schedule_context
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
 
@@ -200,6 +202,170 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
         await asyncio.sleep(30)
 
 
+@app.get("/trip_detail/{transit_system}/{trip_id}")
+async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
+    """Everything the realtime feed says about one trip right now, plus
+    whatever GTFS Schedule data we have on its route/trip/stops - the full
+    stop_time_update list (not just the current position, unlike
+    transit_feed()'s SSE event), per-stop delay/schedule_relationship,
+    vehicle info where the source publishes it, and Schedule fields
+    (coordinates, route_type, platform, accessibility) that never made it
+    into the streamed event at all."""
+    gtfs_url = GTFS_URLS.get(transit_system)
+    if not gtfs_url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+
+    try:
+        feed = await _fetch_feed(gtfs_url)
+    except requests.exceptions.RequestException as ex:
+        logger.error(f"Request error fetching feed for {transit_system}: {ex}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not reach the realtime source",
+        )
+    except Exception as ex:
+        logger.error(f"Parse error with Feed Message for {transit_system}: {ex}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Malformed realtime feed"
+        )
+
+    entity = next(
+        (
+            e
+            for e in feed.entity
+            if e.HasField("trip_update") and e.trip_update.trip.trip_id == trip_id
+        ),
+        None,
+    )
+    if entity is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Trip not found in the current realtime feed - it may not be running right now",
+        )
+
+    trip_update = entity.trip_update
+    trip_descriptor = trip_update.trip
+    live_stop_ids = [stu.stop_id for stu in trip_update.stop_time_update if stu.stop_id]
+
+    # Some sources (confirmed live: BART) don't publish a stop_time_update
+    # for every remaining stop on a trip - the live feed can legitimately
+    # fall short of where the route's long_name says the line actually
+    # ends. Backfill the rest from our own stored Schedule data so the
+    # response still shows the full route, marked as having no live
+    # prediction rather than silently cutting off early.
+    tail_stops = (
+        await asyncio.to_thread(
+            get_scheduled_tail_stops, transit_system, trip_id, live_stop_ids
+        )
+        if live_stop_ids
+        else []
+    )
+    tail_stop_ids = [stop_id for _, stop_id in tail_stops]
+
+    context = await asyncio.to_thread(
+        get_trip_schedule_context,
+        transit_system,
+        trip_id,
+        live_stop_ids + tail_stop_ids,
+    )
+    trip_schedule = context["trip"] or {}
+    route_schedule = context["route"] or {}
+    stops_schedule = context["stops"]
+
+    stops = [
+        TripStopDetail(
+            stop_sequence=(
+                stu.stop_sequence if stu.HasField("stop_sequence") else None
+            ),
+            stop_id=stu.stop_id,
+            stop_name=stops_schedule.get(stu.stop_id, {}).get("stop_name"),
+            stop_lat=stops_schedule.get(stu.stop_id, {}).get("stop_lat"),
+            stop_lon=stops_schedule.get(stu.stop_id, {}).get("stop_lon"),
+            platform_code=stops_schedule.get(stu.stop_id, {}).get("platform_code"),
+            platform_name=stops_schedule.get(stu.stop_id, {}).get("platform_name"),
+            wheelchair_boarding=stops_schedule.get(stu.stop_id, {}).get(
+                "wheelchair_boarding"
+            ),
+            arrival_time=(
+                stu.arrival.time
+                if stu.HasField("arrival") and stu.arrival.HasField("time")
+                else None
+            ),
+            arrival_delay=(
+                stu.arrival.delay
+                if stu.HasField("arrival") and stu.arrival.HasField("delay")
+                else None
+            ),
+            departure_time=(
+                stu.departure.time
+                if stu.HasField("departure") and stu.departure.HasField("time")
+                else None
+            ),
+            departure_delay=(
+                stu.departure.delay
+                if stu.HasField("departure") and stu.departure.HasField("delay")
+                else None
+            ),
+            schedule_relationship=gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.ScheduleRelationship.Name(
+                stu.schedule_relationship
+            ),
+        )
+        for stu in trip_update.stop_time_update
+    ]
+    stops.extend(
+        TripStopDetail(
+            stop_sequence=sequence,
+            stop_id=stop_id,
+            stop_name=stops_schedule.get(stop_id, {}).get("stop_name"),
+            stop_lat=stops_schedule.get(stop_id, {}).get("stop_lat"),
+            stop_lon=stops_schedule.get(stop_id, {}).get("stop_lon"),
+            platform_code=stops_schedule.get(stop_id, {}).get("platform_code"),
+            platform_name=stops_schedule.get(stop_id, {}).get("platform_name"),
+            wheelchair_boarding=stops_schedule.get(stop_id, {}).get(
+                "wheelchair_boarding"
+            ),
+            arrival_time=None,
+            arrival_delay=None,
+            departure_time=None,
+            departure_delay=None,
+            schedule_relationship="NO_DATA",
+        )
+        for sequence, stop_id in tail_stops
+    )
+
+    return TripDetail(
+        trip_id=trip_id,
+        route_id=trip_descriptor.route_id or trip_schedule.get("route_id"),
+        direction_id=(
+            trip_descriptor.direction_id
+            if trip_descriptor.HasField("direction_id")
+            else trip_schedule.get("direction_id")
+        ),
+        trip_headsign=trip_schedule.get("trip_headsign"),
+        trip_short_name=trip_schedule.get("trip_short_name"),
+        wheelchair_accessible=trip_schedule.get("wheelchair_accessible"),
+        bikes_allowed=trip_schedule.get("bikes_allowed"),
+        start_time=trip_descriptor.start_time or None,
+        start_date=trip_descriptor.start_date or None,
+        schedule_relationship=gtfs_realtime_pb2.TripDescriptor.ScheduleRelationship.Name(
+            trip_descriptor.schedule_relationship
+        ),
+        delay=trip_update.delay if trip_update.HasField("delay") else None,
+        timestamp=trip_update.timestamp if trip_update.HasField("timestamp") else None,
+        vehicle_id=trip_update.vehicle.id or None,
+        vehicle_label=trip_update.vehicle.label or None,
+        route_short_name=route_schedule.get("route_short_name"),
+        route_long_name=route_schedule.get("route_long_name"),
+        route_url=route_schedule.get("route_url"),
+        route_color=route_schedule.get("route_color"),
+        route_text_color=route_schedule.get("route_text_color"),
+        route_type=route_schedule.get("route_type"),
+        stops=stops,
+    )
+
+
 @app.get("/transit_systems")
 async def get_transit_systems(request: Request) -> list[str]:
     posthog_client = getattr(request.app.state, "posthog_client", None)
@@ -210,6 +376,21 @@ async def get_transit_systems(request: Request) -> list[str]:
         )
 
     return list(GTFS_URLS.keys())
+
+
+@app.get("/transit_systems/{transit_system}")
+async def get_transit_system_detail(transit_system: str) -> TransitSystemDetail:
+    """System-level metadata that changes rarely (currently just the GTFS
+    Schedule timezone) - its own endpoint rather than a field on every SSE
+    event, since the frontend can fetch and cache this once instead of
+    receiving the same static value on every streamed trip_update."""
+    if transit_system not in GTFS_URLS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+
+    timezone = await asyncio.to_thread(get_transit_system_timezone, transit_system)
+    return TransitSystemDetail(name=transit_system, timezone=timezone)
 
 
 @app.get("/info")

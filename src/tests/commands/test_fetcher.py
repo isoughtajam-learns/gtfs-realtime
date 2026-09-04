@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from src.commands.fetcher import Fetcher
 
 
@@ -31,3 +33,27 @@ def test_scan_stop_times_strips_bom_from_first_column_so_trip_id_is_found(
     assert headsign_by_trip == {"T1": "Downtown"}
     assert stop_meta["S1"]["trip_id"] == "T1"
     assert stop_meta["S2"]["trip_id"] == "T1"
+
+
+def test_parse_agency_timezone_returns_first_populated_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agency_file = tmp_path / "agency.txt"
+    agency_file.write_text(
+        "agency_id,agency_name,agency_timezone\n1,Test Agency,America/Los_Angeles\n"
+    )
+    fetcher = Fetcher(url="http://example.com/gtfs.zip", transit_system="Test_System")
+    monkeypatch.setattr(fetcher, "real_file", lambda name: str(tmp_path / name))
+
+    assert fetcher._parse_agency_timezone() == "America/Los_Angeles"
+
+
+def test_parse_agency_timezone_none_when_file_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # agency.txt is required by the GTFS spec, but real feeds don't always
+    # comply - must degrade to None, not crash the whole fetch.
+    fetcher = Fetcher(url="http://example.com/gtfs.zip", transit_system="Test_System")
+    monkeypatch.setattr(fetcher, "real_file", lambda name: str(tmp_path / name))
+
+    assert fetcher._parse_agency_timezone() is None
