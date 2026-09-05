@@ -87,10 +87,11 @@ A system's full config lives on its own `TransitSystem` row - `realtime_url`, `s
 ### Headsign fallback chain
 
 `Trip.name` is populated greedily so downstream code always has *something* to show. The precedence rule itself lives in `src.services.schedule_utils.resolve_trip_headsign` (a pure function, unit tested in `src/tests/services/test_schedule_utils.py`) - `src/commands/fetcher.py` just calls it:
-1. `trips.trip_headsign` (primary)
-2. First non-empty `stop_times.stop_headsign` at the min `stop_sequence` for the trip (`schedule_utils.is_earlier_stop_sequence`)
-3. `routes.route_long_name` as a last-ditch fallback
-4. `None` if none of the above are available
+1. The trip's own destination stop's real name - the stop at its *highest* `stop_sequence` (`schedule_utils.is_later_stop_sequence`), looked up via `stops.stop_name`. `trips.trip_headsign` can be wrong for an irregular run: confirmed live, BART's Saturday through-service trips carry a headsign copied from an unrelated weekday route pattern (a Berryessa-to-Daly-City run labeled "OAK Airport / SF / Daly City") even though the trip's own stop_times.txt sequence correctly shows where it really terminates. Where a train actually stops is never wrong, so it outranks the agency's own asserted headsign.
+2. `trips.trip_headsign` - used when this trip has no Schedule stop data of its own to derive a destination from.
+3. First non-empty `stop_times.stop_headsign` at the min `stop_sequence` for the trip (`schedule_utils.is_earlier_stop_sequence`)
+4. `routes.route_long_name` as a last-ditch fallback
+5. `None` if none of the above are available
 
 This is done once at ingest time so the runtime lookup path stays a single dict read. The other ingest-time fallback/completeness rules (route URL fallback, which required route/stop fields must be present to insert a row) live in the same module for the same reason - see its docstrings for the full list.
 

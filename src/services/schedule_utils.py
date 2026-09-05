@@ -32,21 +32,38 @@ def dedupe_rows_by_columns(
 
 
 def resolve_trip_headsign(
+    destination_stop_name: Optional[str],
     trip_headsign: Optional[str],
     stop_time_headsign: Optional[str],
     route_long_name: Optional[str],
 ) -> Optional[str]:
     """
     Trip.name fallback chain, most to least authoritative:
-      1. trips.txt's own trip_headsign - the agency's intended value.
-      2. stop_times.txt's stop_headsign at the trip's earliest stop_sequence
+      1. The trip's own destination stop's real name (the stop at its
+         highest stop_sequence, see is_later_stop_sequence) - reflects
+         where the train actually terminates on this specific trip.
+         trips.txt's own headsign can be wrong for an irregular run:
+         confirmed live, BART's Saturday through-service trips carry a
+         trip_headsign copied from an unrelated weekday route pattern
+         (e.g. a Berryessa-to-Daly-City run labeled "OAK Airport / SF /
+         Daly City"), even though the trip's own stop_times.txt sequence
+         correctly shows where it really goes.
+      2. trips.txt's own trip_headsign - used when this trip has no
+         Schedule stop data of its own to derive a destination from.
+      3. stop_times.txt's stop_headsign at the trip's earliest stop_sequence
          (see is_earlier_stop_sequence) - some agencies only set headsigns
          per-stop, not per-trip.
-      3. routes.txt's route_long_name - a last-ditch "something is better
+      4. routes.txt's route_long_name - a last-ditch "something is better
          than nothing" fallback so the UI never has to show a blank trip.
-      4. None, if every source above is empty.
+      5. None, if every source above is empty.
     """
-    return trip_headsign or stop_time_headsign or route_long_name or None
+    return (
+        destination_stop_name
+        or trip_headsign
+        or stop_time_headsign
+        or route_long_name
+        or None
+    )
 
 
 def is_earlier_stop_sequence(
@@ -55,7 +72,7 @@ def is_earlier_stop_sequence(
     """
     Used while streaming stop_times.txt to track, per trip, the non-empty
     stop_headsign seen at the lowest stop_sequence so far (feeds
-    resolve_trip_headsign's second fallback). Returns True if
+    resolve_trip_headsign's third fallback). Returns True if
     `candidate_seq` should replace `current_best_seq` as the new best.
     GTFS agencies often only populate stop_headsign on a trip's first
     stop_time, so the earliest sequence number is the one most likely to
@@ -66,6 +83,24 @@ def is_earlier_stop_sequence(
     if current_best_seq is None:
         return True
     return candidate_seq < current_best_seq
+
+
+def is_later_stop_sequence(
+    candidate_seq: Optional[int], current_best_seq: Optional[int]
+) -> bool:
+    """
+    Used while streaming stop_times.txt to track, per trip, the stop_id at
+    the highest stop_sequence seen so far - the trip's actual destination
+    stop (feeds resolve_trip_headsign's first, highest-priority fallback).
+    Returns True if `candidate_seq` should replace `current_best_seq` as
+    the new best. Where a train actually stops is never wrong, unlike
+    trips.txt's own trip_headsign field (see resolve_trip_headsign).
+    """
+    if candidate_seq is None:
+        return False
+    if current_best_seq is None:
+        return True
+    return candidate_seq > current_best_seq
 
 
 def resolve_route_url(
