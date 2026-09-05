@@ -27,12 +27,48 @@ def test_scan_stop_times_strips_bom_from_first_column_so_trip_id_is_found(
     _write_stop_times_with_bom(stop_times)
 
     fetcher = Fetcher(url="http://example.com/gtfs.zip", transit_system="Test_System")
-    headsign_by_trip, stop_meta, row_count = fetcher._scan_stop_times(str(stop_times))
+    headsign_by_trip, destination_stop_id_by_trip, stop_meta, row_count = (
+        fetcher._scan_stop_times(str(stop_times))
+    )
 
     assert row_count == 2
     assert headsign_by_trip == {"T1": "Downtown"}
+    assert destination_stop_id_by_trip == {"T1": "S2"}
     assert stop_meta["S1"]["trip_id"] == "T1"
     assert stop_meta["S2"]["trip_id"] == "T1"
+
+
+def test_scan_stop_times_destination_is_highest_stop_sequence(
+    tmp_path: Path,
+) -> None:
+    # Real-world case this guards against: BART's Saturday through-service
+    # trips carry a trips.txt headsign copied from an unrelated weekday
+    # route - the destination stop (highest stop_sequence, not file order)
+    # is what resolve_trip_headsign now prefers instead.
+    stop_times = tmp_path / "stop_times.txt"
+    stop_times.write_text(
+        "trip_id,stop_id,stop_sequence\nT1,S3,3\nT1,S1,1\nT1,S2,2\nT2,S9,1\n"
+    )
+    fetcher = Fetcher(url="http://example.com/gtfs.zip", transit_system="Test_System")
+
+    _, destination_stop_id_by_trip, _, _ = fetcher._scan_stop_times(str(stop_times))
+
+    assert destination_stop_id_by_trip == {"T1": "S3", "T2": "S9"}
+
+
+def test_build_stop_names_maps_stop_id_to_stop_name(tmp_path: Path) -> None:
+    stops = tmp_path / "stops.txt"
+    stops.write_text(
+        "stop_id,stop_name,location_type\nS1,Downtown,0\nS2,,0\nS3,Uptown,0\n"
+    )
+    fetcher = Fetcher(url="http://example.com/gtfs.zip", transit_system="Test_System")
+
+    stop_names = fetcher._build_stop_names(str(stops))
+
+    # S2 has no stop_name - must be omitted, not stored as an empty string,
+    # so resolve_trip_headsign's destination-stop-name fallback correctly
+    # falls through to trips.txt's own headsign instead of "".
+    assert stop_names == {"S1": "Downtown", "S3": "Uptown"}
 
 
 def test_parse_agency_timezone_returns_first_populated_value(

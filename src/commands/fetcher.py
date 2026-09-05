@@ -28,6 +28,7 @@ from src.telemetry import configure_posthog_logging
 from src.services.schedule_utils import (
     dedupe_rows_by_columns,
     is_earlier_stop_sequence,
+    is_later_stop_sequence,
     missing_route_fields,
     missing_stop_fields,
     parse_optional_float,
@@ -213,16 +214,19 @@ class Fetcher:
         response.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             z.extractall(self.tmp_dir())
-        headsign_by_trip, stop_meta, stop_times_rows = self._scan_stop_times(
-            self.tmp_file(STOP_TIMES_FILE)
+        headsign_by_trip, destination_stop_id_by_trip, stop_meta, stop_times_rows = (
+            self._scan_stop_times(self.tmp_file(STOP_TIMES_FILE))
         )
-        report = self.diagnose(headsign_by_trip, stop_meta, stop_times_rows)
+        report = self.diagnose(
+            headsign_by_trip, destination_stop_id_by_trip, stop_meta, stop_times_rows
+        )
         self.remove_tmp()
         return report
 
     def diagnose(
         self,
         headsign_by_trip: dict[str, str],
+        destination_stop_id_by_trip: dict[str, str],
         stop_meta: dict[str, dict[str, Any]],
         stop_times_row_count: int,
     ) -> dict[str, Any]:
@@ -237,7 +241,9 @@ class Fetcher:
             "feed_info": self._diagnose_feed_info(),
             "stop_times": {"row_count": stop_times_row_count},
             "routes": self._diagnose_routes(),
-            "trips": self._diagnose_trips(headsign_by_trip),
+            "trips": self._diagnose_trips(
+                headsign_by_trip, destination_stop_id_by_trip
+            ),
             "stops": self._diagnose_stops(stop_meta),
         }
         self._print_diagnosis(report)
@@ -313,11 +319,16 @@ class Fetcher:
             "missing_field_counts": dict(missing_counts),
         }
 
-    def _diagnose_trips(self, headsign_by_trip: dict[str, str]) -> dict[str, Any]:
+    def _diagnose_trips(
+        self,
+        headsign_by_trip: dict[str, str],
+        destination_stop_id_by_trip: dict[str, str],
+    ) -> dict[str, Any]:
         path = self.tmp_file(TRIPS_FILE)
         if not os.path.isfile(path):
             return {"present": False}
         route_long_names = self._build_route_long_names(self.tmp_file(ROUTES_FILE))
+        stop_names = self._build_stop_names(self.tmp_file(STOPS_FILE))
         total = 0
         resolved_by_source: dict[str, int] = defaultdict(int)
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -327,11 +338,17 @@ class Fetcher:
                 trip_id = row.get("trip_id")
                 if not trip_id:
                     continue
+                destination_stop_id = destination_stop_id_by_trip.get(trip_id)
+                via_destination = (
+                    stop_names.get(destination_stop_id) if destination_stop_id else None
+                )
                 direct = row.get("trip_headsign")
                 via_stop_time = headsign_by_trip.get(trip_id)
                 route_id = row.get("route_id")
                 via_route = route_long_names.get(route_id) if route_id else None
-                if direct:
+                if via_destination:
+                    resolved_by_source["destination_stop_name"] += 1
+                elif direct:
                     resolved_by_source["trip_headsign"] += 1
                 elif via_stop_time:
                     resolved_by_source["stop_times.stop_headsign"] += 1
@@ -486,10 +503,12 @@ class Fetcher:
         # and do_upserts() both need it, and re-scanning it a second time
         # from real_dir() after promotion is exactly the double-parse of the
         # largest GTFS file that exhausted memory on large sources earlier.
-        headsign_by_trip, stop_meta, stop_times_rows = self._scan_stop_times(
-            self.tmp_file(STOP_TIMES_FILE)
+        headsign_by_trip, destination_stop_id_by_trip, stop_meta, stop_times_rows = (
+            self._scan_stop_times(self.tmp_file(STOP_TIMES_FILE))
         )
-        report = self.diagnose(headsign_by_trip, stop_meta, stop_times_rows)
+        report = self.diagnose(
+            headsign_by_trip, destination_stop_id_by_trip, stop_meta, stop_times_rows
+        )
         if not self._diagnosis_passes(report):
             logger.warning(
                 f"Diagnosis failed for {self.transit_system} - not promoting or ingesting this fetch. See report above."
@@ -500,7 +519,7 @@ class Fetcher:
         self.update_metadata(METADATA_FILE_LIST)
         self.push_updated_metadata_file()
         self.remove_tmp()
-        self.do_upserts(headsign_by_trip, stop_meta)
+        self.do_upserts(headsign_by_trip, destination_stop_id_by_trip, stop_meta)
 
     def select_transit_system(self, connection: Connection) -> int | None:
         if self.transit_system_id:
@@ -516,12 +535,16 @@ class Fetcher:
         return None
 
     def do_upserts(
-        self, headsign_by_trip: dict[str, str], stop_meta: dict[str, dict[str, Any]]
+        self,
+        headsign_by_trip: dict[str, str],
+        destination_stop_id_by_trip: dict[str, str],
+        stop_meta: dict[str, dict[str, Any]],
     ) -> None:
-        """headsign_by_trip/stop_meta come from fetch_metadata_update's single
-        pre-promotion scan of stop_times.txt (see _scan_stop_times) - by the
-        time this runs, files are already promoted into real_dir(), so
-        re-scanning here would parse the largest GTFS file a second time.
+        """headsign_by_trip/destination_stop_id_by_trip/stop_meta come from
+        fetch_metadata_update's single pre-promotion scan of stop_times.txt
+        (see _scan_stop_times) - by the time this runs, files are already
+        promoted into real_dir(), so re-scanning here would parse the
+        largest GTFS file a second time.
 
         upsert_stop_times() below still does its own separate pass over
         stop_times.txt, same as upsert_trips/upsert_stops/upsert_routes each
@@ -534,7 +557,9 @@ class Fetcher:
             try:
                 if not self.upsert_transit_system(connection):
                     return
-                self.upsert_trips(connection, headsign_by_trip)
+                self.upsert_trips(
+                    connection, headsign_by_trip, destination_stop_id_by_trip
+                )
                 self.upsert_stops(connection, stop_meta)
                 self.upsert_routes(connection)
                 self.upsert_stop_times(connection)
@@ -630,17 +655,24 @@ class Fetcher:
 
     def _scan_stop_times(
         self, file_path: str | None = None
-    ) -> tuple[dict[str, str], dict[str, dict[str, Any]], int]:
-        """Single streaming pass over stop_times.txt, producing what both
-        upsert_trips and upsert_stops need - previously each parsed this file
-        independently, doubling memory/CPU on what is typically the largest
-        GTFS file by far. `file_path` defaults to real_file(STOP_TIMES_FILE);
-        diagnose() passes a scratch-directory path instead so it never reads
-        from (or writes to) the promoted real_dir().
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, dict[str, Any]], int]:
+        """Single streaming pass over stop_times.txt, producing what
+        upsert_trips and upsert_stops both need - previously each parsed
+        this file independently, doubling memory/CPU on what is typically
+        the largest GTFS file by far. `file_path` defaults to
+        real_file(STOP_TIMES_FILE); diagnose() passes a scratch-directory
+        path instead so it never reads from (or writes to) the promoted
+        real_dir().
 
-        Returns (headsign_by_trip, stop_meta, row_count):
+        Returns (headsign_by_trip, destination_stop_id_by_trip, stop_meta,
+        row_count):
           headsign_by_trip: trip_id -> earliest-stop_sequence non-empty
             stop_headsign (see schedule_utils.is_earlier_stop_sequence).
+          destination_stop_id_by_trip: trip_id -> stop_id at that trip's
+            highest stop_sequence (see schedule_utils.is_later_stop_sequence)
+            - resolve_trip_headsign's highest-priority fallback, since a
+            trip's own trips.txt headsign can be stale for an irregular run
+            but where it actually stops never lies.
           stop_meta: stop_id -> {"trip_id", "stop_headsign"} (last row wins,
             matching the original upsert_stops behavior).
           row_count: total rows read - a proxy for how much memory a fetch
@@ -648,6 +680,8 @@ class Fetcher:
         """
         headsign_by_trip: dict[str, str] = {}
         min_seq_by_trip: dict[str, int] = {}
+        destination_stop_id_by_trip: dict[str, str] = {}
+        max_seq_by_trip: dict[str, int] = {}
         stop_meta: dict[str, dict[str, Any]] = {}
         row_count = 0
         with open(
@@ -657,25 +691,38 @@ class Fetcher:
             for row in reader:
                 row_count += 1
                 trip_id = row.get("trip_id")
-                headsign = row.get("stop_headsign")
-                if trip_id and headsign:
-                    seq: int | None
-                    try:
-                        seq = int(row.get("stop_sequence", "0"))
-                    except (TypeError, ValueError):
-                        seq = None
-                    if seq is not None and is_earlier_stop_sequence(
-                        seq, min_seq_by_trip.get(trip_id)
-                    ):
-                        min_seq_by_trip[trip_id] = seq
-                        headsign_by_trip[trip_id] = headsign
                 stop_id = row.get("stop_id")
+                headsign = row.get("stop_headsign")
+                seq: int | None
+                try:
+                    seq = int(row.get("stop_sequence", "0"))
+                except (TypeError, ValueError):
+                    seq = None
+
+                if (
+                    trip_id
+                    and stop_id
+                    and seq is not None
+                    and is_later_stop_sequence(seq, max_seq_by_trip.get(trip_id))
+                ):
+                    max_seq_by_trip[trip_id] = seq
+                    destination_stop_id_by_trip[trip_id] = stop_id
+
+                if (
+                    trip_id
+                    and headsign
+                    and seq is not None
+                    and is_earlier_stop_sequence(seq, min_seq_by_trip.get(trip_id))
+                ):
+                    min_seq_by_trip[trip_id] = seq
+                    headsign_by_trip[trip_id] = headsign
+
                 if stop_id:
                     stop_meta[stop_id] = {
                         "trip_id": trip_id,
                         "stop_headsign": headsign or None,
                     }
-        return headsign_by_trip, stop_meta, row_count
+        return headsign_by_trip, destination_stop_id_by_trip, stop_meta, row_count
 
     def _build_route_long_names(self, file_path: str | None = None) -> dict[str, str]:
         long_name_by_route: dict[str, str] = {}
@@ -690,12 +737,34 @@ class Fetcher:
                     long_name_by_route[route_id] = long_name
         return long_name_by_route
 
+    def _build_stop_names(self, file_path: str | None = None) -> dict[str, str]:
+        """stop_id -> stop_name from stops.txt - a dedicated small read
+        (stops.txt is a few MB at most, unlike stop_times.txt) rather than
+        threading stop names through _scan_stop_times, since that scan
+        only ever needed derived summaries, not raw stops.txt fields.
+        Feeds resolve_trip_headsign's destination-stop-name fallback."""
+        stop_names: dict[str, str] = {}
+        with open(
+            file_path or self.real_file(STOPS_FILE), "r", encoding="utf-8-sig"
+        ) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                stop_id = row.get("stop_id")
+                name = row.get("stop_name")
+                if stop_id and name:
+                    stop_names[stop_id] = name
+        return stop_names
+
     def upsert_trips(
-        self, connection: Connection, stop_headsigns_by_trip: dict[str, str]
+        self,
+        connection: Connection,
+        stop_headsigns_by_trip: dict[str, str],
+        destination_stop_id_by_trip: dict[str, str],
     ) -> None:
         rows_to_write = []
         transit_system_id = self.select_transit_system(connection)
         route_long_names = self._build_route_long_names()
+        stop_names = self._build_stop_names()
 
         with open(self.real_file(TRIPS_FILE), "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
@@ -704,7 +773,12 @@ class Fetcher:
                 route_id = row.get("route_id")
                 if not trip_id:
                     continue
+                destination_stop_id = destination_stop_id_by_trip.get(trip_id)
+                destination_stop_name = (
+                    stop_names.get(destination_stop_id) if destination_stop_id else None
+                )
                 name = resolve_trip_headsign(
+                    destination_stop_name,
                     row.get("trip_headsign"),
                     stop_headsigns_by_trip.get(trip_id),
                     route_long_names.get(route_id) if route_id else None,
