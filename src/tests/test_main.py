@@ -10,7 +10,14 @@ from fastapi.sse import ServerSentEvent
 from google.protobuf.message import DecodeError
 
 from generated import gtfs_realtime_pb2
-from src.main import _fetch_feed, get_transit_system_detail, transit_feed, trip_detail
+from src.main import (
+    _entity_trip_id,
+    _fetch_feed,
+    get_transit_system_detail,
+    get_transit_systems,
+    transit_feed,
+    trip_detail,
+)
 from src.services.schedule_cache import ScheduleCache
 
 
@@ -20,6 +27,24 @@ async def _first_event(transit_system: str) -> ServerSentEvent:
         return await agen.__anext__()
     finally:
         await agen.aclose()
+
+
+def _mock_transit_system_config(**overrides: Any) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "realtime_url": "http://example.com/feed",
+        "schedule_url": "http://example.com/gtfs.zip",
+        "timezone": None,
+        "default_schedule_url": None,
+        "auth_required": False,
+    }
+    config.update(overrides)
+    return config
+
+
+def _active_for(*names: str) -> Any:
+    """monkeypatch target for src.main.get_transit_system_config - returns a
+    config for any of `names`, None (unknown/inactive system) otherwise."""
+    return lambda name: _mock_transit_system_config() if name in names else None
 
 
 def _mock_response(content: bytes, status_code: int = 200) -> Mock:
@@ -167,11 +192,87 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
     monkeypatch.setattr(
         ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
     )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     event = asyncio.run(_first_event("BART"))
 
     assert call_count["n"] == 2
     assert event.data.trip_id == "T1"
+
+
+def test_entity_trip_id_uses_descriptor_trip_id_when_present() -> None:
+    feed = gtfs_realtime_pb2.FeedMessage()
+    entity = feed.entity.add()
+    entity.id = "e1"
+    entity.trip_update.trip.trip_id = "T1"
+
+    assert _entity_trip_id(entity) == "T1"
+
+
+def test_entity_trip_id_falls_back_to_entity_id_when_trip_id_blank() -> None:
+    # Real HSL case: trip_update.trip.trip_id is an empty string on every
+    # entity - FeedEntity.id is the only thing that actually distinguishes
+    # one vehicle from another.
+    feed = gtfs_realtime_pb2.FeedMessage()
+    entity = feed.entity.add()
+    entity.id = "e1"
+
+    assert _entity_trip_id(entity) == "e1"
+
+
+def _feed_with_two_blank_trip_id_entities() -> bytes:
+    # Mirrors HSL: every entity's trip_id is blank, but each has its own
+    # distinct FeedEntity.id and is independently positionable.
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    now = int(datetime.now().timestamp())
+    for entity_id, stop_id in (("e1", "S1"), ("e2", "S2")):
+        entity = feed.entity.add()
+        entity.id = entity_id
+        # TripUpdate.trip is a required submessage in the gtfs-realtime
+        # proto2 schema - explicitly setting trip_id to "" (not just leaving
+        # trip untouched) is what marks it present, mirroring real HSL
+        # entities which do include this submessage, just with a blank
+        # trip_id inside it.
+        entity.trip_update.trip.trip_id = ""
+        stop = entity.trip_update.stop_time_update.add()
+        stop.stop_id = stop_id
+        stop.arrival.time = now - 30
+        stop.departure.time = now + 30
+    return bytes(feed.SerializeToString())
+
+
+async def _first_two_events(transit_system: str) -> list[ServerSentEvent]:
+    agen = transit_feed(transit_system)
+    try:
+        return [await agen.__anext__(), await agen.__anext__()]
+    finally:
+        await agen.aclose()
+
+
+def test_transit_feed_falls_back_to_entity_id_for_blank_trip_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the fallback, both entities below would emit trip_id="" and
+    # the frontend (which keys live rows by trip_id) would collapse them
+    # into a single row - see project memory on the Helsinki live-feed bug.
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_two_blank_trip_id_entities()),
+    )
+    monkeypatch.setattr(
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+    )
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config",
+        _active_for("Helsinki_Regional_Transport"),
+    )
+
+    events = asyncio.run(_first_two_events("Helsinki_Regional_Transport"))
+
+    trip_ids = {event.data.trip_id for event in events}
+    assert trip_ids == {"e1", "e2"}
 
 
 EMPTY_SCHEDULE_CONTEXT: dict[str, Any] = {"trip": None, "route": None, "stops": {}}
@@ -243,7 +344,11 @@ def _mock_schedule_context() -> dict[str, Any]:
     }
 
 
-def test_trip_detail_404s_for_unknown_transit_system() -> None:
+def test_trip_detail_404s_for_unknown_transit_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for())
+
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(trip_detail("NotASystem", "T1"))
     assert exc_info.value.status_code == 404
@@ -254,6 +359,7 @@ def test_trip_detail_502s_on_request_error(monkeypatch: pytest.MonkeyPatch) -> N
         raise requests.exceptions.ConnectionError("connection refused")
 
     monkeypatch.setattr(requests, "get", boom)
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(trip_detail("BART", "T1"))
@@ -266,6 +372,7 @@ def test_trip_detail_502s_on_parse_error(monkeypatch: pytest.MonkeyPatch) -> Non
         "get",
         lambda *a, **k: _mock_response(b"not a protobuf, just garbage"),
     )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(trip_detail("BART", "T1"))
@@ -278,10 +385,38 @@ def test_trip_detail_404s_when_trip_not_in_current_feed(
     monkeypatch.setattr(
         requests, "get", lambda *a, **k: _mock_response(_valid_feed_bytes())
     )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(trip_detail("BART", "some-other-trip-id"))
     assert exc_info.value.status_code == 404
+
+
+def test_trip_detail_matches_entity_by_fallback_id_when_trip_id_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Real HSL case: trip_update.trip.trip_id is blank, so /trip_detail has
+    # to be looked up by the same entity-id fallback transit_feed() emits -
+    # matching on the raw (blank) descriptor trip_id would just grab
+    # whichever blank-trip_id entity happens to come first in the feed.
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_two_blank_trip_id_entities()),
+    )
+    monkeypatch.setattr(
+        "src.main.get_trip_schedule_context", lambda *a, **k: EMPTY_SCHEDULE_CONTEXT
+    )
+    monkeypatch.setattr("src.main.get_scheduled_tail_stops", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config",
+        _active_for("Helsinki_Regional_Transport"),
+    )
+
+    detail = asyncio.run(trip_detail("Helsinki_Regional_Transport", "e2"))
+
+    assert detail.trip_id == "e2"
+    assert detail.stops[0].stop_id == "S2"
 
 
 def test_trip_detail_merges_live_feed_with_schedule_context(
@@ -300,6 +435,7 @@ def test_trip_detail_merges_live_feed_with_schedule_context(
     # accidentally pass or fail based on whatever real stop_times.txt happens
     # to be sitting in src/metadata/BART/ on whichever machine runs it.
     monkeypatch.setattr("src.main.get_scheduled_tail_stops", lambda *a, **k: [])
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     detail = asyncio.run(trip_detail("BART", "T1"))
 
@@ -366,6 +502,7 @@ def test_trip_detail_missing_schedule_context_degrades_gracefully(
         lambda *a, **k: EMPTY_SCHEDULE_CONTEXT,
     )
     monkeypatch.setattr("src.main.get_scheduled_tail_stops", lambda *a, **k: [])
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     detail = asyncio.run(trip_detail("BART", "T1"))
 
@@ -412,6 +549,7 @@ def test_trip_detail_backfills_tail_stops_missing_from_live_feed(
         return context
 
     monkeypatch.setattr("src.main.get_trip_schedule_context", _schedule_context)
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     detail = asyncio.run(trip_detail("BART", "T1"))
 
@@ -435,35 +573,79 @@ def test_trip_detail_backfills_tail_stops_missing_from_live_feed(
     assert fourth.schedule_relationship == "NO_DATA"
 
 
-def test_transit_system_detail_404s_for_unknown_system() -> None:
+def test_transit_system_detail_404s_for_unknown_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for())
+
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(get_transit_system_detail("NotASystem"))
     assert exc_info.value.status_code == 404
 
 
-def test_transit_system_detail_returns_timezone(
+def test_transit_system_detail_returns_full_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "src.main.get_transit_system_timezone",
-        lambda *a, **k: "America/Los_Angeles",
+        "src.main.get_transit_system_config",
+        lambda name: (
+            _mock_transit_system_config(
+                timezone="America/Los_Angeles",
+                default_schedule_url="https://www.bart.gov/schedules",
+                auth_required=True,
+            )
+            if name == "BART"
+            else None
+        ),
     )
 
     detail = asyncio.run(get_transit_system_detail("BART"))
 
     assert detail.name == "BART"
     assert detail.timezone == "America/Los_Angeles"
+    assert detail.default_schedule_url == "https://www.bart.gov/schedules"
+    assert detail.auth_required is True
 
 
-def test_transit_system_detail_timezone_none_when_not_yet_fetched(
+def test_transit_system_detail_degrades_gracefully_when_fields_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A system that's configured but hasn't had a successful Schedule fetch
-    # yet (or whose agency.txt didn't parse) should degrade to None, not
-    # error - matches how every other Schedule-derived field behaves.
-    monkeypatch.setattr("src.main.get_transit_system_timezone", lambda *a, **k: None)
+    # yet (or whose agency.txt didn't parse) should degrade to None/False,
+    # not error - matches how every other Schedule-derived field behaves.
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     detail = asyncio.run(get_transit_system_detail("BART"))
 
     assert detail.name == "BART"
     assert detail.timezone is None
+    assert detail.default_schedule_url is None
+    assert detail.auth_required is False
+
+
+def test_get_transit_systems_returns_active_system_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.main.get_active_transit_systems",
+        lambda: [
+            {
+                "name": "BART",
+                "realtime_url": "http://example.com/bart",
+                "schedule_url": "http://example.com/bart.zip",
+                "auth_required": False,
+            },
+            {
+                "name": "MBTA",
+                "realtime_url": "http://example.com/mbta",
+                "schedule_url": "http://example.com/mbta.zip",
+                "auth_required": False,
+            },
+        ],
+    )
+
+    request = Mock()
+    request.app.state = Mock(spec=[])
+    systems = asyncio.run(get_transit_systems(request))
+
+    assert systems == ["BART", "MBTA"]

@@ -4,8 +4,8 @@ from sqlalchemy import select, func
 
 from src.database import engine
 from src.commands.fetcher import Fetcher
-from src.constants import GTFS_METADATA
 from src.models import TransitSystem, Trip, Stop
+from src.services.transit_system_detail import get_active_transit_systems
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
 
@@ -34,25 +34,26 @@ app.conf.timezone = "UTC"  # type: ignore[misc,assignment]  # celery-types wrong
 @app.task
 def fetch_all_systems() -> None:
     """
-    Iterate over all systems and fetch their metadata updates.
+    Iterate over all active systems and fetch their metadata updates.
     """
-    for system, url in GTFS_METADATA.items():
-        print(f"Fetching GTFS schedule for {system} from {url}")
-        fetcher = Fetcher(url, system)
+    for system in get_active_transit_systems():
+        name, url = system["name"], system["schedule_url"]
+        print(f"Fetching GTFS schedule for {name} from {url}")
+        fetcher = Fetcher(url, name)
         try:
             fetcher.fetch_metadata_update(force=False)
-            print(f"Successfully processed {system}")
+            print(f"Successfully processed {name}")
         except Exception as e:
-            print(f"Error fetching for {system}: {e}")
+            print(f"Error fetching for {name}: {e}")
 
 
 @app.task
 def ensure_schedule_data() -> None:
     """
     Safety net: catches a transit system with no trip/stop data at all - e.g.
-    a system that was just added to GTFS_METADATA, or a previous fetch that
-    upserted transit_system but failed partway through trips/stops - and
-    triggers a fetch for it. Runs far more often than fetch_all_systems so a
+    a system that was just activated, or a previous fetch that upserted
+    transit_system but failed partway through trips/stops - and triggers a
+    fetch for it. Runs far more often than fetch_all_systems so a
     broken/empty system gets caught quickly, but Fetcher.fetched_today makes
     repeat calls for an already-healthy system a cheap no-op (single indexed
     SELECT, no network request), so running this frequently doesn't hammer
@@ -82,8 +83,9 @@ def ensure_schedule_data() -> None:
             )
         }
 
-    for system, url in GTFS_METADATA.items():
-        transit_system_id = systems.get(system)
+    for system in get_active_transit_systems():
+        name, url = system["name"], system["schedule_url"]
+        transit_system_id = systems.get(name)
         has_data = (
             transit_system_id is not None
             and trip_counts.get(transit_system_id, 0) > 0
@@ -91,9 +93,9 @@ def ensure_schedule_data() -> None:
         )
         if has_data:
             continue
-        print(f"No schedule data found for {system}, triggering fetch")
-        fetcher = Fetcher(url, system)
+        print(f"No schedule data found for {name}, triggering fetch")
+        fetcher = Fetcher(url, name)
         try:
             fetcher.fetch_metadata_update(force=False)
         except Exception as e:
-            print(f"Error fetching for {system}: {e}")
+            print(f"Error fetching for {name}: {e}")

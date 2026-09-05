@@ -73,7 +73,7 @@ def resolve_route_url(
 ) -> Optional[str]:
     """
     Route.url fallback: routes.txt's own route_url, else a per-transit-system
-    default (constants.DEFAULT_SCHEDULE_URL_BY_SYSTEM) for agencies that
+    default (models.TransitSystem.default_schedule_url) for agencies that
     don't publish a URL per route at all.
     """
     return route_url or default_url

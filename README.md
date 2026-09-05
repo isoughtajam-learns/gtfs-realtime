@@ -23,12 +23,12 @@ uv run uvicorn src.main:app
 ```
 
 ## Usage
-Update GTFS_URLS in src/constants.py with new GTFS-Realtime trip update sources.
+Insert a `TransitSystem` row (`active=true`, a real `realtime_url`) to add a new GTFS-Realtime trip update source - see "GTFS Schedule ingestion" below for the full registry model.
 
 ## API endpoints
 
 - `GET /trip_updates/{transit_system}` — SSE stream of live position events (`src/main.py`'s `transit_feed()`). Each event is one trip's *current* stop only - see `/trip_detail` below for the rest of a trip's stops.
-- `GET /transit_systems` — list of configured `GTFS_URLS` keys.
+- `GET /transit_systems` — names of every active `TransitSystem` row (see `src/services/transit_system_detail.py`).
 - `GET /transit_systems/{transit_system}` — system-level metadata that changes rarely (currently just `timezone`, an IANA identifier like `"America/Los_Angeles"` from `agency.txt`'s `agency_timezone`). Its own endpoint rather than a field on every SSE event, since the frontend can fetch and cache it once instead of receiving the same static value on every streamed `trip_update`.
 - `GET /trip_detail/{transit_system}/{trip_id}` — everything the realtime feed says about one specific, currently-active trip, plus whatever GTFS Schedule data we have on its route/trip/stops. Meant to back a "trip detail" UI (e.g. clicking an event from the SSE stream).
 
@@ -54,12 +54,12 @@ Pass `--force` to bypass the daily-freshness checks — re-downloads the Schedul
 uv run python -m src.commands.fetcher --force
 ```
 
-Pass `--all` to fetch every system in `GTFS_METADATA` instead of the `--transit-system` default (`BART`); one bad/slow feed won't block the others:
+Pass `--all` to fetch every active system (see `TransitSystem.active`) instead of the `--transit-system` default (`BART`); one bad/slow feed won't block the others:
 ```
 uv run python -m src.commands.fetcher --all
 ```
 
-Pass `--diagnose` to download and report on a feed's data quality *without* writing to the database or promoting anything into `src/metadata/` - see "Diagnosing a source" below. Useful before adding a new system to `GTFS_METADATA` at all:
+Pass `--diagnose` to download and report on a feed's data quality *without* writing to the database or promoting anything into `src/metadata/` - see "Diagnosing a source" below. Useful before inserting a new system's `TransitSystem` row at all:
 ```
 uv run python -m src.commands.fetcher --diagnose --transit-system BART
 uv run python -m src.commands.fetcher --diagnose --transit-system SomeNewAgency --schedule-url https://example.com/gtfs.zip
@@ -67,15 +67,22 @@ uv run python -m src.commands.fetcher --diagnose --transit-system SomeNewAgency 
 
 ## GTFS Schedule ingestion
 
-The fetcher pulls each transit system's GTFS Schedule zip from `GTFS_METADATA` in `src/constants.py`, extracts it under `src/tmp/<transit_system>/`, **diagnoses it in place** (see below - this is where `--diagnose` and the automatic pre-promotion gate share the same code path, so the check you can run ahead of time is exactly the check every real fetch runs), promotes the files into `src/metadata/<transit_system>/` only if that diagnosis passes, and upserts the parsed rows into Postgres. Files read: `trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`, `feed_info.txt`.
+The fetcher pulls each transit system's GTFS Schedule zip from its `TransitSystem.schedule_url` row (see "Transit system registry" below), extracts it under `src/tmp/<transit_system>/`, **diagnoses it in place** (see below - this is where `--diagnose` and the automatic pre-promotion gate share the same code path, so the check you can run ahead of time is exactly the check every real fetch runs), promotes the files into `src/metadata/<transit_system>/` only if that diagnosis passes, and upserts the parsed rows into Postgres. Files read: `trips.txt`, `stops.txt`, `stop_times.txt`, `routes.txt`, `feed_info.txt`.
 
 Tables populated (see `src/models.py`):
 - `transit_system` — one row per system, holds realtime + schedule URLs, and `timezone` (from `agency.txt`'s `agency_timezone` - see `GET /transit_systems/{transit_system}` above).
 - `route` — from `routes.txt`; `route_id`, short/long names, url, colors, `route_type` (GTFS numeric mode enum - bus/rail/ferry/etc).
 - `trip` — from `trips.txt`; `trip_id` (string), `route_id`, `direction_id`, `name` (headsign, hydrated via the fallback chain below), `trip_short_name` (rider-facing train/run number, e.g. MBTA commuter rail's "509" - distinct from `trip_id`), `wheelchair_accessible`, `bikes_allowed`.
 - `stop` — from `stops.txt` (location_type=0) joined with `stop_times.txt`; captures `stop_headsign`, `lat`/`lon`, `platform_code`/`platform_name`, `wheelchair_boarding` per stop.
+- `stop_time` — one row per `stop_times.txt` line (`trip_id`, `stop_sequence`, `stop_id`), indexed on `(transit_system_id, trip_id, stop_sequence)`. Powers `/trip_detail`'s tail-stop backfill (`get_scheduled_tail_stops` in `src/services/trip_detail.py`) with a single indexed query instead of scanning the file per request - see that function's docstring for why (Helsinki's alone is 7.8M rows/~700MB).
 
 All of the fields listed above beyond the original core set (`route_type`, `trip_short_name`, `wheelchair_accessible`, `bikes_allowed`, `lat`/`lon`, `platform_code`/`platform_name`, `wheelchair_boarding`) are optional, same as `zone_id` - present when a source publishes them, `None` otherwise, and never gate whether a row is usable (see `missing_route_fields`/`missing_stop_fields` in `src/services/schedule_utils.py`). They exist to back `GET /trip_detail` (see "API endpoints" above), not the core "show a position on the map" feature.
+
+### Transit system registry
+
+A system's full config lives on its own `TransitSystem` row - `realtime_url`, `schedule_url`, `default_schedule_url` (the `Route.url` fallback for a source that doesn't publish a URL per route), `auth_required` (schema-only for now - see below), and `active`. There's no code-level list of systems anymore (no `GTFS_URLS`/`GTFS_METADATA`/`DEFAULT_SCHEDULE_URL_BY_SYSTEM`, which used to live in `src/constants.py`): `src/services/transit_system_detail.py`'s `get_transit_system_config`/`get_active_transit_systems` are the only reads, and every consumer (`main.py`'s endpoints, `src/tasks.py`'s periodic fetches, `fetcher.py`'s CLI) goes through them.
+
+`active` is deliberately separate from just having URLs on file: a system can be fully configured (real `realtime_url`/`schedule_url`, historical data already ingested) without being served - e.g. a system disabled for reliability reasons keeps its row (and any already-fetched Schedule data) but drops out of `get_active_transit_systems()`/`GET /transit_systems` and 404s from every other endpoint, same as one that was never added at all. **Adding a new system now means inserting a `TransitSystem` row directly** (`active=true`, real `realtime_url`/`schedule_url`) - there's no dict to edit. `auth_required` exists as scaffolding for a future source that needs an API secret to poll `realtime_url`; no current system needs one, so the actual secret lookup/attach at fetch time isn't implemented yet.
 
 ### Headsign fallback chain
 
@@ -93,7 +100,7 @@ This is done once at ingest time so the runtime lookup path stays a single dict 
 
 This isn't just a manual check - `fetch_metadata_update()` runs the exact same diagnosis on every real fetch, *before* deciding whether to promote `tmp/` into `real_dir()` and upsert. The one hard gate: a source needs at least one derivable stop with a name, or the app's core feature is unavailable for it entirely; anything else (missing route colors, unresolved headsigns, a large `stop_times.txt`) is reported but doesn't block ingestion - partial data is still useful (Helsinki has no route colors at all and stays enabled). `--force` bypasses the daily-freshness gate, not this one.
 
-Run it standalone with `--diagnose` (see above) before adding a new system to `GTFS_METADATA` at all - `--schedule-url` lets you point at a feed that isn't registered there yet.
+Run it standalone with `--diagnose` (see above) before inserting a new system's `TransitSystem` row at all - `--schedule-url` lets you point at a feed that isn't registered there yet.
 
 ### Runtime hydration (`src/services/schedule_cache.py`)
 
@@ -111,13 +118,9 @@ Run it standalone with `--diagnose` (see above) before adding a new system to `G
 
 Everywhere we identify "this train" - `transit_feed()`'s SSE event key, `ScheduleCache` lookups, the `trip`/`stop` tables - is keyed on `trip_update.trip.trip_id` from the realtime feed. That works today for **BART, MBTA, and NY_Waterway**: each publishes a `trip_id` that's unique per entity and stable for the life of the trip (confirmed by polling live, including a stability check across a 15s gap). All three also publish absolute `arrival.time`/`departure.time` on `stop_time_update`, which `get_location()` (`src/services/positioning.py`) requires to place a trip between stops - a source that only publishes relative `arrival.delay` (no absolute `time`) can't be positioned this way at all; this was the reason Estonia was dropped rather than fixed (see `deployment` history / project memory).
 
-**Helsinki_Regional_Transport is a gap**: HSL never sets `trip_update.trip.trip_id` - it's an empty string on every entity, confirmed live (654/654 entities). HSL instead identifies a trip via the combination of `route_id` + `direction_id` + `start_time` + `start_date`. Since our code only keys on `trip_id`, every Helsinki entity is currently indistinguishable from every other one on our end, even though upstream they're genuinely different trains.
+**Helsinki_Regional_Transport never sets `trip_update.trip.trip_id`** - it's an empty string on every entity, confirmed live (654/654 entities). HSL instead identifies a trip via the combination of `route_id` + `direction_id` + `start_time` + `start_date`.
 
-**Fallback options, if this needs fixing later** (not yet implemented):
-- Synthesize a trip identifier from the composite key HSL actually uses: `route_id`/`direction_id`/`start_time`/`start_date`.
-- Or use the top-level `FeedEntity.id` field (distinct from `trip_update.trip.trip_id`) - confirmed live to be both unique per trip and stable across polls (934/934 unchanged across a 15s gap) for Helsinki. Not currently read anywhere in this codebase.
-
-Either would need `ScheduleCache`/`main.py`/the DB schema to accept a fallback key when `trip_id` is blank, rather than assuming `trip_id` is always present and unique.
+`_entity_trip_id()` in `src/main.py` handles this: it uses `trip_update.trip.trip_id` when present, falling back to the top-level `FeedEntity.id` field (distinct from `trip_update.trip.trip_id`, and confirmed live to be both unique per trip and stable across polls - 934/934 unchanged across a 15s gap - for Helsinki) when it's blank. Both `transit_feed()`'s SSE event key and `/trip_detail`'s entity lookup go through this helper, so HSL vehicles no longer collapse into a single row/lookup. It's deliberately *not* used for `ScheduleCache`/DB `trip_id` lookups - a feed entity id was never in Schedule data, so those stay keyed on the raw (possibly blank) descriptor value and degrade to `None`/the destination-stop-name fallback for HSL, same as before.
 
 ## Database migrations
 
@@ -150,7 +153,7 @@ The containers are orchestrated to work together:
 
 We use Celery to periodically fetch fresh GTFS Schedule metadata to keep the database up-to-date.
 - **Tasks Definition**: The tasks and schedule are defined in `src/tasks.py`.
-- **`fetch_all_systems`**: fetches every system in `GTFS_METADATA` (`force=False`). Runs every 4 hours, starting at 2 AM UTC (hours 2, 6, 10, 14, 18, 22).
+- **`fetch_all_systems`**: fetches every active system (see "Transit system registry" above, `force=False`). Runs every 4 hours, starting at 2 AM UTC (hours 2, 6, 10, 14, 18, 22).
 - **`ensure_schedule_data`**: safety net. Runs every 15 minutes; checks each configured system's trip+stop counts and triggers a fetch (`force=False`) for any system with none - catches a newly-added system or a fetch that failed partway through before the next scheduled `fetch_all_systems` run. Safe to run this often because of the daily gate below: an already-healthy system costs one indexed SELECT, not a network call.
 - **Worker Execution**: The `celery-worker` container listens to the Redis queue and executes tasks, updating the PostgreSQL database.
 - **Shared Architecture**: Because they share the same Redis and Database connection strings (passed in `docker-compose.yml`), the worker seamlessly updates the same database queried by the FastAPI server.
@@ -187,7 +190,7 @@ This wasn't always two stacks - it started as one Terraform stack managing both,
 
 ### Manually triggering a GTFS Schedule fetch in production
 
-The backend's startup command only runs `alembic upgrade head` - it does **not** fetch GTFS Schedule data. Schedule data is only populated by celery-beat's `fetch_all_systems` task, scheduled every 4 hours (2/6/10/14/18/22 UTC, see `src/tasks.py`). To populate a system's data immediately instead of waiting for the next scheduled run (e.g. right after adding a new `GTFS_URLS`/`GTFS_METADATA` entry, or after a fix like the one that re-enabled Helsinki):
+The backend's startup command only runs `alembic upgrade head` - it does **not** fetch GTFS Schedule data. Schedule data is only populated by celery-beat's `fetch_all_systems` task, scheduled every 4 hours (2/6/10/14/18/22 UTC, see `src/tasks.py`). To populate a system's data immediately instead of waiting for the next scheduled run (e.g. right after activating a new `TransitSystem` row, or after a fix like the one that re-enabled Helsinki):
 
 ```bash
 ssh -i ~/.ssh/<key-name>.pem ec2-user@<instance-ip>
@@ -213,7 +216,7 @@ f.fetch_metadata_update(force=True)
 print(f'{time.time()-t0:.1f}s, peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024:.1f} MB')
 "
 ```
-(If the system isn't in `GTFS_URLS`/`GTFS_METADATA` yet, monkey-patch those dicts in the same script before importing `Fetcher` - see the fetch that validated Helsinki for the pattern.)
+(If the system doesn't have a `TransitSystem` row yet, insert one - real `realtime_url`/`schedule_url`, `active=true` - before running this.)
 
 After a manual production fetch, the running backend's in-memory `ScheduleCache` (`src/services/schedule_cache.py`, 6-hour TTL) won't see the new data until its TTL expires. Force a restart to pick it up immediately:
 ```bash

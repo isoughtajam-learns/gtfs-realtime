@@ -19,12 +19,11 @@ from pathlib import Path
 from typing import Any, List
 
 import requests
-from sqlalchemy import select, Connection
+from sqlalchemy import select, update, Connection
 from sqlalchemy.dialects.postgresql import insert
 
 from src.database import engine
-from src.constants import GTFS_URLS, GTFS_METADATA, DEFAULT_SCHEDULE_URL_BY_SYSTEM
-from src.models import ORMBase, TransitSystem, Trip, Stop, Route
+from src.models import ORMBase, TransitSystem, Trip, Stop, StopTime, Route
 from src.telemetry import configure_posthog_logging
 from src.services.schedule_utils import (
     dedupe_rows_by_columns,
@@ -35,6 +34,10 @@ from src.services.schedule_utils import (
     parse_optional_int,
     resolve_route_url,
     resolve_trip_headsign,
+)
+from src.services.transit_system_detail import (
+    get_active_transit_systems,
+    get_transit_system_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,8 @@ UPDATED_METADATA_FILE = "updated_metadata.txt"
 # single very large source (more stops/trips/routes than this) can't build
 # one enormous SQL statement or hold the whole insert payload at once.
 UPSERT_BATCH_SIZE = 2000
+
+STOP_TIME_CONFLICT_COLUMNS = ["transit_system_id", "trip_id", "stop_sequence"]
 
 
 def _upsert_batched(
@@ -199,8 +204,8 @@ class Fetcher:
         """Standalone entry point for `--diagnose`: downloads the feed into
         tmp/, reports on it, and cleans up - never promotes into real_dir()
         and never touches the database. Use this to check a system before
-        adding it to GTFS_METADATA (see README's "Before enabling a new
-        large transit system" section) - fetch_metadata_update() runs the
+        inserting a TransitSystem row for it (see README's "Before enabling a
+        new large transit system" section) - fetch_metadata_update() runs the
         same diagnosis automatically as a gate on every real fetch, this is
         just for checking ahead of time."""
         self.remove_tmp()
@@ -267,10 +272,19 @@ class Fetcher:
             "feed_end_date": row.get("feed_end_date"),
         }
 
+    def _default_schedule_url(self) -> str | None:
+        """Route.url fallback for this system - moved from constants.py's
+        DEFAULT_SCHEDULE_URL_BY_SYSTEM dict to TransitSystem.
+        default_schedule_url. Queried once per diagnose()/upsert_routes()
+        call (not per-row) since it's the same value for every row."""
+        config = get_transit_system_config(self.transit_system)
+        return config["default_schedule_url"] if config else None
+
     def _diagnose_routes(self) -> dict[str, Any]:
         path = self.tmp_file(ROUTES_FILE)
         if not os.path.isfile(path):
             return {"present": False}
+        default_schedule_url = self._default_schedule_url()
         total = 0
         usable = 0
         missing_counts: dict[str, int] = defaultdict(int)
@@ -278,10 +292,7 @@ class Fetcher:
             reader = csv.DictReader(f)
             for row in reader:
                 total += 1
-                url = resolve_route_url(
-                    row.get("route_url"),
-                    DEFAULT_SCHEDULE_URL_BY_SYSTEM.get(self.transit_system),
-                )
+                url = resolve_route_url(row.get("route_url"), default_schedule_url)
                 missing = missing_route_fields(
                     row.get("route_id"),
                     row.get("route_short_name"),
@@ -510,40 +521,54 @@ class Fetcher:
         """headsign_by_trip/stop_meta come from fetch_metadata_update's single
         pre-promotion scan of stop_times.txt (see _scan_stop_times) - by the
         time this runs, files are already promoted into real_dir(), so
-        re-scanning here would parse the largest GTFS file a second time."""
+        re-scanning here would parse the largest GTFS file a second time.
+
+        upsert_stop_times() below still does its own separate pass over
+        stop_times.txt, same as upsert_trips/upsert_stops/upsert_routes each
+        already do for their own file - _scan_stop_times only ever combined
+        the two passes that were reading the SAME file for DIFFERENT small
+        derived summaries; materializing the full row set is a distinct
+        need with its own streaming/batching shape (see upsert_stop_times's
+        docstring for why it can't just reuse _upsert_batched directly)."""
         with engine.begin() as connection:
             try:
-                self.upsert_transit_system(connection)
+                if not self.upsert_transit_system(connection):
+                    return
                 self.upsert_trips(connection, headsign_by_trip)
                 self.upsert_stops(connection, stop_meta)
                 self.upsert_routes(connection)
+                self.upsert_stop_times(connection)
             except Exception as ex:
                 logger.error(f"Error: {ex}")
         logger.info(f"Upserts completed for {', '.join(METADATA_FILE_LIST)}")
 
-    def upsert_transit_system(self, connection: Connection) -> None:
-        realtime_url = GTFS_URLS.get(self.transit_system)
-        schedule_url = GTFS_METADATA.get(self.transit_system)
-        timezone = self._parse_agency_timezone()
+    def upsert_transit_system(self, connection: Connection) -> bool:
+        """Only updates last_fetched_at/timezone now - realtime_url/
+        schedule_url/default_schedule_url/auth_required/active are this
+        row's own persisted config (see models.TransitSystem), no longer
+        derived from a constants.py dict on every fetch, so nothing here
+        should overwrite them.
 
-        stmt = insert(TransitSystem).values(
-            name=self.transit_system,
-            realtime_url=realtime_url,
-            schedule_url=schedule_url,
-            last_fetched_at=datetime.utcnow(),
-            timezone=timezone,
+        A system must already have a TransitSystem row - inserted directly,
+        per the current workflow for adding one (see project memory) -
+        before it can be fetched at all: every other upsert_* method needs
+        select_transit_system() to resolve a real transit_system_id, which
+        can't happen for a row that was never created. Returns False (and
+        do_upserts skips everything else) in that case, rather than trying
+        to synthesize a row with no known realtime_url/schedule_url."""
+        timezone = self._parse_agency_timezone()
+        result = connection.execute(
+            update(TransitSystem)
+            .where(TransitSystem.name == self.transit_system)
+            .values(last_fetched_at=datetime.utcnow(), timezone=timezone)
         )
-        upsert_stmt = stmt.on_conflict_do_update(
-            constraint="uq_name",
-            set_=dict(
-                realtime_url=stmt.excluded.realtime_url,
-                schedule_url=stmt.excluded.schedule_url,
-                last_fetched_at=stmt.excluded.last_fetched_at,
-                timezone=stmt.excluded.timezone,
-            ),
-        )
-        result = connection.execute(upsert_stmt)
-        logger.info(f"upsert transit system result: {result.keys()}")
+        if result.rowcount == 0:
+            logger.error(
+                f"No TransitSystem row for {self.transit_system} - insert one "
+                "(with a real realtime_url/schedule_url) before fetching."
+            )
+            return False
+        return True
 
     def _parse_agency_timezone(self) -> str | None:
         """agency.txt's agency_timezone is required by the GTFS spec (an
@@ -564,6 +589,7 @@ class Fetcher:
 
     def upsert_routes(self, connection: Connection) -> None:
         transit_system_id = self.select_transit_system(connection)
+        default_schedule_url = self._default_schedule_url()
         routes = []
         with open(self.real_file(ROUTES_FILE), "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
@@ -571,10 +597,7 @@ class Fetcher:
                 route_id = row.get("route_id")
                 short_name = row.get("route_short_name")
                 long_name = row.get("route_long_name")
-                url = resolve_route_url(
-                    row.get("route_url"),
-                    DEFAULT_SCHEDULE_URL_BY_SYSTEM.get(self.transit_system),
-                )
+                url = resolve_route_url(row.get("route_url"), default_schedule_url)
                 color = row.get("route_color")
                 text_color = row.get("route_text_color")
                 if missing_route_fields(
@@ -795,6 +818,66 @@ class Fetcher:
         )
         logger.info(f"upsert stops result: {total} rows")
 
+    def upsert_stop_times(self, connection: Connection) -> None:
+        """Materializes stop_times.txt into the StopTime table so
+        get_scheduled_tail_stops (src/services/trip_detail.py) can look up a
+        trip's stop sequence with one indexed query instead of scanning the
+        file - see project memory for why that scan was slow on Helsinki's
+        7.8M-row/~700MB stop_times.txt.
+
+        Deliberately does NOT use _upsert_batched: that helper dedupes the
+        *entire* row list before chunking, which is fine for routes/trips/
+        stops (at most a few hundred thousand rows) but would mean holding
+        every row of even Helsinki's stop_times.txt in memory at once here -
+        exactly the shape of the original memory blowup (see project
+        memory). Streams the file and dedupes/upserts one UPSERT_BATCH_SIZE
+        chunk at a time instead, so memory stays bounded regardless of file
+        size. Per-batch (not whole-file) dedup is safe here because a
+        (trip_id, stop_sequence) collision, if the source data ever had one,
+        would only ever occur between adjacent rows for the same trip - a
+        real GTFS export's rows for one trip are always contiguous, unlike
+        MBTA's globally-scattered route_short_name reuse that motivated
+        _upsert_batched's whole-list dedup in the first place."""
+        transit_system_id = self.select_transit_system(connection)
+        total = 0
+        batch: list[dict[str, Any]] = []
+        with open(self.real_file(STOP_TIMES_FILE), "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trip_id = row.get("trip_id")
+                stop_id = row.get("stop_id")
+                if not trip_id or not stop_id:
+                    continue
+                try:
+                    stop_sequence = int(row.get("stop_sequence", ""))
+                except (TypeError, ValueError):
+                    continue
+                batch.append(
+                    {
+                        "transit_system_id": transit_system_id,
+                        "trip_id": trip_id,
+                        "stop_sequence": stop_sequence,
+                        "stop_id": stop_id,
+                    }
+                )
+                if len(batch) >= UPSERT_BATCH_SIZE:
+                    total += self._upsert_stop_time_batch(connection, batch)
+                    batch = []
+            if batch:
+                total += self._upsert_stop_time_batch(connection, batch)
+        logger.info(f"upsert stop_times result: {total} rows")
+
+    def _upsert_stop_time_batch(
+        self, connection: Connection, batch: list[dict[str, Any]]
+    ) -> int:
+        deduped = dedupe_rows_by_columns(batch, STOP_TIME_CONFLICT_COLUMNS)
+        insert_stmt = insert(StopTime).values(deduped)
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            constraint="uq_stop_time",
+            set_={"stop_id": insert_stmt.excluded.stop_id},
+        )
+        return connection.execute(upsert_stmt).rowcount
+
 
 if __name__ == "__main__":
     # WARNING by default so third-party libraries (requests/urllib3, etc.)
@@ -824,7 +907,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Fetch every transit system in GTFS_METADATA instead of a single one.",
+        help="Fetch every active transit system (see models.TransitSystem.active) "
+        "instead of a single one.",
     )
     parser.add_argument(
         "--diagnose",
@@ -836,8 +920,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--schedule-url",
-        help="Use this URL instead of looking --transit-system up in GTFS_METADATA - "
-        "lets you diagnose a system before adding it there. Only valid with --diagnose.",
+        help="Use this URL instead of looking --transit-system up in the "
+        "TransitSystem table - lets you diagnose a system before adding it there. "
+        "Only valid with --diagnose.",
     )
     args = parser.parse_args()
 
@@ -846,7 +931,10 @@ if __name__ == "__main__":
             raise SystemExit(
                 "--diagnose doesn't support --all - pass --transit-system for one system at a time."
             )
-        schedule_url = args.schedule_url or GTFS_METADATA.get(args.transit_system)
+        schedule_url = args.schedule_url
+        if not schedule_url:
+            config = get_transit_system_config(args.transit_system)
+            schedule_url = config["schedule_url"] if config else None
         if not schedule_url:
             raise SystemExit(
                 f"Invalid transit system: {args.transit_system} (or pass --schedule-url)"
@@ -858,9 +946,16 @@ if __name__ == "__main__":
         raise SystemExit("--schedule-url is only valid with --diagnose.")
 
     systems: list[tuple[str, str | None]] = (
-        list(GTFS_METADATA.items())
+        [(s["name"], s["schedule_url"]) for s in get_active_transit_systems()]
         if args.all
-        else [(args.transit_system, GTFS_METADATA.get(args.transit_system))]
+        else [
+            (
+                args.transit_system,
+                (get_transit_system_config(args.transit_system) or {}).get(
+                    "schedule_url"
+                ),
+            )
+        ]
     )
     for transit_system, schedule_url in systems:
         if not schedule_url:

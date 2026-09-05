@@ -8,20 +8,12 @@ hot path across every trip in a system), these are single-trip, on-demand
 lookups - plain per-request queries, not cached.
 """
 
-import csv
-import os
 from typing import Any, List, Optional, Tuple
 
 from sqlalchemy import select
 
 from src.database import engine
-from src.models import Route, Stop, TransitSystem, Trip
-
-# Duplicated from src.commands.fetcher rather than imported, to avoid a
-# services -> commands dependency (the reverse of this codebase's normal
-# layering, where commands depends on services).
-METADATA_DIR = "src/metadata/"
-STOP_TIMES_FILE = "stop_times.txt"
+from src.models import Route, Stop, StopTime, TransitSystem, Trip
 
 
 def get_trip_schedule_context(
@@ -129,23 +121,16 @@ def get_trip_schedule_context(
         return {"trip": trip, "route": route, "stops": stops}
 
 
-def get_scheduled_tail_stops(
-    transit_system: str, trip_id: str, live_stop_ids: List[str]
+def _tail_stops_after_anchor(
+    rows: List[Tuple[int, str]], live_stop_ids: List[str]
 ) -> List[Tuple[int, str]]:
-    """Some realtime feeds (confirmed live: BART) don't publish a
-    stop_time_update for every remaining stop on a trip - the GTFS-RT spec
-    explicitly allows this (its NO_DATA schedule_relationship exists for
-    exactly this case: "time predictions only for part of a trip"). This
-    means /trip_detail's stops[] can legitimately fall short of where the
-    trip's route_long_name says the line actually ends.
-
-    Scans our own promoted stop_times.txt (not the DB - we deliberately
-    never store a full per-trip stop sequence there; keeping only the
-    small derived summaries fetcher.py needs is what fixed a real memory
-    blowup earlier in this project, see project memory) for this trip's
-    static stops after the live feed's last-covered stop, so the response
-    can still show the full scheduled route with those extra stops marked
-    as "no live prediction" rather than silently ending early.
+    """Pure anchor-point computation, split out from get_scheduled_tail_stops
+    so the turnback/dedup logic below stays directly unit-testable without
+    a database (see src/tests/services/test_trip_detail.py) - mirrors
+    schedule_utils.py's pattern of keeping derivation logic separate from
+    I/O. `rows` must already be one trip's (stop_sequence, stop_id) pairs
+    in sequence order (get_scheduled_tail_stops' SQL query guarantees this
+    via its WHERE/ORDER BY).
 
     live_stop_ids' LAST entry isn't always unique in the static schedule:
     BART terminal-turnback stations (confirmed live: SFO on the Yellow
@@ -163,33 +148,12 @@ def get_scheduled_tail_stops(
     many times.
 
     Returns (stop_sequence, stop_id) pairs strictly after that anchor, in
-    order. Empty if the trip isn't in Schedule at all, or if the live
-    feed's last stop_id doesn't appear (at least that many times) in its
-    static stop sequence (e.g. a realtime/static ID mismatch, like MBTA's
-    - safer to show nothing extra than guess where it fits)."""
+    order. Empty if `rows` is empty (trip not in Schedule at all), or if
+    the live feed's last stop_id doesn't appear (at least that many times)
+    in `rows` (e.g. a realtime/static ID mismatch, like MBTA's - safer to
+    show nothing extra than guess where it fits)."""
     if not live_stop_ids:
         return []
-
-    path = f"{METADATA_DIR}{transit_system}/{STOP_TIMES_FILE}"
-    if not os.path.isfile(path):
-        return []
-
-    rows: List[Tuple[int, str]] = []
-    with open(path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("trip_id") != trip_id:
-                continue
-            stop_id = row.get("stop_id")
-            if not stop_id:
-                continue
-            try:
-                sequence = int(row.get("stop_sequence", ""))
-            except (TypeError, ValueError):
-                continue
-            rows.append((sequence, stop_id))
-
-    rows.sort(key=lambda r: r[0])
 
     last_covered_stop_id = live_stop_ids[-1]
     occurrence_count = live_stop_ids.count(last_covered_stop_id)
@@ -204,3 +168,47 @@ def get_scheduled_tail_stops(
         for sequence, stop_id in rows
         if sequence > last_covered_sequence
     ]
+
+
+def get_scheduled_tail_stops(
+    transit_system: str, trip_id: str, live_stop_ids: List[str]
+) -> List[Tuple[int, str]]:
+    """Some realtime feeds (confirmed live: BART) don't publish a
+    stop_time_update for every remaining stop on a trip - the GTFS-RT spec
+    explicitly allows this (its NO_DATA schedule_relationship exists for
+    exactly this case: "time predictions only for part of a trip"). This
+    means /trip_detail's stops[] can legitimately fall short of where the
+    trip's route_long_name says the line actually ends.
+
+    Queries the StopTime table (populated by
+    src.commands.fetcher.upsert_stop_times) for this trip's static stops
+    after the live feed's last-covered stop, so the response can still
+    show the full scheduled route with those extra stops marked as "no
+    live prediction" rather than silently ending early. Previously this
+    scanned stop_times.txt directly per request - fine for most sources,
+    but Helsinki's is 7.8M rows/~700MB, which made every lookup take a
+    very long time; StopTime's (transit_system_id, trip_id, stop_sequence)
+    index turns this into a single indexed query instead."""
+    if not live_stop_ids:
+        return []
+
+    with engine.begin() as connection:
+        transit_system_id = connection.execute(
+            select(TransitSystem.id).where(TransitSystem.name == transit_system)
+        ).scalar()
+        if transit_system_id is None:
+            return []
+
+        rows = [
+            (row.stop_sequence, row.stop_id)
+            for row in connection.execute(
+                select(StopTime.stop_sequence, StopTime.stop_id)
+                .where(
+                    StopTime.transit_system_id == transit_system_id,
+                    StopTime.trip_id == trip_id,
+                )
+                .order_by(StopTime.stop_sequence)
+            )
+        ]
+
+    return _tail_stops_after_anchor(rows, live_stop_ids)
