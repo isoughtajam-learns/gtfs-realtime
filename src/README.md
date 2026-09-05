@@ -12,5 +12,5 @@ Here are some key workflows for admins, including fetching new transit system da
 #### 3. fetch one system
 ```docker compose run --rm backend python src/fetcher.py --transit-system BART --force```
 
-#### 4. or fetch everything in GTFS_METADATA at once
+#### 4. or fetch every active system at once
 ```docker compose run --rm backend python src/fetcher.py --all --force```

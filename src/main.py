@@ -13,11 +13,13 @@ from posthog import Posthog
 from starlette import status
 
 from generated import gtfs_realtime_pb2
-from src.constants import GTFS_URLS
 from src.models import TransitSystemDetail, TripDetail, TripPosition, TripStopDetail
 from src.services.positioning import get_location
 from src.services.schedule_cache import ScheduleCache
-from src.services.transit_system_detail import get_transit_system_timezone
+from src.services.transit_system_detail import (
+    get_active_transit_systems,
+    get_transit_system_config,
+)
 from src.services.trip_detail import get_scheduled_tail_stops, get_trip_schedule_context
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
@@ -111,12 +113,32 @@ async def _fetch_feed(gtfs_url: str) -> gtfs_realtime_pb2.FeedMessage:
     return feed
 
 
+def _entity_trip_id(entity: gtfs_realtime_pb2.FeedEntity) -> str:
+    """The identifier this codebase treats as a trip's identity for both
+    the SSE stream and /trip_detail lookups: the realtime feed's own
+    TripDescriptor.trip_id when it's set, falling back to the feed
+    entity's own top-level `id` when it isn't.
+
+    Confirmed live: Helsinki_Regional_Transport never sets trip_id at all
+    - it's blank on every entity (654/654 polled) - which previously made
+    every HSL vehicle indistinguishable from every other one downstream
+    (the frontend's live feed collapsed to a single row, since it keys
+    trips by trip_id). FeedEntity.id is unique per trip and stable across
+    polls for HSL (confirmed live, 934/934 unchanged across a 15s gap),
+    so it's a safe fallback specifically for the "what row is this"
+    identity - NOT used for ScheduleCache/DB trip_id lookups, which stay
+    keyed on the raw (possibly blank) descriptor value since a feed
+    entity id was never in Schedule data to begin with."""
+    return entity.trip_update.trip.trip_id or entity.id
+
+
 @app.get("/trip_updates/{transit_system}", response_class=EventSourceResponse)
 async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, None]:
-    gtfs_url = GTFS_URLS.get(transit_system)
-    if not gtfs_url:
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
         logger.error(f"GTFS URL not found for {transit_system}")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    gtfs_url = config["realtime_url"]
 
     posthog_client = getattr(app.state, "posthog_client", None)
     if posthog_client:
@@ -149,7 +171,14 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
         for entity in feed.entity:
             if entity.HasField("trip_update"):
                 trip_descriptor = entity.trip_update.trip
-                trip_id = trip_descriptor.trip_id
+                # trip_id used below for the emitted row's identity (falls
+                # back to the entity id so HSL's blank trip_id doesn't
+                # collapse every vehicle into one row client-side); Schedule
+                # cache lookups a few lines down deliberately use
+                # trip_descriptor.trip_id directly instead - a feed entity id
+                # was never in Schedule data, so falling back there would
+                # just look up the wrong key.
+                trip_id = _entity_trip_id(entity)
                 route_id = trip_descriptor.route_id
                 direction_id = (
                     trip_descriptor.direction_id
@@ -170,12 +199,12 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     stop_names.get(destination_stop_id) if destination_stop_id else None
                 )
                 headsign = (
-                    trip_headsigns.get(trip_id)
+                    trip_headsigns.get(trip_descriptor.trip_id)
                     or headsigns_by_route_dir.get((route_id, direction_id))
                     or destination_headsign
                 )
                 colors = (
-                    colors_by_trip.get(trip_id)
+                    colors_by_trip.get(trip_descriptor.trip_id)
                     or colors_by_route.get(route_id)
                     or (
                         colors_by_stop.get(destination_stop_id)
@@ -210,12 +239,21 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
     transit_feed()'s SSE event), per-stop delay/schedule_relationship,
     vehicle info where the source publishes it, and Schedule fields
     (coordinates, route_type, platform, accessibility) that never made it
-    into the streamed event at all."""
-    gtfs_url = GTFS_URLS.get(transit_system)
-    if not gtfs_url:
+    into the streamed event at all.
+
+    `trip_id` is whatever transit_feed() emitted as this trip's identity
+    (see _entity_trip_id) - the real TripDescriptor.trip_id for most
+    sources, or a feed entity id for a source like HSL that never sets
+    one. Schedule-derived fields (route/trip/stop detail, tail-stop
+    backfill) still key off the raw descriptor value internally and
+    degrade to None/empty for a source where that never matches - see
+    get_trip_schedule_context and get_scheduled_tail_stops."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
         )
+    gtfs_url = config["realtime_url"]
 
     try:
         feed = await _fetch_feed(gtfs_url)
@@ -235,7 +273,7 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
         (
             e
             for e in feed.entity
-            if e.HasField("trip_update") and e.trip_update.trip.trip_id == trip_id
+            if e.HasField("trip_update") and _entity_trip_id(e) == trip_id
         ),
         None,
     )
@@ -375,22 +413,29 @@ async def get_transit_systems(request: Request) -> list[str]:
             distinct_id=None,
         )
 
-    return list(GTFS_URLS.keys())
+    systems = await asyncio.to_thread(get_active_transit_systems)
+    return [system["name"] for system in systems]
 
 
 @app.get("/transit_systems/{transit_system}")
 async def get_transit_system_detail(transit_system: str) -> TransitSystemDetail:
-    """System-level metadata that changes rarely (currently just the GTFS
-    Schedule timezone) - its own endpoint rather than a field on every SSE
-    event, since the frontend can fetch and cache this once instead of
-    receiving the same static value on every streamed trip_update."""
-    if transit_system not in GTFS_URLS:
+    """System-level metadata that changes rarely (timezone, the route_url
+    fallback, whether fetching needs an API secret) - its own endpoint
+    rather than fields on every SSE event, since the frontend can fetch and
+    cache this once instead of receiving the same static values on every
+    streamed trip_update."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
         )
 
-    timezone = await asyncio.to_thread(get_transit_system_timezone, transit_system)
-    return TransitSystemDetail(name=transit_system, timezone=timezone)
+    return TransitSystemDetail(
+        name=transit_system,
+        timezone=config["timezone"],
+        default_schedule_url=config["default_schedule_url"],
+        auth_required=config["auth_required"],
+    )
 
 
 @app.get("/info")
