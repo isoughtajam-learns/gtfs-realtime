@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Manual/fallback deploy - the routine path is automatic now (see
+# .github/workflows/ci.yml's deploy job, gated on VERSION being bumped and
+# lint/test/docker-build passing). Use this script only for a manual
+# override: an out-of-band hotfix, redeploying an already-tagged version, or
+# debugging the deploy itself. It uses your own local AWS credentials and
+# Terraform's now-remote (S3) state - same state the CI deploy reads/writes,
+# so don't run this concurrently with a CI deploy in flight.
+#
 # Builds, pushes, and rolls out the backend/celery-worker/celery-beat
 # services, from a tag reachable from THIS repo's origin/main - never the
 # local working tree. This stack owns only the backend; the frontend

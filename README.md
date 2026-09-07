@@ -165,29 +165,48 @@ We use Celery to periodically fetch fresh GTFS Schedule metadata to keep the dat
 
 ### Release & deploy workflow
 
-Deploys only ever build from a **tagged commit reachable from `origin/main`** - never the local working tree, and never an unmerged branch. This is enforced by `deployment/deploy.sh`, not just a convention: it verifies the tag with `git merge-base --is-ancestor` before building, and builds via `git archive <tag> | docker build -` (a clean export of that exact commit's tree) rather than `docker build .` against whatever's on disk.
+Deploys only ever build from a **tagged commit reachable from `origin/main`** - never the local working tree, and never an unmerged branch. Builds go via `git archive <tag> | docker build -` (a clean export of that exact commit's tree) rather than `docker build .` against whatever's on disk.
 
-**The backend and frontend are two fully independent Terraform stacks**, each deployed by its own script, so they can move at their own pace without either blocking or accidentally dragging the other along:
-- `gtfs-realtime/deployment` - backend/celery-worker/celery-beat + all the shared infrastructure (EC2 instance, ECS cluster, RDS, ElastiCache, IAM, secrets).
-- `../gtfs-dashboard/deployment` - just the frontend (ECR repo, task definition, service). It looks up the shared ECS cluster/execution role/secrets *by name* (`data` sources), not by reading this stack's state file - the only thing coupling the two is that `var.app_name` must match between them.
+**The backend and frontend are two fully independent Terraform stacks**, so they can move at their own pace without either blocking or accidentally dragging the other along:
+- `gtfs-realtime/deployment` - backend/celery-worker/celery-beat + all the shared infrastructure (EC2 instance, ECS cluster, RDS, ElastiCache, IAM, secrets). **Deploys automatically on every merge to main** (see below).
+- `../gtfs-dashboard/deployment` - just the frontend (ECR repo, task definition, service). It looks up the shared ECS cluster/execution role/secrets *by name* (`data` sources), not by reading this stack's state file - the only thing coupling the two is that `var.app_name` must match between them. Still deployed manually (`tag-release.sh` + `deploy.sh`), same as this stack was before automation.
 
-1. **Merge to `main`** on GitHub as usual (PR workflow), in whichever repo you're releasing.
-2. **Cut a release** - tags that repo's `origin/main` tip with the next version and pushes the tag. Defaults to a patch bump:
-   ```bash
-   ./deployment/tag-release.sh            # patch bump, e.g. v0.2.1 -> v0.2.2
-   ./deployment/tag-release.sh minor      # v0.2.2 -> v0.3.0
-   ./deployment/tag-release.sh major      # v0.3.0 -> v1.0.0
-   ```
-   (Same command in `../gtfs-dashboard/deployment/tag-release.sh` for a frontend release.)
-3. **Deploy just that side**:
-   ```bash
-   cd deployment && ./deploy.sh            # latest tag, or ./deploy.sh v0.2.2 to pin
-   ```
-   Builds and pushes the image from its verified tag, runs `terraform plan` against *that stack only*, and asks for confirmation before `terraform apply` rolls out the new task definition. The image is already in ECR by the time you're asked to confirm - answering no only skips the deploy, not the push.
+#### Backend: automatic, VERSION-gated
+
+The backend deploys itself - `.github/workflows/ci.yml`'s `deploy` job runs on every push to `main`, after `lint-and-typecheck`/`test`/`docker-build` all pass:
+
+1. Reads the `VERSION` file (plain `X.Y.Z`, no `v` prefix) at repo root.
+2. **If `vX.Y.Z` is already tagged** (i.e. this merge didn't bump `VERSION`), it skips - no tag, no deploy. This is the normal case for a PR that doesn't warrant a release (docs, CI config, a WIP piece of a larger change).
+3. **Otherwise**: tags the merge commit `vX.Y.Z` and pushes it, builds+pushes the image from that tag, and runs `terraform apply -var backend_image_tag=vX.Y.Z` non-interactively against the shared S3 state (see "Terraform state" below).
+
+So the human decision point moved from "confirm before apply" (the old `deploy.sh` prompt) to "bump `VERSION` in the PR" - **`check-version-bump`** (same workflow, runs on every PR) posts a non-blocking `::warning::` annotation if a PR's `VERSION` matches main's, as a nudge to make that a deliberate choice rather than a silent miss. It doesn't block merging; some PRs genuinely don't need a release.
+
+Bump `VERSION` yourself as part of a PR, same semantics as `tag-release.sh` used to apply automatically:
+```bash
+# e.g. VERSION currently "0.3.5"
+echo "0.3.6" > VERSION   # patch: a fix, no new capability
+echo "0.4.0" > VERSION   # minor: a new capability, backward compatible
+echo "1.0.0" > VERSION   # major: a breaking change
+```
+
+CI authenticates to AWS via GitHub OIDC (no static keys stored anywhere) - a dedicated IAM role (`gtfs-realtime-ci-deploy`) trusted only for `token.actions.githubusercontent.com`'s `repo:isoughtajam-learns/gtfs-realtime:ref:refs/heads/main` subject, i.e. only workflow runs triggered by a push to this repo's `main` branch can assume it. Its ARN is the `AWS_DEPLOY_ROLE_ARN` repo variable (not a secret - an IAM role ARN isn't sensitive on its own; only the OIDC trust condition makes it assumable).
+
+`deployment/deploy.sh`/`tag-release.sh` still work and remain for **manual/fallback use** - an out-of-band hotfix, redeploying an already-tagged version, or debugging the deploy itself. They use your own local AWS credentials against the same remote state the automated deploy uses, so avoid running one while a CI deploy is in flight (see "Terraform state" below).
+
+For the frontend, the pre-automation workflow still applies as-is:
+```bash
+./deployment/tag-release.sh            # patch bump, e.g. v0.2.1 -> v0.2.2 (run from ../gtfs-dashboard for a frontend release)
+cd deployment && ./deploy.sh            # latest tag, or ./deploy.sh v0.2.2 to pin
+```
+`deploy.sh` builds and pushes the image from its verified tag, runs `terraform plan` against *that stack only*, and asks for confirmation before `terraform apply` rolls out the new task definition. The image is already in ECR by the time you're asked to confirm - answering no only skips the deploy, not the push.
 
 `var.backend_image_tag` / `../gtfs-dashboard`'s `var.frontend_image_tag` have no defaults on purpose - every apply must name an explicit version, so there's no floating `:latest` that could silently drift between what Terraform thinks is deployed and what's actually running (the same class of surprise as the AMI reference in `main.tf` floating to "latest recommended" - see the EC2 instance-replacement note in `deployment/main.tf`'s AMI data source).
 
 This wasn't always two stacks - it started as one Terraform stack managing both, split later via `terraform state rm` + `terraform import` (never destroy/recreate) once independent release cadences made the coupling painful. If you ever need to do something similar: import into the new state first and verify a clean `terraform plan` (zero unexpected diff) *before* removing the resource from the old stack's config/state, so a mistake mid-migration never leaves the resource unowned by either.
+
+#### Terraform state
+
+This stack's state moved from local-only to a remote S3 backend (`deployment/main.tf`'s `terraform { backend "s3" {...} }`) specifically so CI (a fresh VM every run, no access to your laptop's state file) and your own local `deploy.sh`/`tag-release.sh` runs can safely share it. Bucket `gtfs-realtime-tfstate-537735702437` (versioned, encrypted, not public); locking is Terraform's native S3 conditional-write locking (`use_lockfile = true`, needs Terraform >= 1.10 - no separate DynamoDB table). If you ever see a lock-related error running Terraform locally, check whether a CI deploy is currently in progress before assuming it's stuck.
 
 ### Manually triggering a GTFS Schedule fetch in production
 

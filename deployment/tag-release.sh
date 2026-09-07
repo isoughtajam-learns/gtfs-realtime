@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Manual/fallback tagging - the routine path is automatic now: bump VERSION
+# in a PR (a CI check warns if you forget), and once it merges to main and
+# CI passes, .github/workflows/ci.yml's deploy job tags and deploys it for
+# you. Use this script only when you need to tag out-of-band (VERSION
+# wasn't bumped for a merge that should still ship, a hotfix, etc).
+#
 # Tags origin/main's current tip with the next semantic version and pushes
 # the tag. Only ever tags origin/main - never a local-only commit or another
 # branch - since deploy.sh only trusts tags reachable from origin/main.
