@@ -1,0 +1,107 @@
+name: Deploy
+
+# Chained off CI (not `push: main` directly) so a deploy can never start
+# until lint/test/docker-build have all passed on the exact commit that
+# merged - `workflow_run` is the standard way to sequence one workflow
+# after another completes, since a job can't `needs:` a job in a different
+# file. Always runs the version of this file on the default branch,
+# regardless of what triggered the upstream CI run - a deliberate GitHub
+# Actions security property (a PR can't alter deploy behavior by editing
+# this file on its own branch).
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  # Tags and deploys the exact commit that just merged to main, but only if
+  # the CI run this fired from succeeded, and only if VERSION was actually
+  # bumped for this merge (see check-version-bump in ci.yml; a merge that
+  # didn't bump it just means "no release this time", not a failure). Runs
+  # terraform apply non-interactively - deployment/deploy.sh remains for
+  # manual/hotfix deploys, this is the routine path.
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # A deploy mid-`terraform apply` must never be cancelled by a second
+    # merge landing right after - that can corrupt state / leave ECS
+    # mid-update. cancel-in-progress: false makes a second deploy queue
+    # behind the first instead.
+    concurrency:
+      group: gtfs-realtime-deploy
+      cancel-in-progress: false
+    permissions:
+      id-token: write # required to assume the AWS OIDC role below
+      contents: write # required to push the release tag
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Pin to the exact commit CI just verified, not whatever main
+          # happens to be by the time this job starts (normally the same,
+          # but a second merge could land in the gap between CI finishing
+          # and this job starting).
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0 # need full tag history to check/create the release tag
+
+      - name: Determine release tag from VERSION
+        id: version
+        run: echo "tag=v$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version is already tagged
+        id: check_tag
+        run: |
+          git fetch origin --tags
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.version.outputs.tag }} already exists - VERSION wasn't bumped for this merge. Skipping deploy."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag release
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.check_tag.outputs.exists == 'false'
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.check_tag.outputs.exists == 'false'
+        with:
+          # Must be >= 1.10 - deployment/main.tf's S3 backend relies on
+          # native state locking (use_lockfile), added in 1.10.
+          terraform_version: "1.15.8"
+
+      - name: Terraform init
+        if: steps.check_tag.outputs.exists == 'false'
+        working-directory: deployment
+        run: terraform init -input=false
+
+      - name: Build and push backend image
+        if: steps.check_tag.outputs.exists == 'false'
+        working-directory: deployment
+        run: |
+          REPO_URL=$(terraform output -raw ecr_repository_url)
+          aws ecr get-login-password --region us-east-2 \
+            | docker login --username AWS --password-stdin "${REPO_URL%%/*}"
+          TAG="${{ steps.version.outputs.tag }}"
+          # Build from a clean archive of the tagged commit, not the
+          # runner's working directory - matches deploy.sh's own approach,
+          # so what's deployed is provably exactly what's tagged.
+          git -C .. archive "$TAG" | docker build -t "$REPO_URL:$TAG" -
+          docker push "$REPO_URL:$TAG"
+
+      - name: Terraform apply
+        if: steps.check_tag.outputs.exists == 'false'
+        working-directory: deployment
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var="backend_image_tag=${{ steps.version.outputs.tag }}"
