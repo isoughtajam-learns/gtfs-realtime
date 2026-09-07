@@ -1,5 +1,8 @@
 terraform {
-  required_version = ">= 1.0.0"
+  # >= 1.10.0 (not just >= 1.0.0) because the S3 backend below relies on
+  # native state locking (use_lockfile, added in 1.10) - no separate
+  # DynamoDB lock table needed.
+  required_version = ">= 1.10.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,6 +12,19 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.6"
     }
+  }
+
+  # Remote state - both local (human) deploys and CI's automated deploy job
+  # need to see the same state, which a local-only state file can't provide
+  # for CI (a fresh VM every run). Bucket is versioned + encrypted + not
+  # public (see its own creation notes in project memory). use_lockfile
+  # uses S3 conditional writes for locking instead of a DynamoDB table -
+  # cheaper and one less resource to manage for a lock this low-traffic.
+  backend "s3" {
+    bucket       = "gtfs-realtime-tfstate-537735702437"
+    key          = "gtfs-realtime/terraform.tfstate"
+    region       = "us-east-2"
+    use_lockfile = true
   }
 }
 
