@@ -173,13 +173,13 @@ Deploys only ever build from a **tagged commit reachable from `origin/main`** - 
 
 #### Backend: automatic, VERSION-gated
 
-The backend deploys itself - `.github/workflows/ci.yml`'s `deploy` job runs on every push to `main`, after `lint-and-typecheck`/`test`/`docker-build` all pass:
+The backend deploys itself - `.github/workflows/deploy.yml`'s `deploy` job runs whenever `.github/workflows/ci.yml`'s `CI` workflow completes successfully on `main` (a `workflow_run` trigger - a job can't `needs:` a job in a different file, so this is the standard way to chain one workflow after another, and it guarantees `lint-and-typecheck`/`test`/`docker-build` all passed on the exact commit before any deploy step runs):
 
-1. Reads the `VERSION` file (plain `X.Y.Z`, no `v` prefix) at repo root.
+1. Reads the `VERSION` file (plain `X.Y.Z`, no `v` prefix) at repo root, from the exact commit CI just verified (`github.event.workflow_run.head_sha`).
 2. **If `vX.Y.Z` is already tagged** (i.e. this merge didn't bump `VERSION`), it skips - no tag, no deploy. This is the normal case for a PR that doesn't warrant a release (docs, CI config, a WIP piece of a larger change).
-3. **Otherwise**: tags the merge commit `vX.Y.Z` and pushes it, builds+pushes the image from that tag, and runs `terraform apply -var backend_image_tag=vX.Y.Z` non-interactively against the shared S3 state (see "Terraform state" below).
+3. **Otherwise**: tags that commit `vX.Y.Z` and pushes it, builds+pushes the image from that tag, and runs `terraform apply -var backend_image_tag=vX.Y.Z` non-interactively against the shared S3 state (see "Terraform state" below).
 
-So the human decision point moved from "confirm before apply" (the old `deploy.sh` prompt) to "bump `VERSION` in the PR" - **`check-version-bump`** (same workflow, runs on every PR) posts a non-blocking `::warning::` annotation if a PR's `VERSION` matches main's, as a nudge to make that a deliberate choice rather than a silent miss. It doesn't block merging; some PRs genuinely don't need a release.
+So the human decision point moved from "confirm before apply" (the old `deploy.sh` prompt) to "bump `VERSION` in the PR" - **`check-version-bump`** (in `ci.yml`, runs on every PR) posts a non-blocking `::warning::` annotation if a PR's `VERSION` matches main's, as a nudge to make that a deliberate choice rather than a silent miss. It doesn't block merging; some PRs genuinely don't need a release.
 
 Bump `VERSION` yourself as part of a PR, same semantics as `tag-release.sh` used to apply automatically:
 ```bash
@@ -189,7 +189,7 @@ echo "0.4.0" > VERSION   # minor: a new capability, backward compatible
 echo "1.0.0" > VERSION   # major: a breaking change
 ```
 
-CI authenticates to AWS via GitHub OIDC (no static keys stored anywhere) - a dedicated IAM role (`gtfs-realtime-ci-deploy`) trusted only for `token.actions.githubusercontent.com`'s `repo:isoughtajam-learns/gtfs-realtime:ref:refs/heads/main` subject, i.e. only workflow runs triggered by a push to this repo's `main` branch can assume it. Its ARN is the `AWS_DEPLOY_ROLE_ARN` repo variable (not a secret - an IAM role ARN isn't sensitive on its own; only the OIDC trust condition makes it assumable).
+CI authenticates to AWS via GitHub OIDC (no static keys stored anywhere) - a dedicated IAM role (`gtfs-realtime-ci-deploy`) trusted only for `token.actions.githubusercontent.com`'s `repo:isoughtajam-learns@196524593/gtfs-realtime@1330525927:ref:refs/heads/main` subject, i.e. only workflow runs triggered by a push to this repo's `main` branch can assume it. (The `@<numeric-id>` suffixes on the org/repo names are GitHub's immutable identifiers, not a typo - confirmed via CloudTrail after the plain `repo:owner/repo:...` format from GitHub's own docs was rejected with a generic "Not authorized" error; the numeric IDs are actually the more robust match since they survive a repo/org rename.) Its ARN is the `AWS_DEPLOY_ROLE_ARN` repo variable (not a secret - an IAM role ARN isn't sensitive on its own; only the OIDC trust condition makes it assumable).
 
 `deployment/deploy.sh`/`tag-release.sh` still work and remain for **manual/fallback use** - an out-of-band hotfix, redeploying an already-tagged version, or debugging the deploy itself. They use your own local AWS credentials against the same remote state the automated deploy uses, so avoid running one while a CI deploy is in flight (see "Terraform state" below).
 
