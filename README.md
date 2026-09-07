@@ -181,6 +181,8 @@ The backend deploys itself - `.github/workflows/deploy.yml`'s `deploy` job runs 
 
 So the human decision point moved from "confirm before apply" (the old `deploy.sh` prompt) to "bump `VERSION` in the PR" - **`check-version-bump`** (in `ci.yml`, runs on every PR) posts a non-blocking `::warning::` annotation if a PR's `VERSION` matches main's, as a nudge to make that a deliberate choice rather than a silent miss. It doesn't block merging; some PRs genuinely don't need a release.
 
+**The image build is pinned to `linux/arm64`** (`docker buildx build --platform linux/arm64`, via `docker/setup-qemu-action` for cross-arch emulation on GitHub's amd64 runners) - `variables.tf`'s `instance_type` (`t4g.small`) is Graviton, so an `amd64` image crashes on boot with `exec format error`. Confirmed live: the very first automated deploy hit exactly this, because every prior manual deploy had only ever worked by accident - `deploy.sh` never declared a platform either, it just happened to run on an Apple Silicon Mac, which builds `arm64` natively by default. `ci.yml`'s `docker-build` validation job targets the same platform, so an arm64-only build failure (e.g. a dependency with no arm64 wheel) shows up there, not for the first time during a real deploy.
+
 Bump `VERSION` yourself as part of a PR, same semantics as `tag-release.sh` used to apply automatically:
 ```bash
 # e.g. VERSION currently "0.3.5"
