@@ -68,9 +68,14 @@ jobs:
       - run: git fetch origin "${{ github.base_ref }}" --depth=1
       - name: Warn if VERSION wasn't bumped
         run: |
-          BASE_VERSION=$(git show "origin/${{ github.base_ref }}:VERSION")
+          # VERSION may not exist on the base branch yet (e.g. the PR that
+          # introduces it) - `git show` would fail outright rather than
+          # just reporting "nothing to compare", so fall back to empty.
+          BASE_VERSION=$(git show "origin/${{ github.base_ref }}:VERSION" 2>/dev/null || echo "")
           HEAD_VERSION=$(cat VERSION)
-          if [ "$BASE_VERSION" = "$HEAD_VERSION" ]; then
+          if [ -z "$BASE_VERSION" ]; then
+            echo "VERSION doesn't exist on ${{ github.base_ref }} yet - nothing to compare."
+          elif [ "$BASE_VERSION" = "$HEAD_VERSION" ]; then
             echo "::warning file=VERSION::VERSION is still $HEAD_VERSION - if this PR should deploy when merged, bump it (patch/minor/major). Merging without a bump skips tagging and deploying entirely (see the deploy job in ci.yml)."
           else
             echo "VERSION bumped: $BASE_VERSION -> $HEAD_VERSION"
