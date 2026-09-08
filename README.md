@@ -103,6 +103,8 @@ This isn't just a manual check - `fetch_metadata_update()` runs the exact same d
 
 Run it standalone with `--diagnose` (see above) before inserting a new system's `TransitSystem` row at all - `--schedule-url` lets you point at a feed that isn't registered there yet.
 
+For a source that requires an API key to download its schedule zip, add `--auth-header 'Header-Name: value'` (repeatable) - e.g. `--auth-header 'Authorization: Bearer xyz'`. A query-param key doesn't need this, just put it in `--schedule-url` directly. This is CLI-only for now: `TransitSystem.auth_required` is schema/API-surface scaffolding (see `src/models.py`) - the automated fetch path (`--all`, celery-beat's scheduled fetches) doesn't look up a stored secret anywhere yet, so `--auth-header` isn't valid with `--all`.
+
 ### Runtime hydration (`src/services/schedule_cache.py`)
 
 `ScheduleCache` preloads three per-system dicts on first request and refreshes on a 6-hour TTL:
