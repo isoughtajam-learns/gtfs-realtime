@@ -418,10 +418,16 @@ resource "aws_ecs_task_definition" "backend" {
       essential         = true
       cpu               = 256
       memoryReservation = 256
-      command = [
-        "sh", "-c",
-        "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000"
-      ]
+      # Migrations are no longer applied here (was "alembic upgrade head &&
+      # uvicorn ...") - a bad migration meant the container never got past
+      # that step at all, which surfaced as an ECS crash-loop (backend down,
+      # ambiguous error) instead of a clean deploy-time failure. deploy.yml
+      # now runs migrations as a separate, gating one-off task *before*
+      # this task definition is ever rolled out - see that workflow's "Run
+      # database migration" step. Local dev (docker-compose.yml) keeps the
+      # old combined-command convenience; only this production task
+      # definition changed.
+      command = ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
       portMappings = [
         {
           containerPort = local.container_port
