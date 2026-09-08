@@ -105,9 +105,21 @@ class Fetcher:
     transit_system_id: int | None = None
     trips: dict[str, int] | None = None
 
-    def __init__(self, url: str, transit_system: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        transit_system: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.url = url
         self.transit_system = transit_system
+        # Sent on every schedule-zip download (diagnose_only and
+        # fetch_metadata_update) - e.g. {"Authorization": "Bearer ..."} for
+        # a source that requires an API key. CLI-only for now (see
+        # --auth-header): TransitSystem.auth_required is schema-only
+        # scaffolding, the real automated-fetch path doesn't look up a
+        # secret anywhere yet.
+        self.headers = headers
 
     def tmp_dir(self) -> str:
         return f"{TMP_DIR}{self.transit_system}/"
@@ -210,7 +222,7 @@ class Fetcher:
         same diagnosis automatically as a gate on every real fetch, this is
         just for checking ahead of time."""
         self.remove_tmp()
-        response = requests.get(self.url, timeout=60)
+        response = requests.get(self.url, timeout=60, headers=self.headers)
         response.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(response.content)) as z:
             z.extractall(self.tmp_dir())
@@ -488,7 +500,7 @@ class Fetcher:
         if force:
             self.remove_tmp()
 
-        response = requests.get(self.url, timeout=60)
+        response = requests.get(self.url, timeout=60, headers=self.headers)
         if response.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(response.content)) as z:
                 z.extractall(f"{TMP_DIR}{self.transit_system}")
@@ -998,7 +1010,27 @@ if __name__ == "__main__":
         "TransitSystem table - lets you diagnose a system before adding it there. "
         "Only valid with --diagnose.",
     )
+    parser.add_argument(
+        "--auth-header",
+        action="append",
+        default=[],
+        metavar="'Name: value'",
+        help="HTTP header to send when downloading the schedule zip, e.g. "
+        "--auth-header 'Authorization: Bearer xyz' - for a source that requires an "
+        "API key. Repeatable. Not valid with --all (a single header set can't apply "
+        "to every system at once). Query-param API keys don't need this - just put "
+        "them in the URL.",
+    )
     args = parser.parse_args()
+
+    auth_headers: dict[str, str] = {}
+    for raw_header in args.auth_header:
+        name, sep, value = raw_header.partition(":")
+        if not sep:
+            raise SystemExit(
+                f"Invalid --auth-header {raw_header!r} - expected 'Name: value'."
+            )
+        auth_headers[name.strip()] = value.strip()
 
     if args.diagnose:
         if args.all:
@@ -1013,11 +1045,14 @@ if __name__ == "__main__":
             raise SystemExit(
                 f"Invalid transit system: {args.transit_system} (or pass --schedule-url)"
             )
-        Fetcher(schedule_url, args.transit_system).diagnose_only()
+        Fetcher(schedule_url, args.transit_system, headers=auth_headers).diagnose_only()
         raise SystemExit(0)
 
     if args.schedule_url:
         raise SystemExit("--schedule-url is only valid with --diagnose.")
+
+    if auth_headers and args.all:
+        raise SystemExit("--auth-header isn't valid with --all.")
 
     systems: list[tuple[str, str | None]] = (
         [(s["name"], s["schedule_url"]) for s in get_active_transit_systems()]
@@ -1034,7 +1069,7 @@ if __name__ == "__main__":
     for transit_system, schedule_url in systems:
         if not schedule_url:
             raise Exception("Invalid transit system: {}".format(transit_system))
-        fetcher = Fetcher(schedule_url, transit_system)
+        fetcher = Fetcher(schedule_url, transit_system, headers=auth_headers or None)
         if args.all:
             # One slow/unreachable feed shouldn't block the rest, or the
             # startup command (fetcher.py && uvicorn) from ever reaching uvicorn.
