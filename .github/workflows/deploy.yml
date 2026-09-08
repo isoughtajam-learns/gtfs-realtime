@@ -85,6 +85,22 @@ jobs:
         working-directory: deployment
         run: terraform init -input=false
 
+      # ECS runs on Graviton (t4g.small, arm64 - see variables.tf's
+      # instance_type) - the image MUST be built for linux/arm64, or the
+      # container crashes on boot with "exec format error" (confirmed live:
+      # the first automated deploy hit exactly this, since GitHub-hosted
+      # runners are amd64 and nothing declared a target platform before -
+      # manual deploys only ever worked by accident, because they always
+      # ran on an Apple Silicon Mac). setup-qemu-action provides the
+      # emulation buildx needs to cross-compile arm64 on an amd64 runner.
+      - uses: docker/setup-qemu-action@v3
+        if: steps.check_tag.outputs.exists == 'false'
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.check_tag.outputs.exists == 'false'
+
       - name: Build and push backend image
         if: steps.check_tag.outputs.exists == 'false'
         working-directory: deployment
@@ -95,9 +111,11 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
           # Build from a clean archive of the tagged commit, not the
           # runner's working directory - matches deploy.sh's own approach,
-          # so what's deployed is provably exactly what's tagged.
-          git -C .. archive "$TAG" | docker build -t "$REPO_URL:$TAG" -
-          docker push "$REPO_URL:$TAG"
+          # so what's deployed is provably exactly what's tagged. --push
+          # publishes directly from buildx (a cross-platform image can't be
+          # `docker load`ed into the local daemon the same way a native one
+          # can, so there's no separate `docker push` step here).
+          git -C .. archive "$TAG" | docker buildx build --platform linux/arm64 -t "$REPO_URL:$TAG" --push -
 
       - name: Terraform apply
         if: steps.check_tag.outputs.exists == 'false'

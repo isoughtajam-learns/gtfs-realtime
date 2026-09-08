@@ -45,6 +45,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # linux/arm64 to match deploy.yml's real build target (ECS runs on
+      # Graviton/t4g.small) - an arm64-only build failure (e.g. a
+      # dependency with no arm64 wheel, needing to compile from source)
+      # should show up here, not surface for the first time during an
+      # actual deploy.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - uses: docker/setup-buildx-action@v4
       # Validates the Dockerfile still builds - catches a broken dependency
       # or Dockerfile change early. Does not push anywhere - deploy.yml's
@@ -53,6 +61,7 @@ jobs:
       - uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: linux/arm64
           push: false
 
   # Non-blocking nudge for deploy.yml's VERSION-gated deploy: if a PR
