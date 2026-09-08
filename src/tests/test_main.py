@@ -36,6 +36,7 @@ def _mock_transit_system_config(**overrides: Any) -> dict[str, Any]:
         "timezone": None,
         "default_schedule_url": None,
         "auth_required": False,
+        "min_poll_interval_seconds": 0,
     }
     config.update(overrides)
     return config
