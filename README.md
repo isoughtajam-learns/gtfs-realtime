@@ -221,6 +221,14 @@ This wasn't always two stacks - it started as one Terraform stack managing both,
 
 This stack's state moved from local-only to a remote S3 backend (`deployment/main.tf`'s `terraform { backend "s3" {...} }`) specifically so CI (a fresh VM every run, no access to your laptop's state file) and your own local `deploy.sh`/`tag-release.sh` runs can safely share it. Bucket `gtfs-realtime-tfstate-537735702437` (versioned, encrypted, not public); locking is Terraform's native S3 conditional-write locking (`use_lockfile = true`, needs Terraform >= 1.10 - no separate DynamoDB table). If you ever see a lock-related error running Terraform locally, check whether a CI deploy is currently in progress before assuming it's stuck.
 
+### Alerting (`deployment/alerts.tf`)
+
+Built directly in response to the `v0.3.7` arm64 crash-loop incident, which ran for several minutes before anyone noticed - nothing was watching for it. An SNS topic (`gtfs-realtime-alerts`, `var.alert_email`) gets a CloudWatch alarm notification on either:
+- **A service's running task count drops below desired** (`backend`/`celery-worker`/`celery-beat`, via `AWS/ECS`'s `LiveTaskCount` metric - available natively per-service without opting into the extra-billed Container Insights) - sustained for 5 straight 1-minute periods, long enough to ride out a normal deploy's brief 0-task window (this service's single-instance + fixed-host-port setup means the old task must fully stop before the new one starts - see `aws_ecs_service.backend`'s `deployment_minimum_healthy_percent = 0` comment) without false-alarming on every routine release.
+- **The EC2 instance itself fails AWS's status checks** (`AWS/EC2`'s `StatusCheckFailed`, system or instance level).
+
+Both fire `ok_actions` too, so you also get notified when it self-recovers, not just when it breaks. **A new `var.alert_email` subscription needs its confirmation link clicked before anything actually gets delivered** - `terraform apply` doesn't wait for that, so check `aws sns list-subscriptions-by-topic --topic-arn $(terraform output -raw alerts_sns_topic_arn)` if you're not sure whether it's live yet.
+
 ### Manually triggering a GTFS Schedule fetch in production
 
 The backend's startup command only runs `alembic upgrade head` - it does **not** fetch GTFS Schedule data. Schedule data is only populated by celery-beat's `fetch_all_systems` task, scheduled every 4 hours (2/6/10/14/18/22 UTC, see `src/tasks.py`). To populate a system's data immediately instead of waiting for the next scheduled run (e.g. right after activating a new `TransitSystem` row, or after a fix like the one that re-enabled Helsinki):

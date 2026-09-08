@@ -62,3 +62,9 @@ variable "ssh_ingress_cidr" {
   default     = "0.0.0.0/0"
   description = "CIDR allowed to SSH into the instance on port 22. Restrict to your IP (e.g. \"1.2.3.4/32\") instead of leaving this open to the internet."
 }
+
+variable "alert_email" {
+  type        = string
+  default     = "g@gautamjoshi.com"
+  description = "Email address subscribed to the CloudWatch-alarm SNS topic (see alerts.tf). AWS sends a confirmation email to this address after apply - the subscription stays PendingConfirmation (no alarms delivered) until that link is clicked."
+}

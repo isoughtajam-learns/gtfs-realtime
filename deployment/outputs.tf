@@ -67,3 +67,8 @@ output "ssh_command" {
   description = "SSH command to reach the container instance for debugging"
   value       = "ssh -i ~/.ssh/${var.ssh_key_name}.pem ec2-user@${aws_eip.ecs.public_ip}"
 }
+
+output "alerts_sns_topic_arn" {
+  description = "SNS topic CloudWatch alarms publish to (see alerts.tf) - var.alert_email is subscribed, but stays PendingConfirmation until that email's confirmation link is clicked"
+  value       = aws_sns_topic.alerts.arn
+}
