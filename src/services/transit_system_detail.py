@@ -29,6 +29,7 @@ def get_transit_system_config(transit_system: str) -> Optional[dict[str, Any]]:
                 TransitSystem.timezone,
                 TransitSystem.default_schedule_url,
                 TransitSystem.auth_required,
+                TransitSystem.min_poll_interval_seconds,
             ).where(
                 TransitSystem.name == transit_system, TransitSystem.active.is_(True)
             )
@@ -41,6 +42,7 @@ def get_transit_system_config(transit_system: str) -> Optional[dict[str, Any]]:
         "timezone": row.timezone,
         "default_schedule_url": row.default_schedule_url,
         "auth_required": row.auth_required,
+        "min_poll_interval_seconds": row.min_poll_interval_seconds,
     }
 
 

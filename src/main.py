@@ -15,6 +15,7 @@ from starlette import status
 from generated import gtfs_realtime_pb2
 from src.models import TransitSystemDetail, TripDetail, TripPosition, TripStopDetail
 from src.services.positioning import get_location
+from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.schedule_cache import ScheduleCache
 from src.services.transit_system_detail import (
     get_active_transit_systems,
@@ -139,6 +140,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
         logger.error(f"GTFS URL not found for {transit_system}")
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     gtfs_url = config["realtime_url"]
+    min_poll_interval_seconds = config["min_poll_interval_seconds"]
 
     posthog_client = getattr(app.state, "posthog_client", None)
     if posthog_client:
@@ -158,7 +160,18 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             colors_by_stop,
         ) = await ScheduleCache.get(transit_system)
         try:
-            feed = await _fetch_feed(gtfs_url)
+            # Every connected client runs this same 30s loop independently -
+            # without RealtimeFeedCache, N clients would mean N times the
+            # outbound request rate to this system's own API. The cache
+            # shares one real fetch across all of them, respecting
+            # min_poll_interval_seconds (0 - the default - means never
+            # cache, so this is a no-op for every system that doesn't need
+            # rate limiting).
+            feed = await RealtimeFeedCache.get(
+                transit_system,
+                lambda: _fetch_feed(gtfs_url),
+                min_poll_interval_seconds,
+            )
         except requests.exceptions.RequestException as ex:
             logger.error(f"Request error fetching feed for {transit_system}: {ex}")
             await asyncio.sleep(30)
@@ -256,7 +269,16 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
     gtfs_url = config["realtime_url"]
 
     try:
-        feed = await _fetch_feed(gtfs_url)
+        # Shares the same cache as transit_feed()'s SSE loop - see
+        # RealtimeFeedCache. A busy detail view no longer means an extra
+        # uncoordinated poll of the upstream source on top of the SSE
+        # stream's own; min_poll_interval_seconds=0 (the default) still
+        # fetches fresh on every request, exactly like before.
+        feed = await RealtimeFeedCache.get(
+            transit_system,
+            lambda: _fetch_feed(gtfs_url),
+            config["min_poll_interval_seconds"],
+        )
     except requests.exceptions.RequestException as ex:
         logger.error(f"Request error fetching feed for {transit_system}: {ex}")
         raise HTTPException(

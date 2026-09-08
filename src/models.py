@@ -137,6 +137,18 @@ class TransitSystem(ORMBase):
     # a pre-existing or future row nobody explicitly activates doesn't
     # silently start being served.
     active: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # Minimum seconds between real outbound polls of realtime_url for this
+    # system, shared across every caller (main.py's SSE loop - one poll per
+    # connected client - and /trip_detail, which previously fetched fresh
+    # on every single request with no throttling at all). 0 (the default)
+    # means never cache - matches pre-rate-limiting behavior exactly for
+    # every system that doesn't need this. Exists because some sources
+    # enforce a strict per-key quota (e.g. 511.org) that concurrent
+    # uncoordinated polling could exceed - see
+    # src/services/realtime_feed_cache.py.
+    min_poll_interval_seconds: Mapped[int] = mapped_column(
+        default=0, server_default="0"
+    )
     __table_args__ = (UniqueConstraint("name", name="uq_name"),)
 
 
