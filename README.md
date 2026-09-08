@@ -32,7 +32,7 @@ Insert a `TransitSystem` row (`active=true`, a real `realtime_url`) to add a new
 - `GET /transit_systems/{transit_system}` — system-level metadata that changes rarely (currently just `timezone`, an IANA identifier like `"America/Los_Angeles"` from `agency.txt`'s `agency_timezone`). Its own endpoint rather than a field on every SSE event, since the frontend can fetch and cache it once instead of receiving the same static value on every streamed `trip_update`.
 - `GET /trip_detail/{transit_system}/{trip_id}` — everything the realtime feed says about one specific, currently-active trip, plus whatever GTFS Schedule data we have on its route/trip/stops. Meant to back a "trip detail" UI (e.g. clicking an event from the SSE stream).
 
-  Polls the realtime feed fresh on each request (no caching - a detail view is low-frequency, unlike the SSE hot path) and looks for an entity matching `trip_id`; `404`s if the trip isn't in the current feed (it may not be running right now), `502`s if the source itself is unreachable or the feed doesn't parse.
+  Shares `RealtimeFeedCache` with the SSE loop (see "Rate limiting a source" below) rather than always polling fresh - for most systems (`min_poll_interval_seconds=0`) that's the same as fetching fresh on every request. Looks for an entity matching `trip_id`; `404`s if the trip isn't in the current feed (it may not be running right now), `502`s if the source itself is unreachable or the feed doesn't parse.
 
   Returns, beyond what the SSE event already has:
   - **Every remaining stop** on the trip (`stops[]`), not just the current one - each with its own arrival/departure time *and* delay, and `schedule_relationship` (e.g. `SKIPPED`).
@@ -80,9 +80,18 @@ All of the fields listed above beyond the original core set (`route_type`, `trip
 
 ### Transit system registry
 
-A system's full config lives on its own `TransitSystem` row - `realtime_url`, `schedule_url`, `default_schedule_url` (the `Route.url` fallback for a source that doesn't publish a URL per route), `auth_required` (schema-only for now - see below), and `active`. There's no code-level list of systems anymore (no `GTFS_URLS`/`GTFS_METADATA`/`DEFAULT_SCHEDULE_URL_BY_SYSTEM`, which used to live in `src/constants.py`): `src/services/transit_system_detail.py`'s `get_transit_system_config`/`get_active_transit_systems` are the only reads, and every consumer (`main.py`'s endpoints, `src/tasks.py`'s periodic fetches, `fetcher.py`'s CLI) goes through them.
+A system's full config lives on its own `TransitSystem` row - `realtime_url`, `schedule_url`, `default_schedule_url` (the `Route.url` fallback for a source that doesn't publish a URL per route), `auth_required` (schema-only for now - see below), `min_poll_interval_seconds` (see "Rate limiting a source" below), and `active`. There's no code-level list of systems anymore (no `GTFS_URLS`/`GTFS_METADATA`/`DEFAULT_SCHEDULE_URL_BY_SYSTEM`, which used to live in `src/constants.py`): `src/services/transit_system_detail.py`'s `get_transit_system_config`/`get_active_transit_systems` are the only reads, and every consumer (`main.py`'s endpoints, `src/tasks.py`'s periodic fetches, `fetcher.py`'s CLI) goes through them.
 
 `active` is deliberately separate from just having URLs on file: a system can be fully configured (real `realtime_url`/`schedule_url`, historical data already ingested) without being served - e.g. a system disabled for reliability reasons keeps its row (and any already-fetched Schedule data) but drops out of `get_active_transit_systems()`/`GET /transit_systems` and 404s from every other endpoint, same as one that was never added at all. **Adding a new system now means inserting a `TransitSystem` row directly** (`active=true`, real `realtime_url`/`schedule_url`) - there's no dict to edit. `auth_required` exists as scaffolding for a future source that needs an API secret to poll `realtime_url`; no current system needs one, so the actual secret lookup/attach at fetch time isn't implemented yet.
+
+### Rate limiting a source
+
+`TransitSystem.min_poll_interval_seconds` (default `0`) bounds how often we make a *real* outbound request to that system's own `realtime_url` - for a source with a strict per-key quota (e.g. 511.org), uncoordinated polling can blow through it fast: `transit_feed()`'s SSE loop polls every 30s *per connected client*, and `/trip_detail` used to fetch fresh on every single request with no throttling at all. `src/services/realtime_feed_cache.py`'s `RealtimeFeedCache` is the shared layer both endpoints go through instead of calling `_fetch_feed` directly - every caller for a given transit_system shares one real fetch, refreshed at most once every `min_poll_interval_seconds`, with a per-system lock so concurrent callers racing a stale cache don't each trigger their own duplicate fetch. `0` means never cache - exactly the old fetch-fresh-always behavior - so this is a no-op for every system that hasn't hit a real rate-limit problem.
+
+Set it directly on the row (no CLI flag yet, unlike `--auth-header`):
+```sql
+UPDATE transit_system SET min_poll_interval_seconds = 60 WHERE name = 'SomeRateLimitedAgency';
+```
 
 ### Headsign fallback chain
 
