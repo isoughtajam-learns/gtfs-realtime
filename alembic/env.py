@@ -13,7 +13,6 @@ config = context.config
 section = config.config_ini_section
 config_section = config.get_section(section)
 injected_env_url = get_settings().database_url
-print(f"post-injection sqlalchemy.url {injected_env_url}")
 config.set_section_option(section, "sqlalchemy.url", injected_env_url)
 
 

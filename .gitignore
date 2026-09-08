@@ -25,3 +25,4 @@ deployment/tfplan*
 deployment/*.tfvars
 
 celerybeat-schedule
+.claude/

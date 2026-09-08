@@ -117,6 +117,61 @@ jobs:
           # can, so there's no separate `docker push` step here).
           git -C .. archive "$TAG" | docker buildx build --platform linux/arm64 -t "$REPO_URL:$TAG" --push -
 
+      - name: Run database migration
+        if: steps.check_tag.outputs.exists == 'false'
+        working-directory: deployment
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          REPO_URL=$(terraform output -raw ecr_repository_url)
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+
+          # Clone the currently-registered backend task definition (still
+          # pointing at the *previous* release - this deploy's terraform
+          # apply, which would register the real new revision, hasn't run
+          # yet) and swap in this release's image + a migration-only
+          # command. Registering it as its own revision - rather than
+          # `run-task --overrides`, which can't change the image - and
+          # running that to completion *before* terraform apply ever
+          # touches the live service means a bad migration fails the
+          # deploy cleanly here, instead of surfacing as an ECS crash-loop
+          # after the service already points at the new image (see
+          # deployment/main.tf's backend task definition comment).
+          NEW_TASK_DEF=$(aws ecs describe-task-definition \
+              --task-definition gtfs-realtime-backend \
+              --query 'taskDefinition' | \
+            jq --arg image "$REPO_URL:$TAG" '
+              .containerDefinitions[0].image = $image |
+              .containerDefinitions[0].command = ["alembic", "upgrade", "head"] |
+              .containerDefinitions[0].portMappings = [] |
+              del(
+                .taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy
+              )
+            ')
+
+          NEW_TASK_DEF_ARN=$(echo "$NEW_TASK_DEF" | aws ecs register-task-definition \
+            --cli-input-json file:///dev/stdin \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$NEW_TASK_DEF_ARN" \
+            --launch-type EC2 \
+            --query 'tasks[0].taskArn' --output text)
+
+          echo "Migration task started ($TASK_ARN), waiting for it to stop..."
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Migration task exited $EXIT_CODE - aborting before touching the live service."
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN"
+            exit 1
+          fi
+          echo "Migration succeeded."
+
       - name: Terraform apply
         if: steps.check_tag.outputs.exists == 'false'
         working-directory: deployment
