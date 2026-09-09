@@ -137,7 +137,11 @@ jobs:
           # deploy cleanly here, instead of surfacing as an ECS crash-loop
           # after the service already points at the new image (see
           # deployment/main.tf's backend task definition comment).
-          NEW_TASK_DEF=$(aws ecs describe-task-definition \
+          # Written to a real file, not piped through `file:///dev/stdin` -
+          # confirmed live that the AWS CLI's file:// handling doesn't
+          # reliably read a pipe/special file that way (fails with "Invalid
+          # JSON received" even though the JSON itself is valid).
+          aws ecs describe-task-definition \
               --task-definition gtfs-realtime-backend \
               --query 'taskDefinition' | \
             jq --arg image "$REPO_URL:$TAG" '
@@ -148,10 +152,10 @@ jobs:
                 .taskDefinitionArn, .revision, .status, .requiresAttributes,
                 .compatibilities, .registeredAt, .registeredBy
               )
-            ')
+            ' > migration-task-def.json
 
-          NEW_TASK_DEF_ARN=$(echo "$NEW_TASK_DEF" | aws ecs register-task-definition \
-            --cli-input-json file:///dev/stdin \
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://migration-task-def.json \
             --query 'taskDefinition.taskDefinitionArn' --output text)
 
           TASK_ARN=$(aws ecs run-task \
