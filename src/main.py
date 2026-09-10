@@ -13,10 +13,21 @@ from posthog import Posthog
 from starlette import status
 
 from generated import gtfs_realtime_pb2
-from src.models import TransitSystemDetail, TripDetail, TripPosition, TripStopDetail
+from src.models import (
+    ServiceAlert,
+    TransitSystemDetail,
+    TripDetail,
+    TripPosition,
+    TripStopDetail,
+)
 from src.services.positioning import get_location
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.schedule_cache import ScheduleCache
+from src.services.service_alerts import (
+    build_service_alerts,
+    extract_referenced_ids,
+    get_alert_hydration_data,
+)
 from src.services.transit_system_detail import (
     get_active_transit_systems,
     get_transit_system_config,
@@ -424,6 +435,54 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
         route_type=route_schedule.get("route_type"),
         stops=stops,
     )
+
+
+@app.get("/service_alerts/{transit_system}")
+async def service_alerts(transit_system: str) -> list[ServiceAlert]:
+    """Every currently-published GTFS-RT ServiceAlert for this system,
+    hydrated against our stored Schedule data - see
+    models.TransitSystem.alerts_url and src/services/service_alerts.py.
+    404s for a system with no alerts_url configured, same as an unknown
+    system - both mean "nothing to fetch here"."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config or not config["alerts_url"]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Unknown transit system or no service alerts feed configured",
+        )
+    alerts_url = config["alerts_url"]
+
+    try:
+        # Shares RealtimeFeedCache with transit_feed()/trip_detail() under a
+        # distinct key - see RealtimeFeedCache.get's key param - so a
+        # system's alerts_url and realtime_url are rate-limited together
+        # against min_poll_interval_seconds (one shared quota, e.g. 511.org)
+        # without one feed's cache entry clobbering the other's.
+        feed = await RealtimeFeedCache.get(
+            f"{transit_system}:alerts",
+            lambda: _fetch_feed(alerts_url),
+            config["min_poll_interval_seconds"],
+        )
+    except requests.exceptions.RequestException as ex:
+        logger.error(f"Request error fetching alerts for {transit_system}: {ex}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not reach the alerts source",
+        )
+    except Exception as ex:
+        logger.error(f"Parse error with alerts Feed Message for {transit_system}: {ex}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Malformed alerts feed"
+        )
+
+    trip_ids, route_ids = extract_referenced_ids(feed)
+    trips_by_id, routes_by_id = await asyncio.to_thread(
+        get_alert_hydration_data, transit_system, list(trip_ids), list(route_ids)
+    )
+    return [
+        ServiceAlert(**alert)
+        for alert in build_service_alerts(feed, trips_by_id, routes_by_id)
+    ]
 
 
 @app.get("/transit_systems")

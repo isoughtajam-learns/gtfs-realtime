@@ -76,6 +76,53 @@ class TripDetail(BaseModel):
     stops: list[TripStopDetail] = []
 
 
+class AlertActivePeriod(BaseModel):
+    """One start/end window a ServiceAlert is in effect - GTFS-RT allows
+    several per alert (e.g. recurring weekend maintenance). Either bound
+    can be unset (open-ended)."""
+
+    start: Optional[int] = None
+    end: Optional[int] = None
+
+
+class AffectedTrip(BaseModel):
+    """One trip a ServiceAlert names, either directly (informed_entity.trip)
+    or via one of its stops - hydrated from our own stored Trip row, not
+    whatever the alert entity itself happened to set (which BART's live
+    feed frequently leaves blank for route_id - see trip_detail.py's same
+    reasoning for route_id)."""
+
+    trip_id: str
+    trip_headsign: Optional[str] = None
+    route_id: Optional[str] = None
+
+
+class AffectedRoute(BaseModel):
+    """One route a ServiceAlert names - either directly (informed_entity.
+    route_id) or via an affected trip's own route_id."""
+
+    route_id: str
+    route_short_name: Optional[str] = None
+    route_long_name: Optional[str] = None
+
+
+class ServiceAlert(BaseModel):
+    """One GTFS-RT Alert entity, hydrated against our stored Schedule data.
+    Response shape for GET /service_alerts/{transit_system} - see
+    src/services/service_alerts.py."""
+
+    alert_id: str
+    cause: str
+    effect: str
+    severity_level: Optional[str] = None
+    header_text: Optional[str] = None
+    description_text: Optional[str] = None
+    url: Optional[str] = None
+    active_period: list[AlertActivePeriod] = []
+    affected_trips: list[AffectedTrip] = []
+    affected_routes: list[AffectedRoute] = []
+
+
 class TransitSystemDetail(BaseModel):
     """Response for GET /transit_systems/{transit_system} - system-level
     metadata that changes rarely (e.g. its GTFS Schedule timezone).
@@ -149,6 +196,15 @@ class TransitSystem(ORMBase):
     min_poll_interval_seconds: Mapped[int] = mapped_column(
         default=0, server_default="0"
     )
+    # GTFS-RT ServiceAlerts feed URL - a distinct feed from realtime_url
+    # (TripUpdates), usually a sibling endpoint (confirmed live for BART,
+    # SF-MTA/511.org). Optional: not every system has one, or we may not
+    # have found it yet. Polled through the same RealtimeFeedCache/
+    # min_poll_interval_seconds as realtime_url (see
+    # src/services/service_alerts.py) - a system with a strict per-key
+    # quota (511.org) has that quota shared across both feeds, not budgeted
+    # separately.
+    alerts_url: Mapped[Optional[str]]
     __table_args__ = (UniqueConstraint("name", name="uq_name"),)
 
 

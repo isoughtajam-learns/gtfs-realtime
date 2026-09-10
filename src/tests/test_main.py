@@ -15,9 +15,11 @@ from src.main import (
     _fetch_feed,
     get_transit_system_detail,
     get_transit_systems,
+    service_alerts,
     transit_feed,
     trip_detail,
 )
+from src.models import AffectedRoute, AffectedTrip, AlertActivePeriod
 from src.services.schedule_cache import ScheduleCache
 
 
@@ -37,6 +39,7 @@ def _mock_transit_system_config(**overrides: Any) -> dict[str, Any]:
         "default_schedule_url": None,
         "auth_required": False,
         "min_poll_interval_seconds": 0,
+        "alerts_url": None,
     }
     config.update(overrides)
     return config
@@ -650,3 +653,153 @@ def test_get_transit_systems_returns_active_system_names(
     systems = asyncio.run(get_transit_systems(request))
 
     assert systems == ["BART", "MBTA"]
+
+
+def _active_with_alerts(*names: str) -> Any:
+    """monkeypatch target for src.main.get_transit_system_config - like
+    _active_for, but with alerts_url populated, since service_alerts() 404s
+    on a system with no alerts feed configured even if it's otherwise
+    active."""
+    return lambda name: (
+        _mock_transit_system_config(alerts_url="http://example.com/alerts")
+        if name in names
+        else None
+    )
+
+
+def _valid_alerts_feed_bytes() -> bytes:
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    entity = feed.entity.add()
+    entity.id = "A1"
+    alert = entity.alert
+    alert.cause = gtfs_realtime_pb2.Alert.MAINTENANCE
+    alert.effect = gtfs_realtime_pb2.Alert.DETOUR
+    alert.severity_level = gtfs_realtime_pb2.Alert.WARNING
+    alert.header_text.translation.add(text="Weekend maintenance", language="en")
+    alert.description_text.translation.add(
+        text="Trains replaced by shuttle buses", language="en"
+    )
+    alert.url.translation.add(text="http://example.com/alert-details", language="en")
+    period = alert.active_period.add()
+    period.start = 1_700_000_000
+    period.end = 1_700_100_000
+    informed = alert.informed_entity.add()
+    informed.trip.trip_id = "T1"
+    return feed.SerializeToString()
+
+
+def test_service_alerts_404s_for_unknown_transit_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_with_alerts())
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(service_alerts("NotASystem"))
+    assert exc_info.value.status_code == 404
+
+
+def test_service_alerts_404s_when_no_alerts_url_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BART is active and has a realtime_url, but _active_for's default
+    # config leaves alerts_url unset - same 404 as an unknown system, since
+    # there's nothing for this endpoint to fetch either way.
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(service_alerts("BART"))
+    assert exc_info.value.status_code == 404
+
+
+def test_service_alerts_502s_on_request_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", boom)
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config", _active_with_alerts("BART")
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(service_alerts("BART"))
+    assert exc_info.value.status_code == 502
+
+
+def test_service_alerts_502s_on_parse_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(b"not a protobuf, just garbage"),
+    )
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config", _active_with_alerts("BART")
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(service_alerts("BART"))
+    assert exc_info.value.status_code == 502
+
+
+def test_service_alerts_returns_hydrated_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: _mock_response(_valid_alerts_feed_bytes())
+    )
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config", _active_with_alerts("BART")
+    )
+    monkeypatch.setattr(
+        "src.main.get_alert_hydration_data",
+        lambda transit_system, trip_ids, route_ids: (
+            {"T1": {"trip_headsign": "Downtown", "route_id": "R1"}},
+            {"R1": {"route_short_name": "Red", "route_long_name": "Red Line"}},
+        ),
+    )
+
+    alerts = asyncio.run(service_alerts("BART"))
+
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.alert_id == "A1"
+    assert alert.cause == "MAINTENANCE"
+    assert alert.effect == "DETOUR"
+    assert alert.severity_level == "WARNING"
+    assert alert.header_text == "Weekend maintenance"
+    assert alert.description_text == "Trains replaced by shuttle buses"
+    assert alert.url == "http://example.com/alert-details"
+    assert alert.active_period == [
+        AlertActivePeriod(start=1_700_000_000, end=1_700_100_000)
+    ]
+    assert alert.affected_trips == [
+        AffectedTrip(trip_id="T1", trip_headsign="Downtown", route_id="R1")
+    ]
+    # R1 was only referenced through T1's own route_id, not directly in
+    # any informed_entity - still expected to show up, hydrated.
+    assert alert.affected_routes == [
+        AffectedRoute(route_id="R1", route_short_name="Red", route_long_name="Red Line")
+    ]
+
+
+def test_service_alerts_degrades_gracefully_without_hydration_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trip_id/route_id the live alert names but we have no Schedule data
+    for should still show up, just without the hydrated fields - not get
+    dropped or error."""
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: _mock_response(_valid_alerts_feed_bytes())
+    )
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config", _active_with_alerts("BART")
+    )
+    monkeypatch.setattr("src.main.get_alert_hydration_data", lambda *a, **k: ({}, {}))
+
+    alerts = asyncio.run(service_alerts("BART"))
+
+    assert len(alerts) == 1
+    assert alerts[0].affected_trips == [
+        AffectedTrip(trip_id="T1", trip_headsign=None, route_id=None)
+    ]
+    assert alerts[0].affected_routes == []
