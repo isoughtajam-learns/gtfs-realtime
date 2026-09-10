@@ -96,6 +96,9 @@ def ensure_schedule_data() -> None:
         print(f"No schedule data found for {name}, triggering fetch")
         fetcher = Fetcher(url, name)
         try:
-            fetcher.fetch_metadata_update(force=False)
+            # force=True skips should_update() entirely and always
+            # downloads+upserts, which is exactly what an empty-DB system
+            # needs regardless of what's already promoted on disk.
+            fetcher.fetch_metadata_update(force=True)
         except Exception as e:
             print(f"Error fetching for {name}: {e}")
