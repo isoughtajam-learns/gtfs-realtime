@@ -96,19 +96,6 @@ def ensure_schedule_data() -> None:
         print(f"No schedule data found for {name}, triggering fetch")
         fetcher = Fetcher(url, name)
         try:
-            # force=True, not False: Fetcher.should_update() (called when
-            # force=False) gates on whether src/metadata/<system>/ already
-            # has promoted files on disk, as a proxy for "already ingested" -
-            # a reasonable proxy normally, but wrong here specifically. We
-            # already know from has_data above that trip/stop rows are
-            # missing from *this* database; a previous promotion under a
-            # different database (e.g. local docker-compose vs. local
-            # no-docker dev, which share a bind-mounted src/metadata/ but not
-            # a DB - confirmed live: this exact scenario left SF-MTA's
-            # trip_headsign/stop_name null in the SSE stream indefinitely,
-            # since should_update() kept finding the old promoted files and
-            # skipping the upsert every 15-minute retry) can leave those
-            # files sitting there and silently defeat this safety net.
             # force=True skips should_update() entirely and always
             # downloads+upserts, which is exactly what an empty-DB system
             # needs regardless of what's already promoted on disk.
