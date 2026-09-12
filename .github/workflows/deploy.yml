@@ -73,7 +73,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-2
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         if: steps.check_tag.outputs.exists == 'false'
         with:
           # Must be >= 1.10 - deployment/main.tf's S3 backend relies on
