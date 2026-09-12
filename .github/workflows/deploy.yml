@@ -67,7 +67,7 @@ jobs:
           git tag -a "${{ steps.version.outputs.tag }}" -m "${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         if: steps.check_tag.outputs.exists == 'false'
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
