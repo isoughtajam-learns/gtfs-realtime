@@ -22,6 +22,7 @@ from src.models import (
 )
 from src.services.positioning import get_location
 from src.services.realtime_feed_cache import RealtimeFeedCache
+from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
 from src.services.service_alerts import (
     build_service_alerts,
@@ -161,6 +162,13 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             properties={"transit_system": transit_system},
         )
 
+    # Give a newly-connected client something real to show immediately,
+    # instead of making them wait out this system's poll/rate-limit cycle
+    # (up to min_poll_interval_seconds - e.g. SF-MTA's 240s) for the first
+    # live event - see RecentEventsCache.
+    for cached_position in RecentEventsCache.get(transit_system):
+        yield ServerSentEvent(data=cached_position, event="trip_update", retry=5000)
+
     while True:
         (
             trip_headsigns,
@@ -192,6 +200,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             await asyncio.sleep(30)
             continue
 
+        positions_this_poll: list[TripPosition] = []
         for entity in feed.entity:
             if entity.HasField("trip_update"):
                 trip_descriptor = entity.trip_update.trip
@@ -237,21 +246,35 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     )
                 )
                 color, text_color = colors if colors else (None, None)
+                # trip_update.timestamp ("last measured" time for this
+                # vehicle) is the ranking key RecentEventsCache uses to keep
+                # its most-recently-updated 50 - not every source sets it
+                # per-trip, so fall back to the feed's own header timestamp
+                # (always present) rather than leaving it unset.
+                timestamp = (
+                    entity.trip_update.timestamp
+                    if entity.trip_update.HasField("timestamp")
+                    else feed.header.timestamp
+                )
+                trip_position = TripPosition(
+                    trip_id=trip_id,
+                    stop_id=position.stop_id,
+                    previous=position.previous,
+                    next=position.next,
+                    status=position.status,
+                    trip_headsign=headsign,
+                    stop_name=stop_names.get(position.stop_id),
+                    color=color,
+                    text_color=text_color,
+                    timestamp=timestamp,
+                )
+                positions_this_poll.append(trip_position)
                 yield ServerSentEvent(
-                    data=TripPosition(
-                        trip_id=trip_id,
-                        stop_id=position.stop_id,
-                        previous=position.previous,
-                        next=position.next,
-                        status=position.status,
-                        trip_headsign=headsign,
-                        stop_name=stop_names.get(position.stop_id),
-                        color=color,
-                        text_color=text_color,
-                    ),
+                    data=trip_position,
                     event="trip_update",
                     retry=5000,
                 )
+        RecentEventsCache.update(transit_system, positions_this_poll)
         await asyncio.sleep(30)
 
 
