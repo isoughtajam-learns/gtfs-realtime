@@ -147,6 +147,20 @@ def _entity_trip_id(entity: gtfs_realtime_pb2.FeedEntity) -> str:
 
 @app.get("/trip_updates/{transit_system}", response_class=EventSourceResponse)
 async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, None]:
+    # Known benign log noise, confirmed live in prod CloudWatch (2026-09-12):
+    # an "ERROR: Exception in ASGI application" / anyio.BrokenResourceError
+    # from fastapi/routing.py's internal _keepalive_inserter, raised when a
+    # client disconnects (tab closed, switched systems, network drop) at the
+    # exact instant that background task is mid-send into its own internal
+    # memory stream. That's entirely inside FastAPI's own SSE plumbing, not
+    # this function - nothing here catches or causes it, and there's
+    # nothing lost for other connected clients (each SSE connection is
+    # independent). No ALB/health check hits this endpoint (single EC2,
+    # host networking, no target group - see deployment/main.tf) that could
+    # be causing artificial disconnect churn, and deployment/alerts.tf only
+    # watches ECS task counts/EC2 status checks, not log content, so this
+    # can't be what triggers a real alert. Investigated and intentionally
+    # left as-is rather than "fixed."
     config = await asyncio.to_thread(get_transit_system_config, transit_system)
     if not config:
         logger.error(f"GTFS URL not found for {transit_system}")
