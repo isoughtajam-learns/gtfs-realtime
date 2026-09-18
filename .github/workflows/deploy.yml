@@ -93,7 +93,7 @@ jobs:
       # manual deploys only ever worked by accident, because they always
       # ran on an Apple Silicon Mac). setup-qemu-action provides the
       # emulation buildx needs to cross-compile arm64 on an amd64 runner.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         if: steps.check_tag.outputs.exists == 'false'
         with:
           platforms: arm64
