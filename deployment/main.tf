@@ -356,12 +356,15 @@ resource "aws_ecs_cluster" "main" {
 # ------------------------------------------------------------------------------
 # 9. EC2 Container Instance + Elastic IP
 # ------------------------------------------------------------------------------
-data "aws_ssm_parameter" "ecs_ami" {
-  name = "/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id"
-}
-
+# Was: data.aws_ssm_parameter.ecs_ami's "recommended" value, tracked live.
+# Pinned instead: the "recommended" AMI had already drifted from what this
+# instance actually runs (AWS publishes new ones regularly), so an untracked
+# apply would replace this already-live, traffic-serving instance - and with
+# it, /etc/letsencrypt (see ../../gtfs-dashboard/deployment/main.tf's
+# "letsencrypt" volume), which is host-local with no backup. Pinned to the
+# AMI this instance is actually running; bump deliberately, not implicitly.
 resource "aws_instance" "ecs" {
-  ami                         = data.aws_ssm_parameter.ecs_ami.value
+  ami                         = "ami-09f9087c26b946f3e"
   instance_type               = var.instance_type
   subnet_id                   = data.aws_subnets.default.ids[0]
   associate_public_ip_address = true

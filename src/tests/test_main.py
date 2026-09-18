@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime
-from typing import Any
+from typing import Any, Generator
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -19,8 +19,27 @@ from src.main import (
     transit_feed,
     trip_detail,
 )
-from src.models import AffectedRoute, AffectedTrip, AlertActivePeriod
+from src.models import (
+    AffectedRoute,
+    AffectedTrip,
+    AlertActivePeriod,
+    Status,
+    TripPosition,
+)
+from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _clear_recent_events_cache() -> Generator[None, None, None]:
+    # RecentEventsCache is class-level global state, same as
+    # RealtimeFeedCache/ScheduleCache - unlike those, several tests below
+    # reuse the same transit_system name (e.g. "BART"), so without this a
+    # later test's initial burst could pick up an earlier test's cached
+    # positions instead of exercising a clean stream.
+    RecentEventsCache._events.clear()
+    yield
+    RecentEventsCache._events.clear()
 
 
 async def _first_event(transit_system: str) -> ServerSentEvent:
@@ -202,6 +221,63 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
 
     assert call_count["n"] == 2
     assert event.data.trip_id == "T1"
+
+
+def test_transit_feed_yields_cached_recent_events_before_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A newly-connected client shouldn't have to wait out a real poll (let
+    # alone this system's rate-limit window) to see anything - the first
+    # event(s) come from RecentEventsCache, before requests.get is ever
+    # called.
+    RecentEventsCache.update(
+        "BART",
+        [
+            TripPosition(
+                trip_id="CachedTrip",
+                stop_id="S9",
+                previous=100,
+                next=200,
+                status=Status.IN_TRANSIT,
+                timestamp=42,
+            )
+        ],
+    )
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("requests.get should not be called for the cached burst")
+
+    monkeypatch.setattr(requests, "get", boom)
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    event = asyncio.run(_first_event("BART"))
+
+    assert event.data.trip_id == "CachedTrip"
+
+
+def test_transit_feed_populates_recent_events_cache_after_a_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RecentEventsCache.update() runs after a poll's whole entity loop - a
+    # single grabbed event (_first_event) closes the generator before that
+    # point is ever reached, so this needs a second event to force the
+    # generator to resume past it (into the update call, the sleep, and the
+    # next poll iteration).
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
+    )
+    monkeypatch.setattr(
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+    )
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    asyncio.run(_first_two_events("BART"))
+
+    cached = RecentEventsCache.get("BART")
+    assert [p.trip_id for p in cached] == ["T1"]
 
 
 def test_entity_trip_id_uses_descriptor_trip_id_when_present() -> None:
