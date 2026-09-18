@@ -4,8 +4,20 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # All routine version bumps land as one PR per week instead of one
+      # per dependency - six separate PRs in one week (each needing its
+      # own CI run, and each invalidating the others' "up to date with
+      # main" status on merge) was the prompt for this.
+      python-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - "*"
