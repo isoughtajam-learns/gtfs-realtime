@@ -180,7 +180,23 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
     # instead of making them wait out this system's poll/rate-limit cycle
     # (up to min_poll_interval_seconds - e.g. SF-MTA's 240s) for the first
     # live event - see RecentEventsCache.
+    # Filtered against whatever's already cached (no new fetch - see
+    # RealtimeFeedCache.peek) so a burst entry that's already dropped out
+    # of the live feed (its trip ended) isn't served as if it were still
+    # live - confirmed live in prod: trip_detail() 404s for a burst-served
+    # trip_id no longer in the current feed, which a client has no way to
+    # distinguish from a real error. `live_trip_ids is None` (nothing
+    # cached yet) means "unknown" - serve the burst unfiltered rather than
+    # dropping everything just because we can't yet verify it.
+    live_feed = RealtimeFeedCache.peek(transit_system)
+    live_trip_ids = (
+        {_entity_trip_id(e) for e in live_feed.entity if e.HasField("trip_update")}
+        if live_feed is not None
+        else None
+    )
     for cached_position in RecentEventsCache.get(transit_system):
+        if live_trip_ids is not None and cached_position.trip_id not in live_trip_ids:
+            continue
         yield ServerSentEvent(data=cached_position, event="trip_update", retry=5000)
 
     while True:

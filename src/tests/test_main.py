@@ -26,20 +26,30 @@ from src.models import (
     Status,
     TripPosition,
 )
+from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _clear_recent_events_cache() -> Generator[None, None, None]:
-    # RecentEventsCache is class-level global state, same as
-    # RealtimeFeedCache/ScheduleCache - unlike those, several tests below
-    # reuse the same transit_system name (e.g. "BART"), so without this a
-    # later test's initial burst could pick up an earlier test's cached
-    # positions instead of exercising a clean stream.
+    # RecentEventsCache and RealtimeFeedCache are both class-level global
+    # state - unlike RealtimeFeedCache's own test file (which sidesteps
+    # this with a unique transit_system name per test), several tests
+    # below reuse the same name (e.g. "BART"), so without clearing both,
+    # a later test's burst/live-feed-peek could pick up an earlier test's
+    # cached data instead of exercising a clean stream. transit_feed()'s
+    # burst is now filtered against RealtimeFeedCache.peek() (see
+    # main.py), so leftover feed state from an earlier test can silently
+    # change which burst entries pass the filter - clearing both here,
+    # not just RecentEventsCache, is what actually fixes that.
     RecentEventsCache._events.clear()
+    RealtimeFeedCache._feed.clear()
+    RealtimeFeedCache._fetched_at.clear()
     yield
     RecentEventsCache._events.clear()
+    RealtimeFeedCache._feed.clear()
+    RealtimeFeedCache._fetched_at.clear()
 
 
 async def _first_event(transit_system: str) -> ServerSentEvent:
@@ -253,6 +263,99 @@ def test_transit_feed_yields_cached_recent_events_before_polling(
     event = asyncio.run(_first_event("BART"))
 
     assert event.data.trip_id == "CachedTrip"
+
+
+def test_transit_feed_filters_burst_entries_not_in_cached_live_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Confirmed live in prod: a RecentEventsCache trip whose run has already
+    # ended (no longer in the live feed) still got served in the burst,
+    # and clicking it 404'd from trip_detail() - indistinguishable from a
+    # real error to a client. Filtering against RealtimeFeedCache.peek()
+    # closes that gap.
+    #
+    # Seeds RealtimeFeedCache._feed directly rather than via .get() - two
+    # separate top-level asyncio.run() calls (one to seed, one for
+    # _first_event below) are two separate event loops, and an
+    # asyncio.Lock created in one hangs forever if awaited from another;
+    # .get()'s per-system lock only gets touched on an actual cache-miss
+    # fetch, so writing the cache directly sidesteps that entirely.
+    live_feed = gtfs_realtime_pb2.FeedMessage()
+    live_entity = live_feed.entity.add()
+    live_entity.id = "e1"
+    live_entity.trip_update.trip.trip_id = "StillLiveTrip"
+    RealtimeFeedCache._feed["PeekFilterSystem"] = live_feed
+
+    RecentEventsCache.update(
+        "PeekFilterSystem",
+        [
+            TripPosition(
+                trip_id="EndedTrip",
+                stop_id="S9",
+                previous=100,
+                next=200,
+                status=Status.IN_TRANSIT,
+                timestamp=1,
+            )
+        ],
+    )
+
+    # EndedTrip isn't in the live feed above, so the burst loop should
+    # yield nothing for it - the first real event comes from the normal
+    # poll loop instead, which (min_poll_interval_seconds=0, so always a
+    # "fresh" fetch) reuses this same mocked response.
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
+    )
+    monkeypatch.setattr(
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+    )
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config", _active_for("PeekFilterSystem")
+    )
+
+    event = asyncio.run(_first_event("PeekFilterSystem"))
+
+    assert event.data.trip_id != "EndedTrip"
+    assert event.data.trip_id == "T1"  # from _feed_with_one_active_trip_update()
+
+
+def test_transit_feed_keeps_burst_entries_still_in_cached_live_feed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live_feed = gtfs_realtime_pb2.FeedMessage()
+    live_entity = live_feed.entity.add()
+    live_entity.id = "e1"
+    live_entity.trip_update.trip.trip_id = "StillLiveTrip"
+    RealtimeFeedCache._feed["PeekKeepSystem"] = live_feed
+
+    RecentEventsCache.update(
+        "PeekKeepSystem",
+        [
+            TripPosition(
+                trip_id="StillLiveTrip",
+                stop_id="S9",
+                previous=100,
+                next=200,
+                status=Status.IN_TRANSIT,
+                timestamp=1,
+            )
+        ],
+    )
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("requests.get should not be called for the cached burst")
+
+    monkeypatch.setattr(requests, "get", boom)
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config", _active_for("PeekKeepSystem")
+    )
+
+    event = asyncio.run(_first_event("PeekKeepSystem"))
+
+    assert event.data.trip_id == "StillLiveTrip"
 
 
 def test_transit_feed_populates_recent_events_cache_after_a_poll(
