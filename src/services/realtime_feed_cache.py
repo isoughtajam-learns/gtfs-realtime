@@ -60,6 +60,17 @@ class RealtimeFeedCache:
         return cast(T, cls._feed[transit_system])
 
     @classmethod
+    def peek(cls, transit_system: str) -> Any:
+        """Whatever's currently cached for `transit_system`, or None if
+        nothing has been fetched yet - never triggers a fetch or checks
+        freshness against min_interval_seconds. Used by transit_feed()'s
+        RecentEventsCache burst to check which cached trips are still in
+        the live feed without forcing a real network fetch just to serve
+        that burst (which exists specifically to avoid making a newly
+        connected client wait on one)."""
+        return cls._feed.get(transit_system)
+
+    @classmethod
     def _is_fresh(cls, transit_system: str, min_interval_seconds: int) -> bool:
         fetched_at = cls._fetched_at.get(transit_system)
         if fetched_at is None or transit_system not in cls._feed:

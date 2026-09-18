@@ -22,6 +22,7 @@ from src.models import (
 )
 from src.services.positioning import get_location
 from src.services.realtime_feed_cache import RealtimeFeedCache
+from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
 from src.services.service_alerts import (
     build_service_alerts,
@@ -146,6 +147,20 @@ def _entity_trip_id(entity: gtfs_realtime_pb2.FeedEntity) -> str:
 
 @app.get("/trip_updates/{transit_system}", response_class=EventSourceResponse)
 async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, None]:
+    # Known benign log noise, confirmed live in prod CloudWatch (2026-09-12):
+    # an "ERROR: Exception in ASGI application" / anyio.BrokenResourceError
+    # from fastapi/routing.py's internal _keepalive_inserter, raised when a
+    # client disconnects (tab closed, switched systems, network drop) at the
+    # exact instant that background task is mid-send into its own internal
+    # memory stream. That's entirely inside FastAPI's own SSE plumbing, not
+    # this function - nothing here catches or causes it, and there's
+    # nothing lost for other connected clients (each SSE connection is
+    # independent). No ALB/health check hits this endpoint (single EC2,
+    # host networking, no target group - see deployment/main.tf) that could
+    # be causing artificial disconnect churn, and deployment/alerts.tf only
+    # watches ECS task counts/EC2 status checks, not log content, so this
+    # can't be what triggers a real alert. Investigated and intentionally
+    # left as-is rather than "fixed."
     config = await asyncio.to_thread(get_transit_system_config, transit_system)
     if not config:
         logger.error(f"GTFS URL not found for {transit_system}")
@@ -160,6 +175,29 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             distinct_id=None,
             properties={"transit_system": transit_system},
         )
+
+    # Give a newly-connected client something real to show immediately,
+    # instead of making them wait out this system's poll/rate-limit cycle
+    # (up to min_poll_interval_seconds - e.g. SF-MTA's 240s) for the first
+    # live event - see RecentEventsCache.
+    # Filtered against whatever's already cached (no new fetch - see
+    # RealtimeFeedCache.peek) so a burst entry that's already dropped out
+    # of the live feed (its trip ended) isn't served as if it were still
+    # live - confirmed live in prod: trip_detail() 404s for a burst-served
+    # trip_id no longer in the current feed, which a client has no way to
+    # distinguish from a real error. `live_trip_ids is None` (nothing
+    # cached yet) means "unknown" - serve the burst unfiltered rather than
+    # dropping everything just because we can't yet verify it.
+    live_feed = RealtimeFeedCache.peek(transit_system)
+    live_trip_ids = (
+        {_entity_trip_id(e) for e in live_feed.entity if e.HasField("trip_update")}
+        if live_feed is not None
+        else None
+    )
+    for cached_position in RecentEventsCache.get(transit_system):
+        if live_trip_ids is not None and cached_position.trip_id not in live_trip_ids:
+            continue
+        yield ServerSentEvent(data=cached_position, event="trip_update", retry=5000)
 
     while True:
         (
@@ -192,6 +230,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             await asyncio.sleep(30)
             continue
 
+        positions_this_poll: list[TripPosition] = []
         for entity in feed.entity:
             if entity.HasField("trip_update"):
                 trip_descriptor = entity.trip_update.trip
@@ -237,21 +276,35 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     )
                 )
                 color, text_color = colors if colors else (None, None)
+                # trip_update.timestamp ("last measured" time for this
+                # vehicle) is the ranking key RecentEventsCache uses to keep
+                # its most-recently-updated 50 - not every source sets it
+                # per-trip, so fall back to the feed's own header timestamp
+                # (always present) rather than leaving it unset.
+                timestamp = (
+                    entity.trip_update.timestamp
+                    if entity.trip_update.HasField("timestamp")
+                    else feed.header.timestamp
+                )
+                trip_position = TripPosition(
+                    trip_id=trip_id,
+                    stop_id=position.stop_id,
+                    previous=position.previous,
+                    next=position.next,
+                    status=position.status,
+                    trip_headsign=headsign,
+                    stop_name=stop_names.get(position.stop_id),
+                    color=color,
+                    text_color=text_color,
+                    timestamp=timestamp,
+                )
+                positions_this_poll.append(trip_position)
                 yield ServerSentEvent(
-                    data=TripPosition(
-                        trip_id=trip_id,
-                        stop_id=position.stop_id,
-                        previous=position.previous,
-                        next=position.next,
-                        status=position.status,
-                        trip_headsign=headsign,
-                        stop_name=stop_names.get(position.stop_id),
-                        color=color,
-                        text_color=text_color,
-                    ),
+                    data=trip_position,
                     event="trip_update",
                     retry=5000,
                 )
+        RecentEventsCache.update(transit_system, positions_this_poll)
         await asyncio.sleep(30)
 
 

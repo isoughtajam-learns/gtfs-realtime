@@ -26,6 +26,11 @@ class TripPosition(SimplePosition):
     trip_headsign: Optional[str] = None
     color: Optional[str] = None
     text_color: Optional[str] = None
+    # GTFS-RT trip_update.timestamp ("last measured" time for this vehicle),
+    # falling back to the feed header's timestamp when a source doesn't set
+    # the per-trip one. Ranking key for RecentEventsCache - see
+    # src/services/recent_events_cache.py - not otherwise used/displayed.
+    timestamp: Optional[int] = None
 
 
 class TripStopDetail(BaseModel):
