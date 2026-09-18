@@ -118,3 +118,25 @@ def test_concurrent_callers_share_one_fetch_when_cache_is_stale() -> None:
 
     assert results == ["feed"] * 5
     assert calls["n"] == 1
+
+
+def test_peek_returns_none_when_nothing_cached_yet() -> None:
+    assert RealtimeFeedCache.peek("never-fetched-system") is None
+
+
+def test_peek_returns_cached_value_without_triggering_a_fetch() -> None:
+    fetch = _FetchStub("feed-1")
+
+    asyncio.run(RealtimeFeedCache.get("peeked-system", fetch, 9999))
+
+    assert RealtimeFeedCache.peek("peeked-system") == "feed-1"
+    assert fetch.calls == 1  # peek() itself made no additional call
+
+
+def test_peek_ignores_min_interval_freshness() -> None:
+    # peek() has no min_interval_seconds param at all - it returns whatever
+    # is cached regardless of age, unlike get().
+    fetch = _FetchStub("feed-1")
+    asyncio.run(RealtimeFeedCache.get("stale-but-peekable-system", fetch, 0))
+
+    assert RealtimeFeedCache.peek("stale-but-peekable-system") == "feed-1"
