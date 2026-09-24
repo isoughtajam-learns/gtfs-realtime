@@ -68,6 +68,7 @@ locals {
   common_secrets = [
     { name = "DATABASE_URL", valueFrom = aws_secretsmanager_secret.database_url.arn },
     { name = "SECRET_KEY", valueFrom = aws_secretsmanager_secret.app_secret_key.arn },
+    { name = "API_KEY_511_ORG", valueFrom = data.aws_secretsmanager_secret.api_key_511org.arn },
   ]
 
   log_config = { for prefix in ["backend", "celery-worker", "celery-beat"] : prefix => {
@@ -89,6 +90,16 @@ data "aws_secretsmanager_secret" "tls_cert" {
 
 data "aws_secretsmanager_secret" "tls_key" {
   name = "${var.app_name}/tls-key"
+}
+
+# 511.org's API key - also provisioned by hand (an externally-issued
+# credential from 511.org's own developer portal, not something Terraform
+# should generate). Rotated after the previous key was found hardcoded
+# directly in migration files and flagged by GitGuardian once this repo
+# went public - see src/settings.py's api_key_511_org for how the app/
+# migrations read it (never a literal value in a committed file again).
+data "aws_secretsmanager_secret" "api_key_511org" {
+  name = "${var.app_name}/511-api-key"
 }
 
 # ------------------------------------------------------------------------------
@@ -313,6 +324,7 @@ resource "aws_iam_role_policy" "ecs_secrets_access" {
           aws_secretsmanager_secret.app_secret_key.arn,
           local.tls_cert_arn,
           local.tls_key_arn,
+          data.aws_secretsmanager_secret.api_key_511org.arn,
         ]
       }
     ]
