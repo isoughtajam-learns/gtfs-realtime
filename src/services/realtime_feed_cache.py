@@ -10,11 +10,18 @@ TransitSystem.min_poll_interval_seconds (see
 src/services/transit_system_detail.py) - a value of 0 (the default for
 every system unless explicitly configured) means never cache, matching
 pre-rate-limiting behavior exactly.
+
+min_poll_interval_seconds alone only throttles one transit_system's own
+feed in isolation - see SharedFeedQuota for the separate problem of
+several *different* transit_system entries drawing on one real quota
+shared between them (e.g. every 511.org-backed system on our one API key).
 """
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, TypeVar, cast
+from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar, cast
+
+from src.services.shared_feed_quota import SharedFeedQuota
 
 T = TypeVar("T")
 
@@ -33,6 +40,7 @@ class RealtimeFeedCache:
         transit_system: str,
         fetch: Callable[[], Awaitable[T]],
         min_interval_seconds: int,
+        quota_group: Optional[str] = None,
     ) -> T:
         """Returns the cached feed for `transit_system` if it's within
         `min_interval_seconds` old, otherwise awaits `fetch()` for a fresh
@@ -48,6 +56,16 @@ class RealtimeFeedCache:
         outbound request rate under concurrent load (e.g. several SSE
         clients whose 30s poll cycles happen to line up).
 
+        `quota_group` (see SharedFeedQuota), when set, means this
+        transit_system's real fetches also draw from a budget shared with
+        every other transit_system in the same group - once that group's
+        rolling-hour budget is spent, a fetch that's otherwise due (per
+        min_interval_seconds) is skipped and the existing cached feed is
+        served instead, however stale. The one exception: nothing cached
+        for this transit_system yet at all (e.g. its very first request) -
+        there's no stale fallback to serve, so the fetch proceeds
+        regardless of group budget rather than returning nothing.
+
         A `fetch()` exception propagates as-is and never gets cached, so a
         single failed poll can't poison subsequent callers or block a
         retry on the next one."""
@@ -55,8 +73,14 @@ class RealtimeFeedCache:
             lock = cls._locks.setdefault(transit_system, asyncio.Lock())
             async with lock:
                 if not cls._is_fresh(transit_system, min_interval_seconds):
-                    cls._feed[transit_system] = await fetch()
-                    cls._fetched_at[transit_system] = datetime.utcnow()
+                    has_cached = transit_system in cls._feed
+                    if (
+                        quota_group is None
+                        or SharedFeedQuota.try_consume(quota_group)
+                        or not has_cached
+                    ):
+                        cls._feed[transit_system] = await fetch()
+                        cls._fetched_at[transit_system] = datetime.utcnow()
         return cast(T, cls._feed[transit_system])
 
     @classmethod

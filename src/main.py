@@ -21,6 +21,10 @@ from src.models import (
     TripStopDetail,
 )
 from src.services.positioning import get_location
+from src.services.quota_group_scheduler import (
+    QuotaGroupScheduler,
+    next_realtime_update_at,
+)
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
@@ -29,8 +33,11 @@ from src.services.service_alerts import (
     extract_referenced_ids,
     get_alert_hydration_data,
 )
+from src.services.shared_feed_quota import QUOTA_GROUP_LIMITS
 from src.services.transit_system_detail import (
+    get_active_quota_groups,
     get_active_transit_systems,
+    get_quota_group_members,
     get_transit_system_config,
 )
 from src.services.trip_detail import get_scheduled_tail_stops, get_trip_schedule_context
@@ -41,14 +48,53 @@ configure_posthog_logging()
 logger = logging.getLogger(__name__)
 
 
+async def _start_quota_group_schedulers(app: FastAPI) -> list[asyncio.Task[None]]:
+    """One background QuotaGroupScheduler task per active quota_group
+    (currently just "511.org") - see that module for why proactive,
+    evenly-paced fetching replaces relying on inbound requests alone to
+    keep a shared-quota system's feed warm. Scheduler instances are kept
+    on app.state so get_transit_system_detail() can read
+    next_realtime_update_at off them; task handles are returned so
+    lifespan() can cancel them cleanly on shutdown."""
+    app.state.quota_group_schedulers = []
+    tasks: list[asyncio.Task[None]] = []
+    groups = await asyncio.to_thread(get_active_quota_groups)
+    for group in groups:
+        # Unconfigured groups (not in QUOTA_GROUP_LIMITS) have no real
+        # budget to schedule against - SharedFeedQuota.try_consume already
+        # treats them as unbounded, so there's nothing for a scheduler to
+        # usefully pace here.
+        budget = QUOTA_GROUP_LIMITS.get(group)
+        if budget is None:
+            logger.warning(
+                f"quota_group {group!r} has no configured budget in "
+                "QUOTA_GROUP_LIMITS - not starting a scheduler for it."
+            )
+            continue
+        members = await asyncio.to_thread(get_quota_group_members, group)
+        if not members:
+            continue
+        scheduler = QuotaGroupScheduler(group, members, _fetch_feed, budget)
+        app.state.quota_group_schedulers.append(scheduler)
+        tasks.append(asyncio.create_task(scheduler.run()))
+    return tasks
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Initialize and gracefully stop the shared PostHog client."""
+    """Initialize and gracefully stop the shared PostHog client, and start
+    (then cancel, on shutdown) one QuotaGroupScheduler task per active
+    quota_group - see _start_quota_group_schedulers above. The latter runs
+    regardless of PostHog settings, unlike the early-return path below for
+    a disabled PostHog client."""
     settings = get_settings()
     posthog_client: Posthog | None = None
 
     if not settings.posthog_enabled:
+        scheduler_tasks = await _start_quota_group_schedulers(app)
         yield
+        for task in scheduler_tasks:
+            task.cancel()
         return
 
     if not settings.posthog_project_token:
@@ -74,7 +120,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.posthog_client = posthog_client
         atexit.register(posthog_client.shutdown)
 
+    scheduler_tasks = await _start_quota_group_schedulers(app)
+
     yield
+
+    for task in scheduler_tasks:
+        task.cancel()
 
     if posthog_client:
         posthog_client.flush()
@@ -167,6 +218,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     gtfs_url = config["realtime_url"]
     min_poll_interval_seconds = config["min_poll_interval_seconds"]
+    quota_group = config["quota_group"]
 
     posthog_client = getattr(app.state, "posthog_client", None)
     if posthog_client:
@@ -215,11 +267,14 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             # shares one real fetch across all of them, respecting
             # min_poll_interval_seconds (0 - the default - means never
             # cache, so this is a no-op for every system that doesn't need
-            # rate limiting).
+            # rate limiting) and quota_group, when set, for a budget shared
+            # across several different systems (e.g. every 511.org-backed
+            # one) - see SharedFeedQuota.
             feed = await RealtimeFeedCache.get(
                 transit_system,
                 lambda: _fetch_feed(gtfs_url),
                 min_poll_interval_seconds,
+                quota_group,
             )
         except requests.exceptions.RequestException as ex:
             logger.error(f"Request error fetching feed for {transit_system}: {ex}")
@@ -342,6 +397,7 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
             transit_system,
             lambda: _fetch_feed(gtfs_url),
             config["min_poll_interval_seconds"],
+            config["quota_group"],
         )
     except requests.exceptions.RequestException as ex:
         logger.error(f"Request error fetching feed for {transit_system}: {ex}")
@@ -509,12 +565,14 @@ async def service_alerts(transit_system: str) -> list[ServiceAlert]:
         # Shares RealtimeFeedCache with transit_feed()/trip_detail() under a
         # distinct key - see RealtimeFeedCache.get's key param - so a
         # system's alerts_url and realtime_url are rate-limited together
-        # against min_poll_interval_seconds (one shared quota, e.g. 511.org)
-        # without one feed's cache entry clobbering the other's.
+        # against min_poll_interval_seconds, and (via quota_group) against
+        # any budget shared with other systems too - e.g. 511.org - without
+        # one feed's cache entry clobbering the other's.
         feed = await RealtimeFeedCache.get(
             f"{transit_system}:alerts",
             lambda: _fetch_feed(alerts_url),
             config["min_poll_interval_seconds"],
+            config["quota_group"],
         )
     except requests.exceptions.RequestException as ex:
         logger.error(f"Request error fetching alerts for {transit_system}: {ex}")
@@ -564,11 +622,13 @@ async def get_transit_system_detail(transit_system: str) -> TransitSystemDetail:
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
         )
 
+    schedulers = getattr(app.state, "quota_group_schedulers", [])
     return TransitSystemDetail(
         name=transit_system,
         timezone=config["timezone"],
         default_schedule_url=config["default_schedule_url"],
         auth_required=config["auth_required"],
+        next_realtime_update_at=next_realtime_update_at(schedulers, transit_system),
     )
 
 
