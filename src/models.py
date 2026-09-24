@@ -145,6 +145,14 @@ class TransitSystemDetail(BaseModel):
     # auth, so there's nothing to look up yet; see
     # TransitSystem.auth_required.
     auth_required: bool = False
+    # Unix timestamp of this system's next scheduled TripUpdates refresh -
+    # see src/services/quota_group_scheduler.py. None for a system not in
+    # any scheduled quota_group (fetched purely on demand instead, with no
+    # predictable cadence to expose). Unlike every other field here, this
+    # one changes constantly (recomputed on nearly every real fetch) - a
+    # deliberate exception to this endpoint's usual "changes rarely"
+    # contract, since it's meant to back a countdown-to-next-update UI.
+    next_realtime_update_at: Optional[int] = None
 
 
 class ORMBase(DeclarativeBase):

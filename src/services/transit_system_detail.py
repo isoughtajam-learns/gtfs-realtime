@@ -10,7 +10,7 @@ not cached like ScheduleCache, since none of these are on the SSE hot path.
 
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import distinct, select
 
 from src.database import engine
 from src.models import TransitSystem
@@ -69,6 +69,48 @@ def get_active_transit_systems() -> list[dict[str, Any]]:
             "realtime_url": row.realtime_url,
             "schedule_url": row.schedule_url,
             "auth_required": row.auth_required,
+        }
+        for row in rows
+    ]
+
+
+def get_active_quota_groups() -> list[str]:
+    """Every distinct TransitSystem.quota_group value currently in use by
+    an active system - what src/services/quota_group_scheduler.py's
+    lifespan() startup hook iterates to know which shared-budget
+    schedulers to actually start. Queried once at startup (see that
+    module) rather than kept live-updated - onboarding a new quota_group
+    member already means a migration + deploy, which restarts the process
+    anyway."""
+    with engine.begin() as connection:
+        rows = connection.execute(
+            select(distinct(TransitSystem.quota_group)).where(
+                TransitSystem.active.is_(True), TransitSystem.quota_group.is_not(None)
+            )
+        ).all()
+    return [row[0] for row in rows]
+
+
+def get_quota_group_members(quota_group: str) -> list[dict[str, Any]]:
+    """Every active system sharing `quota_group`, ordered by name for a
+    deterministic round-robin - see
+    src/services/quota_group_scheduler.py's QuotaGroupScheduler."""
+    with engine.begin() as connection:
+        rows = connection.execute(
+            select(
+                TransitSystem.name, TransitSystem.realtime_url, TransitSystem.alerts_url
+            )
+            .where(
+                TransitSystem.active.is_(True),
+                TransitSystem.quota_group == quota_group,
+            )
+            .order_by(TransitSystem.name)
+        ).all()
+    return [
+        {
+            "name": row.name,
+            "realtime_url": row.realtime_url,
+            "alerts_url": row.alerts_url,
         }
         for row in rows
     ]

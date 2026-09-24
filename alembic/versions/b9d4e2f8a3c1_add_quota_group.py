@@ -19,17 +19,23 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 # SF-MTA's min_poll_interval_seconds (240s) was tuned purely against its
-# own solo 60/hour 511.org quota - now that SharedFeedQuota coordinates
-# real fetch spend across every 511.org-backed system together (see
-# src/services/shared_feed_quota.py), that per-system floor can drop back
-# down to match the SSE loop's own natural cadence (30s): the group budget,
-# not this value, is what actually protects the underlying 60/hour API-key
-# limit now. Pre-migration value kept here so downgrade() can restore it -
-# rolling this migration back removes the only real protection
-# SharedFeedQuota was providing, so leaving min_poll_interval_seconds at 30
-# post-downgrade would let SF-MTA alone burn through the real quota fast.
+# own solo 60/hour 511.org quota. Now that a QuotaGroupScheduler (see
+# src/services/quota_group_scheduler.py) proactively, evenly re-fetches
+# every 511.org-backed system on its own predictable cadence - roughly
+# every ~11 minutes per system for today's group size, well under this
+# value - min_poll_interval_seconds stops being "the promised refresh
+# rate" and becomes purely a demand-driven recovery threshold: an inbound
+# HTTP request only attempts its own real fetch if the scheduler has
+# somehow fallen behind on this system for longer than this. Set high
+# (900s) so it essentially never fires under normal scheduler operation
+# and doesn't compete with the scheduler's own carefully-paced spend
+# against the same shared budget. Pre-migration value kept here so
+# downgrade() can restore it - rolling this migration back (and, with it,
+# the scheduler that depends on quota_group) removes the only real
+# protection left, so leaving min_poll_interval_seconds at 900
+# post-downgrade would badly starve SF-MTA of any real refresh at all.
 _SF_MTA_PRE_MIGRATION_MIN_POLL_INTERVAL_SECONDS = 240
-_SF_MTA_POST_MIGRATION_MIN_POLL_INTERVAL_SECONDS = 30
+_SF_MTA_POST_MIGRATION_MIN_POLL_INTERVAL_SECONDS = 900
 
 
 def upgrade() -> None:
