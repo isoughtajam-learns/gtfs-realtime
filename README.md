@@ -1,26 +1,19 @@
-# Tutorial of gRPC
-Supporting tech stack:
-- [x] gRPC
-- [x] FastAPI
-- [x] uv
-- [x] precommit w/ ruff & mypy
+# GTFS Realtime
 
-[Based on tutorial found here](https://gtfs.org/documentation/realtime/language-bindings/python/)
+FastAPI backend for [IRL Transit](https://irltransit.com) - ingests GTFS-Realtime and GTFS Schedule feeds for multiple transit systems and serves live positions (over SSE), trip detail, and service alerts. Pairs with the [gtfs-dashboard](https://github.com/isoughtajam-learns/gtfs-dashboard) frontend.
 
-# Install dependencies
+## Setup
+
 ```
 uv sync
 ```
 
-# Generate server code from protobuff
+Regenerate the GTFS-Realtime protobuf bindings in `generated/` after changing `protos/gtfs-realtime.proto` (spec reference [here](https://gtfs.org/documentation/realtime/language-bindings/python/)):
 ```
-python -m grpc_tools.protoc -I./protos --python_out=generated/ --pyi_out=generated/ service.proto
 python -m grpc_tools.protoc -I./protos --python_out=generated/ --pyi_out=generated/ gtfs-realtime.proto
 ```
-# Run the server
-```
-uv run uvicorn src.main:app
-```
+
+`uv run uvicorn src.main:app --reload` runs the app directly once a database is reachable via `.env.dev` - see "Local Startup and Development (Docker Compose)" below for the full local dev workflow (Postgres/Redis included).
 
 ## Usage
 Insert a `TransitSystem` row (`active=true`, a real `realtime_url`) to add a new GTFS-Realtime trip update source - see "GTFS Schedule ingestion" below for the full registry model.
@@ -190,7 +183,7 @@ We use Celery to periodically fetch fresh GTFS Schedule metadata to keep the dat
 - **Daily fetch cap (restart-proof)**: `Fetcher.fetch_metadata_update` won't re-fetch a system more than once per UTC day, gated by `TransitSystem.last_fetched_at` in Postgres - not a local file, which would get wiped on every celery-worker restart/redeploy and defeat the cap. Pass `force=True` to bypass it.
 - **Registering a new task**: Celery's auto-generated task name is module-qualified based on how the app is invoked (`celery -A src.tasks worker` → `src.tasks.<funcname>`, not just `tasks.<funcname>`). Verify the actual name in the worker's startup `[tasks]` log banner before wiring it into `beat_schedule` - a mismatched name fails silently (the task is just never dispatched, no error).
 
-# AWS Deployment
+## AWS Deployment
 
 ### Release & deploy workflow
 
