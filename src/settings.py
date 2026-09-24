@@ -55,6 +55,18 @@ class Settings(BaseSettings):
         alias="POSTHOG_PROJECT_TOKEN",
     )
     posthog_host: str | None = Field(default=None, alias="POSTHOG_HOST")
+    # 511.org Open Data API key, shared across every Bay Area system in the
+    # "511.org" quota_group (see src/services/shared_feed_quota.py). NOT in
+    # any committed .env.* file, same reasoning as POSTHOG_PROJECT_TOKEN
+    # above - an earlier version of this key was hardcoded directly in
+    # migration files and flagged by GitGuardian once this repo went public,
+    # so it's since been rotated. Set as a real environment variable in every
+    # environment: locally via your own shell (or an uncommitted .env), in
+    # prod via Secrets Manager (see deployment/main.tf's api_key_511org data
+    # source). A migration or script that needs a 511.org URL should read
+    # this via get_settings().api_key_511_org, never write the literal value
+    # into a file.
+    api_key_511_org: str | None = Field(default=None, alias="API_KEY_511_ORG")
 
 
 @lru_cache
