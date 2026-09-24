@@ -210,6 +210,17 @@ class TransitSystem(ORMBase):
     # quota (511.org) has that quota shared across both feeds, not budgeted
     # separately.
     alerts_url: Mapped[Optional[str]]
+    # Name of a shared outbound-request budget this system's realtime_url/
+    # alerts_url fetches draw from, alongside every other TransitSystem row
+    # with the same value here - see src/services/shared_feed_quota.py.
+    # Distinct from min_poll_interval_seconds: that throttles this one
+    # system's own feed in isolation, but has no way to know about a quota
+    # actually shared across several *different* systems (confirmed live:
+    # every 511.org-backed system draws on the same 60-requests/hour
+    # API-key budget, not one each). None (the default) means this
+    # system's fetches aren't coordinated with anyone else's - true for
+    # every system with its own dedicated source/key.
+    quota_group: Mapped[Optional[str]]
     __table_args__ = (UniqueConstraint("name", name="uq_name"),)
 
 

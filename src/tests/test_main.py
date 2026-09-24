@@ -69,6 +69,7 @@ def _mock_transit_system_config(**overrides: Any) -> dict[str, Any]:
         "auth_required": False,
         "min_poll_interval_seconds": 0,
         "alerts_url": None,
+        "quota_group": None,
     }
     config.update(overrides)
     return config

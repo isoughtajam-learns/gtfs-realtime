@@ -6,6 +6,12 @@ import pytest
 
 from src.services import realtime_feed_cache as cache_module
 from src.services.realtime_feed_cache import RealtimeFeedCache
+from src.services.shared_feed_quota import QUOTA_GROUP_LIMITS, SharedFeedQuota
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _clear_shared_feed_quota() -> None:
+    SharedFeedQuota._timestamps.clear()
 
 
 class _FetchStub:
@@ -140,3 +146,88 @@ def test_peek_ignores_min_interval_freshness() -> None:
     asyncio.run(RealtimeFeedCache.get("stale-but-peekable-system", fetch, 0))
 
     assert RealtimeFeedCache.peek("stale-but-peekable-system") == "feed-1"
+
+
+def test_quota_group_none_never_touches_shared_quota() -> None:
+    # Default/unconfigured behavior (every system before quota_group
+    # existed) - fetches happen unconditionally, exactly as before.
+    fetch = _FetchStub("feed-1", "feed-2")
+
+    result1 = asyncio.run(
+        RealtimeFeedCache.get("no-group-system", fetch, 0, quota_group=None)
+    )
+    result2 = asyncio.run(
+        RealtimeFeedCache.get("no-group-system", fetch, 0, quota_group=None)
+    )
+
+    assert result1 == "feed-1"
+    assert result2 == "feed-2"
+    assert fetch.calls == 2
+
+
+def test_quota_group_fetches_while_budget_remains() -> None:
+    fetch = _FetchStub("feed-1")
+
+    result = asyncio.run(
+        RealtimeFeedCache.get("quota-system-a", fetch, 0, quota_group="test-group-a")
+    )
+
+    assert result == "feed-1"
+    assert fetch.calls == 1
+
+
+def test_quota_group_serves_stale_cache_once_budget_is_exhausted() -> None:
+    # First call populates the cache and spends the group's only token.
+    # Once the group is out of budget, a due-for-refresh call must serve
+    # the existing cached feed rather than making another real request -
+    # that's the whole point (a budget shared with other transit_systems,
+    # e.g. every 511.org-backed one on our one API key).
+    QUOTA_GROUP_LIMITS["test-group-b"] = 1
+    try:
+        fetch = _FetchStub("feed-1", "feed-2")
+
+        result1 = asyncio.run(
+            RealtimeFeedCache.get(
+                "quota-system-b", fetch, 0, quota_group="test-group-b"
+            )
+        )
+        result2 = asyncio.run(
+            RealtimeFeedCache.get(
+                "quota-system-b", fetch, 0, quota_group="test-group-b"
+            )
+        )
+
+        assert result1 == "feed-1"
+        assert result2 == "feed-1"  # stale cache served, not feed-2
+        assert fetch.calls == 1
+    finally:
+        del QUOTA_GROUP_LIMITS["test-group-b"]
+
+
+def test_quota_group_still_fetches_when_nothing_cached_yet_despite_exhausted_budget() -> (
+    None
+):
+    # A transit_system's very first request has no stale fallback to serve
+    # - proceeding anyway (accepting a rare/minor over-budget spend) beats
+    # returning nothing for a system that's never had any data at all.
+    QUOTA_GROUP_LIMITS["test-group-c"] = 1
+    try:
+        # Exhaust the group's budget via an unrelated transit_system first.
+        other_fetch = _FetchStub("other-feed")
+        asyncio.run(
+            RealtimeFeedCache.get(
+                "quota-system-c-other", other_fetch, 0, quota_group="test-group-c"
+            )
+        )
+
+        fetch = _FetchStub("feed-1")
+        result = asyncio.run(
+            RealtimeFeedCache.get(
+                "quota-system-c-new", fetch, 0, quota_group="test-group-c"
+            )
+        )
+
+        assert result == "feed-1"
+        assert fetch.calls == 1
+    finally:
+        del QUOTA_GROUP_LIMITS["test-group-c"]

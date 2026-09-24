@@ -167,6 +167,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     gtfs_url = config["realtime_url"]
     min_poll_interval_seconds = config["min_poll_interval_seconds"]
+    quota_group = config["quota_group"]
 
     posthog_client = getattr(app.state, "posthog_client", None)
     if posthog_client:
@@ -215,11 +216,14 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             # shares one real fetch across all of them, respecting
             # min_poll_interval_seconds (0 - the default - means never
             # cache, so this is a no-op for every system that doesn't need
-            # rate limiting).
+            # rate limiting) and quota_group, when set, for a budget shared
+            # across several different systems (e.g. every 511.org-backed
+            # one) - see SharedFeedQuota.
             feed = await RealtimeFeedCache.get(
                 transit_system,
                 lambda: _fetch_feed(gtfs_url),
                 min_poll_interval_seconds,
+                quota_group,
             )
         except requests.exceptions.RequestException as ex:
             logger.error(f"Request error fetching feed for {transit_system}: {ex}")
@@ -342,6 +346,7 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
             transit_system,
             lambda: _fetch_feed(gtfs_url),
             config["min_poll_interval_seconds"],
+            config["quota_group"],
         )
     except requests.exceptions.RequestException as ex:
         logger.error(f"Request error fetching feed for {transit_system}: {ex}")
@@ -509,12 +514,14 @@ async def service_alerts(transit_system: str) -> list[ServiceAlert]:
         # Shares RealtimeFeedCache with transit_feed()/trip_detail() under a
         # distinct key - see RealtimeFeedCache.get's key param - so a
         # system's alerts_url and realtime_url are rate-limited together
-        # against min_poll_interval_seconds (one shared quota, e.g. 511.org)
-        # without one feed's cache entry clobbering the other's.
+        # against min_poll_interval_seconds, and (via quota_group) against
+        # any budget shared with other systems too - e.g. 511.org - without
+        # one feed's cache entry clobbering the other's.
         feed = await RealtimeFeedCache.get(
             f"{transit_system}:alerts",
             lambda: _fetch_feed(alerts_url),
             config["min_poll_interval_seconds"],
+            config["quota_group"],
         )
     except requests.exceptions.RequestException as ex:
         logger.error(f"Request error fetching alerts for {transit_system}: {ex}")
