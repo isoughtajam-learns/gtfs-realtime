@@ -205,6 +205,24 @@ def _feed_with_one_active_trip_update() -> bytes:
     return bytes(feed.SerializeToString())
 
 
+def _feed_with_one_active_trip_update_blank_route_id() -> bytes:
+    """Mirrors the real BART scenario (confirmed live elsewhere in this
+    codebase): the live feed's TripDescriptor.route_id is left unset -
+    route_short_name resolution has to fall back through the trip's own
+    stored route_id rather than the live entity's (blank) one."""
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    entity = feed.entity.add()
+    entity.id = "e1"
+    entity.trip_update.trip.trip_id = "T1"
+    now = int(datetime.now().timestamp())
+    stop = entity.trip_update.stop_time_update.add()
+    stop.stop_id = "S1"
+    stop.arrival.time = now - 30
+    stop.departure.time = now + 30
+    return bytes(feed.SerializeToString())
+
+
 def test_transit_feed_survives_a_request_error_and_keeps_streaming(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,7 +242,7 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
     monkeypatch.setattr(requests, "get", flaky_get)
     monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
     )
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
@@ -232,6 +250,54 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
 
     assert call_count["n"] == 2
     assert event.data.trip_id == "T1"
+
+
+def test_transit_feed_resolves_route_short_name_from_route_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Confirmed live: SF-MTA's own service alerts refer to routes by
+    # short_name ("48 RRT STOP CLOSED"), not trip_headsign - without this,
+    # a live event had no visible connection to the alerts about it.
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
+    )
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {"R1": "2"})),
+    )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("SF-MTA"))
+
+    event = asyncio.run(_first_event("SF-MTA"))
+
+    assert event.data.route_short_name == "2"
+
+
+def test_transit_feed_route_short_name_falls_back_to_trip_level_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same trip-then-route fallback as colors_by_trip - covers a source
+    # that leaves the live entity's route_id blank (confirmed live: BART),
+    # by resolving through the trip's own stored route_id instead.
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(
+            _feed_with_one_active_trip_update_blank_route_id()
+        ),
+    )
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {"T1": "2"}, {})),
+    )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("SF-MTA"))
+
+    event = asyncio.run(_first_event("SF-MTA"))
+
+    assert event.data.route_short_name == "2"
 
 
 def test_transit_feed_yields_cached_recent_events_before_polling(
@@ -311,7 +377,7 @@ def test_transit_feed_filters_burst_entries_not_in_cached_live_feed(
         lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
     )
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config", _active_for("PeekFilterSystem")
@@ -373,7 +439,7 @@ def test_transit_feed_populates_recent_events_cache_after_a_poll(
         lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
     )
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
     )
     monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
@@ -446,7 +512,7 @@ def test_transit_feed_falls_back_to_entity_id_for_blank_trip_id(
         lambda *a, **k: _mock_response(_feed_with_two_blank_trip_id_entities()),
     )
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}))
+        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config",
