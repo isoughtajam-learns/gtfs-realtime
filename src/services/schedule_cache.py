@@ -26,6 +26,8 @@ class ScheduleCache:
     _colors_by_trip: Dict[str, Dict[str, Tuple[str, str]]] = {}
     _colors_by_route: Dict[str, Dict[str, Tuple[str, str]]] = {}
     _colors_by_stop: Dict[str, Dict[str, Tuple[str, str]]] = {}
+    _short_names_by_trip: Dict[str, Dict[str, str]] = {}
+    _short_names_by_route: Dict[str, Dict[str, str]] = {}
     _loaded_at: Dict[str, datetime] = {}
     _locks: Dict[str, asyncio.Lock] = {}
 
@@ -39,6 +41,8 @@ class ScheduleCache:
         Dict[str, Tuple[str, str]],
         Dict[str, Tuple[str, str]],
         Dict[str, Tuple[str, str]],
+        Dict[str, str],
+        Dict[str, str],
     ]:
         if not cls._is_fresh(transit_system):
             lock = cls._locks.setdefault(transit_system, asyncio.Lock())
@@ -52,6 +56,8 @@ class ScheduleCache:
             cls._colors_by_trip.get(transit_system, {}),
             cls._colors_by_route.get(transit_system, {}),
             cls._colors_by_stop.get(transit_system, {}),
+            cls._short_names_by_trip.get(transit_system, {}),
+            cls._short_names_by_route.get(transit_system, {}),
         )
 
     @classmethod
@@ -72,6 +78,8 @@ class ScheduleCache:
                 cls._colors_by_trip[transit_system] = {}
                 cls._colors_by_route[transit_system] = {}
                 cls._colors_by_stop[transit_system] = {}
+                cls._short_names_by_trip[transit_system] = {}
+                cls._short_names_by_route[transit_system] = {}
                 cls._loaded_at[transit_system] = datetime.utcnow()
                 return
             trip_rows = conn.execute(
@@ -85,18 +93,28 @@ class ScheduleCache:
                 )
             ).all()
             route_rows = conn.execute(
-                select(Route.route_id, Route.color, Route.text_color).where(
-                    Route.transit_system_id == ts_id
-                )
+                select(
+                    Route.route_id, Route.color, Route.text_color, Route.short_name
+                ).where(Route.transit_system_id == ts_id)
             ).all()
 
         colors_by_route: Dict[str, Tuple[str, str]] = {
             row.route_id: (row.color, row.text_color) for row in route_rows
         }
+        # route_short_name is real-world signage/colloquial naming (e.g. SF
+        # Muni's "2", "48", "14R") - confirmed live: SF-MTA's own service
+        # alerts refer to routes this way ("48 RRT STOP CLOSED"), but the
+        # live trip_update event previously carried nothing but
+        # trip_headsign, leaving no visible link between an alert and the
+        # trips it's about. Keyed same as colors_by_route below.
+        short_names_by_route: Dict[str, str] = {
+            row.route_id: row.short_name for row in route_rows if row.short_name
+        }
 
         trips: Dict[str, Optional[str]] = {}
         headsigns_by_route_dir: Dict[Tuple[str, Optional[int]], str] = {}
         colors_by_trip: Dict[str, Tuple[str, str]] = {}
+        short_names_by_trip: Dict[str, str] = {}
         route_id_by_trip: Dict[str, str] = {}
         for row in trip_rows:
             trips[row.trip_id] = row.name
@@ -110,6 +128,9 @@ class ScheduleCache:
                 route_colors = colors_by_route.get(row.route_id)
                 if route_colors:
                     colors_by_trip[row.trip_id] = route_colors
+                route_short_name = short_names_by_route.get(row.route_id)
+                if route_short_name:
+                    short_names_by_trip[row.trip_id] = route_short_name
 
         colors_by_stop: Dict[str, Tuple[str, str]] = {}
         for stop_row in stop_rows:
@@ -125,5 +146,7 @@ class ScheduleCache:
         cls._colors_by_trip[transit_system] = colors_by_trip
         cls._colors_by_route[transit_system] = colors_by_route
         cls._colors_by_stop[transit_system] = colors_by_stop
+        cls._short_names_by_trip[transit_system] = short_names_by_trip
+        cls._short_names_by_route[transit_system] = short_names_by_route
         cls._stops[transit_system] = {row.stop_id: row.name for row in stop_rows}
         cls._loaded_at[transit_system] = datetime.utcnow()

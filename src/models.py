@@ -24,6 +24,13 @@ class SimplePosition(BaseModel):
 class TripPosition(SimplePosition):
     trip_id: str
     trip_headsign: Optional[str] = None
+    # Real-world signage/colloquial route naming (e.g. SF Muni's "2", "48",
+    # "14R") - distinct from trip_headsign, which is a destination
+    # description, not a line identifier. Confirmed live: SF-MTA's own
+    # service alerts refer to routes this way ("48 RRT STOP CLOSED"), so
+    # without this a live event and the alert it relates to shared no
+    # visible connection. See src/services/schedule_cache.py.
+    route_short_name: Optional[str] = None
     color: Optional[str] = None
     text_color: Optional[str] = None
     # GTFS-RT trip_update.timestamp ("last measured" time for this vehicle),
