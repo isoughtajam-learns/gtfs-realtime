@@ -2,7 +2,7 @@
 In-memory cache for GTFS Schedule lookups (trip_headsign, stop_name) keyed by transit system.
 
 The realtime feed only supplies trip_id and stop_id. Hydrating each SSE event with a DB
-query would add a round-trip per entity — instead we preload the two dicts once per
+query would add a round-trip per entity — instead we preload these lookups once per
 transit system and refresh on a TTL, since Schedule data updates at most daily.
 """
 
