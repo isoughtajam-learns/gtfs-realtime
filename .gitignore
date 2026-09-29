@@ -12,6 +12,10 @@ wheels/
 # Local env override (use committed .env._dev / .env.dev_docker / .env.prod)
 .env
 
+# Local MCP server config - holds real API keys (e.g. Linear), never commit
+.mcp.json
+.mcp.json.swp
+
 # IDE
 .idea/*
 src/tmp/
