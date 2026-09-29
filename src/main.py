@@ -261,6 +261,8 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             colors_by_stop,
             short_names_by_trip,
             short_names_by_route,
+            long_names_by_trip,
+            long_names_by_route,
         ) = await ScheduleCache.get(transit_system)
         try:
             # Every connected client runs this same 30s loop independently -
@@ -340,6 +342,9 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                 route_short_name = short_names_by_trip.get(
                     trip_descriptor.trip_id
                 ) or short_names_by_route.get(route_id)
+                route_long_name = long_names_by_trip.get(
+                    trip_descriptor.trip_id
+                ) or long_names_by_route.get(route_id)
                 # trip_update.timestamp ("last measured" time for this
                 # vehicle) is the ranking key RecentEventsCache uses to keep
                 # its most-recently-updated 50 - not every source sets it
@@ -358,6 +363,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     status=position.status,
                     trip_headsign=headsign,
                     route_short_name=route_short_name,
+                    route_long_name=route_long_name,
                     stop_name=stop_names.get(position.stop_id),
                     color=color,
                     text_color=text_color,

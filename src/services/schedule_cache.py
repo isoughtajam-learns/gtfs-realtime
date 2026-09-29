@@ -28,6 +28,8 @@ class ScheduleCache:
     _colors_by_stop: Dict[str, Dict[str, Tuple[str, str]]] = {}
     _short_names_by_trip: Dict[str, Dict[str, str]] = {}
     _short_names_by_route: Dict[str, Dict[str, str]] = {}
+    _long_names_by_trip: Dict[str, Dict[str, str]] = {}
+    _long_names_by_route: Dict[str, Dict[str, str]] = {}
     _loaded_at: Dict[str, datetime] = {}
     _locks: Dict[str, asyncio.Lock] = {}
 
@@ -41,6 +43,8 @@ class ScheduleCache:
         Dict[str, Tuple[str, str]],
         Dict[str, Tuple[str, str]],
         Dict[str, Tuple[str, str]],
+        Dict[str, str],
+        Dict[str, str],
         Dict[str, str],
         Dict[str, str],
     ]:
@@ -58,6 +62,8 @@ class ScheduleCache:
             cls._colors_by_stop.get(transit_system, {}),
             cls._short_names_by_trip.get(transit_system, {}),
             cls._short_names_by_route.get(transit_system, {}),
+            cls._long_names_by_trip.get(transit_system, {}),
+            cls._long_names_by_route.get(transit_system, {}),
         )
 
     @classmethod
@@ -80,6 +86,8 @@ class ScheduleCache:
                 cls._colors_by_stop[transit_system] = {}
                 cls._short_names_by_trip[transit_system] = {}
                 cls._short_names_by_route[transit_system] = {}
+                cls._long_names_by_trip[transit_system] = {}
+                cls._long_names_by_route[transit_system] = {}
                 cls._loaded_at[transit_system] = datetime.utcnow()
                 return
             trip_rows = conn.execute(
@@ -94,27 +102,36 @@ class ScheduleCache:
             ).all()
             route_rows = conn.execute(
                 select(
-                    Route.route_id, Route.color, Route.text_color, Route.short_name
+                    Route.route_id,
+                    Route.color,
+                    Route.text_color,
+                    Route.short_name,
+                    Route.long_name,
                 ).where(Route.transit_system_id == ts_id)
             ).all()
 
         colors_by_route: Dict[str, Tuple[str, str]] = {
             row.route_id: (row.color, row.text_color) for row in route_rows
         }
-        # route_short_name is real-world signage/colloquial naming (e.g. SF
-        # Muni's "2", "48", "14R") - confirmed live: SF-MTA's own service
-        # alerts refer to routes this way ("48 RRT STOP CLOSED"), but the
-        # live trip_update event previously carried nothing but
-        # trip_headsign, leaving no visible link between an alert and the
-        # trips it's about. Keyed same as colors_by_route below.
+        # route_short_name/route_long_name are real-world signage/colloquial
+        # route naming (e.g. SF Muni's "L" short_name + "TARAVAL" long_name,
+        # together read as "L Taraval") - confirmed live: SF-MTA's own
+        # service alerts refer to routes by short_name ("48 RRT STOP
+        # CLOSED"), but the live trip_update event previously carried
+        # nothing but trip_headsign, leaving no visible link between an
+        # alert and the trips it's about. Keyed same as colors_by_route.
         short_names_by_route: Dict[str, str] = {
             row.route_id: row.short_name for row in route_rows if row.short_name
+        }
+        long_names_by_route: Dict[str, str] = {
+            row.route_id: row.long_name for row in route_rows if row.long_name
         }
 
         trips: Dict[str, Optional[str]] = {}
         headsigns_by_route_dir: Dict[Tuple[str, Optional[int]], str] = {}
         colors_by_trip: Dict[str, Tuple[str, str]] = {}
         short_names_by_trip: Dict[str, str] = {}
+        long_names_by_trip: Dict[str, str] = {}
         route_id_by_trip: Dict[str, str] = {}
         for row in trip_rows:
             trips[row.trip_id] = row.name
@@ -131,6 +148,9 @@ class ScheduleCache:
                 route_short_name = short_names_by_route.get(row.route_id)
                 if route_short_name:
                     short_names_by_trip[row.trip_id] = route_short_name
+                route_long_name = long_names_by_route.get(row.route_id)
+                if route_long_name:
+                    long_names_by_trip[row.trip_id] = route_long_name
 
         colors_by_stop: Dict[str, Tuple[str, str]] = {}
         for stop_row in stop_rows:
@@ -148,5 +168,7 @@ class ScheduleCache:
         cls._colors_by_stop[transit_system] = colors_by_stop
         cls._short_names_by_trip[transit_system] = short_names_by_trip
         cls._short_names_by_route[transit_system] = short_names_by_route
+        cls._long_names_by_trip[transit_system] = long_names_by_trip
+        cls._long_names_by_route[transit_system] = long_names_by_route
         cls._stops[transit_system] = {row.stop_id: row.name for row in stop_rows}
         cls._loaded_at[transit_system] = datetime.utcnow()

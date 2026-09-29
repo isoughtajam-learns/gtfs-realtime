@@ -31,6 +31,10 @@ class TripPosition(SimplePosition):
     # without this a live event and the alert it relates to shared no
     # visible connection. See src/services/schedule_cache.py.
     route_short_name: Optional[str] = None
+    # The full colloquial route name (e.g. SF Muni's "TARAVAL", paired with
+    # route_short_name "L" to read as "L Taraval" the way riders/signage do)
+    # - distinct from trip_headsign for the same reason route_short_name is.
+    route_long_name: Optional[str] = None
     color: Optional[str] = None
     text_color: Optional[str] = None
     # GTFS-RT trip_update.timestamp ("last measured" time for this vehicle),

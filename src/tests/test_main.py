@@ -242,7 +242,9 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
     monkeypatch.setattr(requests, "get", flaky_get)
     monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
+        ScheduleCache,
+        "get",
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
@@ -266,13 +268,27 @@ def test_transit_feed_resolves_route_short_name_from_route_id(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {"R1": "2"})),
+        AsyncMock(
+            return_value=(
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {"R1": "2"},
+                {},
+                {"R1": "TARAVAL"},
+            )
+        ),
     )
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("SF-MTA"))
 
     event = asyncio.run(_first_event("SF-MTA"))
 
     assert event.data.route_short_name == "2"
+    assert event.data.route_long_name == "TARAVAL"
 
 
 def test_transit_feed_route_short_name_falls_back_to_trip_level_lookup(
@@ -291,13 +307,27 @@ def test_transit_feed_route_short_name_falls_back_to_trip_level_lookup(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {"T1": "2"}, {})),
+        AsyncMock(
+            return_value=(
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {"T1": "2"},
+                {},
+                {"T1": "TARAVAL"},
+                {},
+            )
+        ),
     )
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("SF-MTA"))
 
     event = asyncio.run(_first_event("SF-MTA"))
 
     assert event.data.route_short_name == "2"
+    assert event.data.route_long_name == "TARAVAL"
 
 
 def test_transit_feed_yields_cached_recent_events_before_polling(
@@ -377,7 +407,9 @@ def test_transit_feed_filters_burst_entries_not_in_cached_live_feed(
         lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
     )
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
+        ScheduleCache,
+        "get",
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config", _active_for("PeekFilterSystem")
@@ -439,7 +471,9 @@ def test_transit_feed_populates_recent_events_cache_after_a_poll(
         lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
     )
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
+        ScheduleCache,
+        "get",
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
@@ -512,7 +546,9 @@ def test_transit_feed_falls_back_to_entity_id_for_blank_trip_id(
         lambda *a, **k: _mock_response(_feed_with_two_blank_trip_id_entities()),
     )
     monkeypatch.setattr(
-        ScheduleCache, "get", AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}))
+        ScheduleCache,
+        "get",
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config",
