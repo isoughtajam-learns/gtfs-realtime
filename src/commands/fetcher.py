@@ -991,10 +991,21 @@ class Fetcher:
         feed's Transfer entity. It provides static transfer relationships
         that could be used for fare calculations, journey planning, or
         displaying transfer information to riders."""
+        path = self.real_file(TRANSFERS_FILE)
+        if not os.path.isfile(path):
+            # transfers.txt is optional per the GTFS spec - most real feeds
+            # don't publish it at all, unlike trips/stops/stop_times/routes.
+            # Without this check, do_upserts()'s broad except would catch
+            # the FileNotFoundError here and silently roll back the entire
+            # fetch (trips/stops/routes/stop_times included) for every such
+            # system.
+            logger.info(f"No transfers.txt for {self.transit_system} - skipping")
+            return
+
         transit_system_id = self.select_transit_system(connection)
 
         rows_to_write = []
-        with open(self.real_file(TRANSFERS_FILE), "r", encoding="utf-8-sig") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 from_stop_id = row.get("from_stop_id")

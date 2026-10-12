@@ -9,6 +9,7 @@ from sqlalchemy.engine import Engine
 
 from src.commands.fetcher import Fetcher
 from src.models import ORMBase, TransitSystem, Route, Trip, StopTime, Stop, Transfer
+from src.settings import get_settings
 
 
 # Start a temporary Postgres DB in Docker for the whole test session.
@@ -21,6 +22,7 @@ def db_engine(
     db_name = "gtfs_test"
     container_name = f"gtfs-test-{tmp_path_factory.mktemp('pg').name}"
     port = 5433
+    password = get_settings().test_db_password
 
     subprocess.run(
         [
@@ -34,7 +36,7 @@ def db_engine(
             "-e",
             "POSTGRES_USER=postgres",
             "-e",
-            "POSTGRES_PASSWORD=postgres",
+            f"POSTGRES_PASSWORD={password}",
             "-p",
             f"{port}:5432",
             "-d",
@@ -46,7 +48,7 @@ def db_engine(
     for _ in range(20):
         try:
             engine = create_engine(
-                f"postgresql://postgres:postgres@localhost:{port}/{db_name}"
+                f"postgresql://postgres:{password}@localhost:{port}/{db_name}"
             )
             engine.connect()
             break
