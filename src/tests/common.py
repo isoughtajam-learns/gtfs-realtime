@@ -1,3 +1,4 @@
+import os
 import pytest
 import subprocess
 import time
@@ -12,12 +13,36 @@ from src.models import ORMBase, TransitSystem, Route, Trip, StopTime, Stop, Tran
 from src.settings import get_settings
 
 
-# Start a temporary Postgres DB in Docker for the whole test session.
+# Real Postgres for the whole test session, from one of two sources:
+#
+# - CI sets TEST_DATABASE_URL (see .github/workflows/ci.yml's `test` job),
+#   pointing at a Postgres already provisioned by GitHub Actions' native
+#   `services:` block. That's the idiomatic way to get a real database in a
+#   GH-hosted job - its image pull goes through GitHub's own infra/caching
+#   and `options: --health-cmd pg_isready` gates the job on actual
+#   readiness, neither of which a hand-rolled poll loop can match. That poll
+#   loop is exactly what broke here: a cold pull of postgres:15-alpine on a
+#   fresh runner took longer than this fixture's fixed 10-second budget
+#   (20 x 0.5s), so every test using it failed with "Postgres did not start
+#   in time" even though Docker itself was available and working fine.
+# - Locally, where bare `pytest` has no `services:` equivalent, this
+#   fixture falls back to self-managing its own throwaway Docker container,
+#   same as before.
+#
+# Either way tests run against the same real Postgres 15 (matching prod's
+# RDS engine_version) - only who provisions the container differs.
 @pytest.fixture(scope="session")  # type: ignore[misc]
 def db_engine(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Generator[Engine, None, None]:
     from sqlalchemy import create_engine
+
+    test_database_url = os.environ.get("TEST_DATABASE_URL")
+    if test_database_url:
+        engine = create_engine(test_database_url)
+        ORMBase.metadata.create_all(engine)
+        yield engine
+        return
 
     db_name = "gtfs_test"
     container_name = f"gtfs-test-{tmp_path_factory.mktemp('pg').name}"
