@@ -73,7 +73,7 @@ def db_engine(
     for _ in range(20):
         try:
             engine = create_engine(
-                f"postgresql://postgres:{password}@localhost:{port}/{db_name}"
+                f"postgresql+psycopg2://postgres:{password}@localhost:{port}/{db_name}"
             )
             engine.connect()
             break
