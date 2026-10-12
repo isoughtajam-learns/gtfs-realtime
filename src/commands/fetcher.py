@@ -977,71 +977,44 @@ class Fetcher:
     def upsert_transfers(self, connection: Connection) -> None:
         """Materializes transfers.txt into the Transfer table.
 
-        GTFS transfers.txt columns (https://github.com/google/transit/blob/master/gtfs/spec/en/transfers.txt):
-          transfer_id        - unique identifier for this transfer relationship
-          route_id           - route of from_stop (optional, may be blank)
-          from_stop_code     - stop code/short_name where passenger transfers FROM
-          from_stop_sequence - sequence number in from_direction at transfer point
-          transit_time       - time in minutes between arrival at from_stop and departure at to_stop
-          destination_route_id - route of to_stop (optional, may be blank)
-          to_stop_code       - stop code/short_name where passenger transfers TO
-          to_stop_sequence   - sequence sequence number in to_direction at transfer point
+        GTFS transfers.txt columns (https://gtfs.org/schedule/reference/#transferstxt):
+          from_stop_id/to_stop_id - stops this rule connects (required; a row
+            missing either is unusable and skipped)
+          from_route_id/to_route_id - optionally scopes the rule to one route
+          from_trip_id/to_trip_id - optionally scopes the rule to one trip
+          transfer_type - GTFS enum (0/blank=recommended .. 5=in-seat not
+            allowed) - see models.Transfer's docstring
+          min_transfer_time - seconds required, only meaningful for
+            transfer_type=2
 
-        Note: This is the GTFS Schedule metadata file, NOT the realtime feed's Transfer entity.
-        It provides static transfer relationships that could be used for fare calculations,
-        journey planning, or displaying transfer information to riders."""
+        Note: This is the GTFS Schedule metadata file, NOT the realtime
+        feed's Transfer entity. It provides static transfer relationships
+        that could be used for fare calculations, journey planning, or
+        displaying transfer information to riders."""
         transit_system_id = self.select_transit_system(connection)
 
-        # Handle optional route_id/destination_route_id columns - they may be empty
         rows_to_write = []
         with open(self.real_file(TRANSFERS_FILE), "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                transfer_id = row.get("transfer_id")
-                if not transfer_id:
-                    continue
-
-                # Parse numeric fields, defaulting to empty string if missing
-                route_id = row.get("route_id", "") or None
-                from_stop_code = row.get("from_stop_code", "") or ""
-                try:
-                    from_stop_sequence = int(row.get("from_stop_sequence", "0"))
-                except (TypeError, ValueError):
-                    logger.warning(
-                        f"Invalid from_stop_sequence for transfer {transfer_id}: {row.get('from_stop_sequence')}"
-                    )
-                    continue
-
-                transit_time_str = row.get("transit_time", "") or ""
-                try:
-                    transit_time = int(transit_time_str)
-                except (TypeError, ValueError):
-                    logger.warning(
-                        f"Invalid transit_time for transfer {transfer_id}: {row.get('transit_time')}"
-                    )
-                    continue
-
-                destination_route_id = row.get("destination_route_id", "") or None
-                to_stop_code = row.get("to_stop_code", "") or ""
-                try:
-                    to_stop_sequence = int(row.get("to_stop_sequence", "0"))
-                except (TypeError, ValueError):
-                    logger.warning(
-                        f"Invalid to_stop_sequence for transfer {transfer_id}: {row.get('to_stop_sequence')}"
-                    )
+                from_stop_id = row.get("from_stop_id")
+                to_stop_id = row.get("to_stop_id")
+                if not from_stop_id or not to_stop_id:
                     continue
 
                 rows_to_write.append(
                     {
                         "transit_system_id": transit_system_id,
-                        "transfer_id": transfer_id,
-                        "route_id": route_id,
-                        "from_stop_code": from_stop_code,
-                        "from_stop_sequence": from_stop_sequence,
-                        "transit_time": transit_time,
-                        "destination_route_id": destination_route_id,
-                        "to_stop_code": to_stop_code,
-                        "to_stop_sequence": to_stop_sequence,
+                        "from_stop_id": from_stop_id,
+                        "to_stop_id": to_stop_id,
+                        "from_route_id": row.get("from_route_id") or None,
+                        "to_route_id": row.get("to_route_id") or None,
+                        "from_trip_id": row.get("from_trip_id") or None,
+                        "to_trip_id": row.get("to_trip_id") or None,
+                        "transfer_type": parse_optional_int(row.get("transfer_type")),
+                        "min_transfer_time": parse_optional_int(
+                            row.get("min_transfer_time")
+                        ),
                     }
                 )
 
@@ -1054,15 +1027,14 @@ class Fetcher:
             Transfer,
             rows_to_write,
             "uq_transfer",
-            ["transit_system_id", "transfer_id"],
+            ["transit_system_id", "from_stop_id", "to_stop_id"],
             [
-                "route_id",
-                "from_stop_code",
-                "from_stop_sequence",
-                "transit_time",
-                "destination_route_id",
-                "to_stop_code",
-                "to_stop_sequence",
+                "from_route_id",
+                "to_route_id",
+                "from_trip_id",
+                "to_trip_id",
+                "transfer_type",
+                "min_transfer_time",
             ],
         )
         logger.info(f"upsert transfers result: {total} rows")
