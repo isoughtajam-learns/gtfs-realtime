@@ -1,0 +1,135 @@
+from generated import gtfs_realtime_pb2
+from src.services.regional_feed import split_feed_by_agency
+
+AGENCY_MAP = {"SF": "SF-MTA", "AC": "AC_Transit"}
+
+
+def _rg_feed() -> gtfs_realtime_pb2.FeedMessage:
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    feed.header.timestamp = 1700000000
+    return feed
+
+
+def test_splits_entities_by_agency_code_prefix() -> None:
+    feed = _rg_feed()
+
+    sf_entity = feed.entity.add()
+    sf_entity.id = "SF:e1"
+    sf_entity.trip_update.trip.trip_id = "SF:T1"
+    sf_entity.trip_update.trip.route_id = "SF:R1"
+
+    ac_entity = feed.entity.add()
+    ac_entity.id = "AC:e2"
+    ac_entity.trip_update.trip.trip_id = "AC:T2"
+    ac_entity.trip_update.trip.route_id = "AC:R2"
+
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert set(messages.keys()) == {"SF-MTA", "AC_Transit"}
+    assert len(messages["SF-MTA"].entity) == 1
+    assert len(messages["AC_Transit"].entity) == 1
+
+
+def test_strips_agency_prefix_from_trip_update_fields() -> None:
+    feed = _rg_feed()
+
+    entity = feed.entity.add()
+    entity.id = "SF:e1"
+    entity.trip_update.trip.trip_id = "SF:12133132_M11"
+    entity.trip_update.trip.route_id = "SF:L"
+    entity.trip_update.vehicle.id = "SF:v1"
+    stop_time_update = entity.trip_update.stop_time_update.add()
+    stop_time_update.stop_id = "SF:4015"
+
+    [stripped] = split_feed_by_agency(feed, AGENCY_MAP)["SF-MTA"].entity
+
+    assert stripped.id == "e1"
+    assert stripped.trip_update.trip.trip_id == "12133132_M11"
+    assert stripped.trip_update.trip.route_id == "L"
+    assert stripped.trip_update.vehicle.id == "v1"
+    assert stripped.trip_update.stop_time_update[0].stop_id == "4015"
+
+
+def test_strips_agency_prefix_from_alert_informed_entity_fields() -> None:
+    feed = _rg_feed()
+
+    entity = feed.entity.add()
+    entity.id = "SF:alert1"
+    informed = entity.alert.informed_entity.add()
+    informed.route_id = "SF:L"
+    informed.trip.trip_id = "SF:T1"
+    informed.stop_id = "SF:4015"
+
+    [stripped] = split_feed_by_agency(feed, AGENCY_MAP)["SF-MTA"].entity
+
+    informed_stripped = stripped.alert.informed_entity[0]
+    assert informed_stripped.route_id == "L"
+    assert informed_stripped.trip.trip_id == "T1"
+    assert informed_stripped.stop_id == "4015"
+
+
+def test_agency_code_with_no_mapping_entry_is_skipped() -> None:
+    feed = _rg_feed()
+
+    entity = feed.entity.add()
+    entity.id = "GG:e1"
+    entity.trip_update.trip.trip_id = "GG:T1"
+    entity.trip_update.trip.route_id = "GG:R1"
+
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert messages == {}
+
+
+def test_falls_back_to_entity_id_when_trip_fields_are_blank() -> None:
+    # Mirrors a source like HSL that never sets trip_id - see
+    # main.py's _entity_trip_id - but still needs *some* signal to
+    # attribute the entity to an agency.
+    feed = _rg_feed()
+
+    entity = feed.entity.add()
+    entity.id = "AC:e1"
+
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert "AC_Transit" in messages
+    assert messages["AC_Transit"].entity[0].id == "e1"
+
+
+def test_entity_with_no_prefixed_field_anywhere_is_skipped() -> None:
+    feed = _rg_feed()
+
+    entity = feed.entity.add()
+    entity.id = "unprefixed-id"
+    entity.trip_update.trip.trip_id = "unprefixed-trip"
+
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert messages == {}
+
+
+def test_result_messages_copy_the_shared_feed_header() -> None:
+    feed = _rg_feed()
+    entity = feed.entity.add()
+    entity.id = "SF:e1"
+    entity.trip_update.trip.trip_id = "SF:T1"
+    entity.trip_update.trip.route_id = "SF:R1"
+
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert messages["SF-MTA"].header.timestamp == feed.header.timestamp
+    assert messages["SF-MTA"].header.gtfs_realtime_version == "2.0"
+
+
+def test_original_feed_is_not_mutated() -> None:
+    feed = _rg_feed()
+    entity = feed.entity.add()
+    entity.id = "SF:e1"
+    entity.trip_update.trip.trip_id = "SF:T1"
+    entity.trip_update.trip.route_id = "SF:R1"
+
+    split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert feed.entity[0].trip_update.trip.trip_id == "SF:T1"
+    assert feed.entity[0].trip_update.trip.route_id == "SF:R1"

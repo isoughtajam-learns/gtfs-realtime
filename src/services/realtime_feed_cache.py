@@ -84,6 +84,20 @@ class RealtimeFeedCache:
         return cast(T, cls._feed[transit_system])
 
     @classmethod
+    def set(cls, transit_system: str, feed: Any) -> None:
+        """Directly populates the cache for `transit_system`, bypassing
+        `fetch()`/locking entirely - for a caller that already has a feed
+        in hand from one combined fetch covering many systems at once
+        (see src/services/regional_feed.py's agency=RG demux), rather than
+        fetching per-system through `.get()`. A subsequent `.get()` call
+        for `transit_system` sees this as freshly fetched (now), exactly
+        as if `.get()` itself had just fetched it - including being
+        exempt from quota_group accounting, same as any other cache
+        write, since no real outbound request happens here."""
+        cls._feed[transit_system] = feed
+        cls._fetched_at[transit_system] = datetime.utcnow()
+
+    @classmethod
     def peek(cls, transit_system: str) -> Any:
         """Whatever's currently cached for `transit_system`, or None if
         nothing has been fetched yet - never triggers a fetch or checks

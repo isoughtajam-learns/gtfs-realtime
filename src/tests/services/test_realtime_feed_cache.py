@@ -204,6 +204,26 @@ def test_quota_group_serves_stale_cache_once_budget_is_exhausted() -> None:
         del QUOTA_GROUP_LIMITS["test-group-b"]
 
 
+def test_set_populates_cache_without_calling_fetch() -> None:
+    RealtimeFeedCache.set("regional-fed-system", "injected-feed")
+
+    assert RealtimeFeedCache.peek("regional-fed-system") == "injected-feed"
+
+
+def test_set_result_is_served_as_fresh_by_get() -> None:
+    # A caller with an already-fetched feed in hand (e.g. the regional
+    # scheduler's agency=RG demux, covering many systems from one fetch)
+    # populates the cache via set() - a subsequent get() must see it as
+    # freshly fetched, not fall through to fetch() again.
+    fetch = _FetchStub("should-not-be-called")
+
+    RealtimeFeedCache.set("preloaded-system", "injected-feed")
+    result = asyncio.run(RealtimeFeedCache.get("preloaded-system", fetch, 9999))
+
+    assert result == "injected-feed"
+    assert fetch.calls == 0
+
+
 def test_quota_group_still_fetches_when_nothing_cached_yet_despite_exhausted_budget() -> (
     None
 ):
