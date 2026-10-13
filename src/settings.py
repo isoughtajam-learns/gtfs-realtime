@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     # this via get_settings().api_key_511_org, never write the literal value
     # into a file.
     api_key_511_org: str | None = Field(default=None, alias="API_KEY_511_ORG")
+    # Password for the throwaway, session-scoped Docker Postgres container
+    # the test suite spins up (see src/tests/common.py's db_engine fixture) -
+    # not a real secret (the container only ever listens on localhost for
+    # the duration of one pytest run), but kept out of the Python source and
+    # read from .env.* like every other credential here, rather than
+    # hardcoded in common.py.
+    test_db_password: str = Field(default="postgres", alias="TEST_DB_PASSWORD")
 
 
 @lru_cache

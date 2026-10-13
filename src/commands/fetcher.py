@@ -4,6 +4,7 @@ Fetcher is meant to check for updates to GTFS Schedule data for a transit system
 Current scope:
 trips.txt for trip_id and headsign
 stops.txt for stop_id and stop_name
+transfers.txt for transfer relationships between trips/routes
 """
 
 import argparse
@@ -20,10 +21,10 @@ from typing import Any, List
 
 import requests
 from sqlalchemy import select, update, Connection
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database import engine
-from src.models import ORMBase, TransitSystem, Trip, Stop, StopTime, Route
+from src.models import ORMBase, TransitSystem, Trip, Stop, StopTime, Route, Transfer
 from src.telemetry import configure_posthog_logging
 from src.services.schedule_utils import (
     dedupe_rows_by_columns,
@@ -51,7 +52,15 @@ STOPS_FILE = "stops.txt"
 STOP_TIMES_FILE = "stop_times.txt"
 ROUTES_FILE = "routes.txt"
 AGENCY_FILE = "agency.txt"
-METADATA_FILE_LIST = [TRIPS_FILE, STOPS_FILE, STOP_TIMES_FILE, ROUTES_FILE, AGENCY_FILE]
+TRANSFERS_FILE = "transfers.txt"
+METADATA_FILE_LIST = [
+    TRIPS_FILE,
+    STOPS_FILE,
+    STOP_TIMES_FILE,
+    ROUTES_FILE,
+    AGENCY_FILE,
+    TRANSFERS_FILE,
+]
 UPDATED_METADATA_FILE = "updated_metadata.txt"
 
 # Upsert rows in fixed-size batches rather than one statement per file, so a
@@ -90,7 +99,7 @@ def _upsert_batched(
     total = 0
     for start in range(0, len(rows), UPSERT_BATCH_SIZE):
         batch = rows[start : start + UPSERT_BATCH_SIZE]
-        insert_stmt = insert(table).values(batch)
+        insert_stmt = pg_insert(table).values(batch)
         upsert_stmt = insert_stmt.on_conflict_do_update(
             constraint=constraint,
             set_={col: getattr(insert_stmt.excluded, col) for col in update_columns},
@@ -575,6 +584,7 @@ class Fetcher:
                 self.upsert_stops(connection, stop_meta)
                 self.upsert_routes(connection)
                 self.upsert_stop_times(connection)
+                self.upsert_transfers(connection)
             except Exception as ex:
                 logger.error(f"Error: {ex}")
         logger.info(f"Upserts completed for {', '.join(METADATA_FILE_LIST)}")
@@ -957,12 +967,88 @@ class Fetcher:
         self, connection: Connection, batch: list[dict[str, Any]]
     ) -> int:
         deduped = dedupe_rows_by_columns(batch, STOP_TIME_CONFLICT_COLUMNS)
-        insert_stmt = insert(StopTime).values(deduped)
+        insert_stmt = pg_insert(StopTime).values(deduped)
         upsert_stmt = insert_stmt.on_conflict_do_update(
             constraint="uq_stop_time",
             set_={"stop_id": insert_stmt.excluded.stop_id},
         )
         return connection.execute(upsert_stmt).rowcount
+
+    def upsert_transfers(self, connection: Connection) -> None:
+        """Materializes transfers.txt into the Transfer table.
+
+        GTFS transfers.txt columns (https://gtfs.org/schedule/reference/#transferstxt):
+          from_stop_id/to_stop_id - stops this rule connects (required; a row
+            missing either is unusable and skipped)
+          from_route_id/to_route_id - optionally scopes the rule to one route
+          from_trip_id/to_trip_id - optionally scopes the rule to one trip
+          transfer_type - GTFS enum (0/blank=recommended .. 5=in-seat not
+            allowed) - see models.Transfer's docstring
+          min_transfer_time - seconds required, only meaningful for
+            transfer_type=2
+
+        Note: This is the GTFS Schedule metadata file, NOT the realtime
+        feed's Transfer entity. It provides static transfer relationships
+        that could be used for fare calculations, journey planning, or
+        displaying transfer information to riders."""
+        path = self.real_file(TRANSFERS_FILE)
+        if not os.path.isfile(path):
+            # transfers.txt is optional per the GTFS spec - most real feeds
+            # don't publish it at all, unlike trips/stops/stop_times/routes.
+            # Without this check, do_upserts()'s broad except would catch
+            # the FileNotFoundError here and silently roll back the entire
+            # fetch (trips/stops/routes/stop_times included) for every such
+            # system.
+            logger.info(f"No transfers.txt for {self.transit_system} - skipping")
+            return
+
+        transit_system_id = self.select_transit_system(connection)
+
+        rows_to_write = []
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                from_stop_id = row.get("from_stop_id")
+                to_stop_id = row.get("to_stop_id")
+                if not from_stop_id or not to_stop_id:
+                    continue
+
+                rows_to_write.append(
+                    {
+                        "transit_system_id": transit_system_id,
+                        "from_stop_id": from_stop_id,
+                        "to_stop_id": to_stop_id,
+                        "from_route_id": row.get("from_route_id") or None,
+                        "to_route_id": row.get("to_route_id") or None,
+                        "from_trip_id": row.get("from_trip_id") or None,
+                        "to_trip_id": row.get("to_trip_id") or None,
+                        "transfer_type": parse_optional_int(row.get("transfer_type")),
+                        "min_transfer_time": parse_optional_int(
+                            row.get("min_transfer_time")
+                        ),
+                    }
+                )
+
+        if not rows_to_write:
+            logger.info(f"No transfer records to upsert for {self.transit_system}")
+            return
+
+        total = _upsert_batched(
+            connection,
+            Transfer,
+            rows_to_write,
+            "uq_transfer",
+            ["transit_system_id", "from_stop_id", "to_stop_id"],
+            [
+                "from_route_id",
+                "to_route_id",
+                "from_trip_id",
+                "to_trip_id",
+                "transfer_type",
+                "min_transfer_time",
+            ],
+        )
+        logger.info(f"upsert transfers result: {total} rows")
 
 
 if __name__ == "__main__":
