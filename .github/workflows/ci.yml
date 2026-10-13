@@ -28,6 +28,33 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # The fetcher's upsert_* tests (src/tests/commands/) exercise real
+    # upsert/constraint behavior against an actual Postgres, matching prod's
+    # RDS engine_version (15) - everything else in the suite is a pure unit
+    # test and never touches this service. A GitHub Actions `services:`
+    # container (not a `docker run` inside the test step itself) is the
+    # idiomatic way to provision it: GitHub's own infra handles the image
+    # pull/cache and `options:` below gates job startup on an actual
+    # `pg_isready`, instead of a fixed-budget poll loop that - as happened
+    # here once - times out on a cold pull before the container's even up.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: gtfs_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # src/tests/common.py's db_engine fixture connects here directly
+      # instead of self-managing a container, when this is set.
+      TEST_DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/gtfs_test
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -35,10 +62,7 @@ jobs:
           enable-cache: true
       # `uv run` syncs the environment (including the `dev` dependency
       # group, which is where pytest lives) on demand - no separate sync
-      # step needed. Tests don't need a live Postgres: SQLAlchemy's
-      # create_engine() is lazy and .env.dev (committed) supplies a
-      # syntactically valid but unreachable DATABASE_URL, which is enough
-      # for every test in this suite (none of them execute a query).
+      # step needed.
       - run: uv run pytest -q
 
   docker-build:

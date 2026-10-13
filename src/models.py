@@ -340,3 +340,53 @@ class Stop(ORMBase):
     __table_args__ = (
         UniqueConstraint("stop_id", "transit_system_id", name="uq_transit_stop_id"),
     )
+
+
+class Transfer(ORMBase):
+    """GTFS transfers.txt records describing a transfer relationship between
+    two stops, optionally scoped to specific routes/trips.
+    See https://gtfs.org/schedule/reference/#transferstxt
+
+    transfers.txt has no unique "transfer_id" field in the real GTFS spec -
+    an earlier version of this model invented one, along with several other
+    non-standard column names (from_stop_code/to_stop_code/transit_time/
+    destination_route_id), none of which exist in any real-world feed; every
+    row was silently dropped on ingestion as a result. Columns here match
+    the actual spec:
+      from_stop_id/to_stop_id - stops this rule connects (required)
+      from_route_id/to_route_id - optionally scopes the rule to one route
+        rather than every route serving from_stop_id/to_stop_id
+      from_trip_id/to_trip_id - optionally scopes the rule to one trip
+        (required by the spec for transfer_type 4/5, in-seat transfers)
+      transfer_type - GTFS enum: 0/blank=recommended, 1=timed (departing
+        vehicle waits), 2=requires min_transfer_time, 3=not possible,
+        4=in-seat transfer, 5=in-seat transfer not allowed
+      min_transfer_time - seconds needed, only meaningful for transfer_type=2
+    """
+
+    __tablename__ = "transfer"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
+    from_stop_id: Mapped[str]
+    to_stop_id: Mapped[str]
+    from_route_id: Mapped[Optional[str]]
+    to_route_id: Mapped[Optional[str]]
+    from_trip_id: Mapped[Optional[str]]
+    to_trip_id: Mapped[Optional[str]]
+    transfer_type: Mapped[Optional[int]]
+    min_transfer_time: Mapped[Optional[int]]
+
+    __table_args__ = (
+        # Keyed on the stop pair alone, not the full GTFS identity tuple
+        # (which would also include from_route_id/to_route_id/from_trip_id/
+        # to_trip_id) - Postgres treats NULLs as distinct for uniqueness
+        # purposes, so a compound key including those mostly-blank optional
+        # columns would let literal duplicate rows (same stop pair, same
+        # blank route/trip scoping) insert as separate rows instead of
+        # deduping, the same real failure mode _upsert_batched's docstring
+        # already describes for MBTA's route_short_name reuse.
+        UniqueConstraint(
+            "transit_system_id", "from_stop_id", "to_stop_id", name="uq_transfer"
+        ),
+    )
