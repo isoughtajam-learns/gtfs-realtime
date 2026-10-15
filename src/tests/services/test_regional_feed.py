@@ -167,12 +167,14 @@ def test_compare_feeds_reports_no_diff_when_identical() -> None:
 
     assert report["direct_entity_count"] == 1
     assert report["demuxed_entity_count"] == 1
+    assert report["matched_entity_count"] == 1
     assert report["entity_ids_only_in_direct"] == []
     assert report["entity_ids_only_in_demuxed"] == []
     assert report["route_ids_only_in_direct"] == []
     assert report["route_ids_only_in_demuxed"] == []
     assert report["stop_ids_only_in_direct"] == []
     assert report["stop_ids_only_in_demuxed"] == []
+    assert report["matched_trip_stop_id_mismatches"] == {}
 
 
 def test_compare_feeds_surfaces_unstripped_stop_id_prefix() -> None:
@@ -190,6 +192,33 @@ def test_compare_feeds_surfaces_unstripped_stop_id_prefix() -> None:
 
     assert report["stop_ids_only_in_direct"] == ["4015"]
     assert report["stop_ids_only_in_demuxed"] == ["SF:4015"]
+    # The decisive signal: entity "e1" exists on both sides (not churn -
+    # same trip), and its stop sequences genuinely differ.
+    assert report["matched_trip_stop_id_mismatches"] == {
+        "e1": {"direct": ["4015"], "demuxed": ["SF:4015"]}
+    }
+
+
+def test_compare_feeds_matched_trips_are_clean_despite_unmatched_churn() -> None:
+    # Mirrors what a live comparison actually looks like: the two fetches
+    # aren't simultaneous, so a trip can legitimately appear on only one
+    # side (see e2/e3 below) without that being a stop_id-handling bug -
+    # matched_trip_stop_id_mismatches must stay empty as long as every
+    # trip present on *both* sides has identical stop sequences, even
+    # though the flat stop_ids_only_in_* sets are non-empty here.
+    direct = _plain_feed()
+    _add_trip_update(direct, "e1", "T1", "R1", ["4015", "4016"])
+    _add_trip_update(direct, "e2", "T2", "R2", ["5000"])  # churned out by the 2nd fetch
+
+    demuxed = _plain_feed()
+    _add_trip_update(demuxed, "e1", "T1", "R1", ["4015", "4016"])
+    _add_trip_update(demuxed, "e3", "T3", "R3", ["6000"])  # appeared only after churn
+
+    report = compare_feeds(direct, demuxed)
+
+    assert report["stop_ids_only_in_direct"] == ["5000"]
+    assert report["stop_ids_only_in_demuxed"] == ["6000"]
+    assert report["matched_trip_stop_id_mismatches"] == {}
 
 
 def test_compare_feeds_surfaces_missing_entity() -> None:

@@ -180,13 +180,47 @@ def compare_feeds(
         if stu.stop_id
     }
 
+    # The two fetches aren't simultaneous (direct, then RG, a network
+    # round-trip apart) - on a live feed, some trips naturally start/end
+    # between them, so set differences across the *whole* feed (above)
+    # can't tell a real stop_id-handling bug apart from ordinary churn: a
+    # trip that's merely absent from one side will of course contribute
+    # "extra" stop_ids to a flat set diff. Comparing stop_id sequences
+    # only for entity ids present on *both* sides isolates the real
+    # signal - same trip, observed in both feeds, so any difference here
+    # can't be explained by churn.
+    matched_ids = set(direct_by_id) & set(demuxed_by_id)
+    matched_trip_stop_id_mismatches = {
+        entity_id: {
+            "direct": [
+                stu.stop_id
+                for stu in direct_by_id[entity_id].trip_update.stop_time_update
+            ],
+            "demuxed": [
+                stu.stop_id
+                for stu in demuxed_by_id[entity_id].trip_update.stop_time_update
+            ],
+        }
+        for entity_id in sorted(matched_ids)
+        if [stu.stop_id for stu in direct_by_id[entity_id].trip_update.stop_time_update]
+        != [
+            stu.stop_id for stu in demuxed_by_id[entity_id].trip_update.stop_time_update
+        ]
+    }
+
     return {
         "direct_entity_count": len(direct_by_id),
         "demuxed_entity_count": len(demuxed_by_id),
+        "matched_entity_count": len(matched_ids),
         "entity_ids_only_in_direct": sorted(set(direct_by_id) - set(demuxed_by_id)),
         "entity_ids_only_in_demuxed": sorted(set(demuxed_by_id) - set(direct_by_id)),
         "route_ids_only_in_direct": sorted(direct_route_ids - demuxed_route_ids),
         "route_ids_only_in_demuxed": sorted(demuxed_route_ids - direct_route_ids),
         "stop_ids_only_in_direct": sorted(direct_stop_ids - demuxed_stop_ids),
         "stop_ids_only_in_demuxed": sorted(demuxed_stop_ids - direct_stop_ids),
+        # The decisive signal for whether stop_id handling is actually
+        # correct (see this function's docstring) - empty means every
+        # trip observed on both sides had an identical stop sequence;
+        # anything here is a real demux bug, not explainable by churn.
+        "matched_trip_stop_id_mismatches": matched_trip_stop_id_mismatches,
     }
