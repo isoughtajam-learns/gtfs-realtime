@@ -1,7 +1,28 @@
 from generated import gtfs_realtime_pb2
-from src.services.regional_feed import split_feed_by_agency
+from src.services.regional_feed import compare_feeds, split_feed_by_agency
 
 AGENCY_MAP = {"SF": "SF-MTA", "AC": "AC_Transit"}
+
+
+def _plain_feed() -> gtfs_realtime_pb2.FeedMessage:
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    return feed
+
+
+def _add_trip_update(
+    feed: gtfs_realtime_pb2.FeedMessage,
+    entity_id: str,
+    trip_id: str,
+    route_id: str,
+    stop_ids: list[str],
+) -> None:
+    entity = feed.entity.add()
+    entity.id = entity_id
+    entity.trip_update.trip.trip_id = trip_id
+    entity.trip_update.trip.route_id = route_id
+    for stop_id in stop_ids:
+        entity.trip_update.stop_time_update.add().stop_id = stop_id
 
 
 def _rg_feed() -> gtfs_realtime_pb2.FeedMessage:
@@ -133,3 +154,83 @@ def test_original_feed_is_not_mutated() -> None:
 
     assert feed.entity[0].trip_update.trip.trip_id == "SF:T1"
     assert feed.entity[0].trip_update.trip.route_id == "SF:R1"
+
+
+def test_compare_feeds_reports_no_diff_when_identical() -> None:
+    direct = _plain_feed()
+    _add_trip_update(direct, "e1", "T1", "R1", ["4015", "4016"])
+
+    demuxed = _plain_feed()
+    _add_trip_update(demuxed, "e1", "T1", "R1", ["4015", "4016"])
+
+    report = compare_feeds(direct, demuxed)
+
+    assert report["direct_entity_count"] == 1
+    assert report["demuxed_entity_count"] == 1
+    assert report["entity_ids_only_in_direct"] == []
+    assert report["entity_ids_only_in_demuxed"] == []
+    assert report["route_ids_only_in_direct"] == []
+    assert report["route_ids_only_in_demuxed"] == []
+    assert report["stop_ids_only_in_direct"] == []
+    assert report["stop_ids_only_in_demuxed"] == []
+
+
+def test_compare_feeds_surfaces_unstripped_stop_id_prefix() -> None:
+    # Exactly the failure mode IRL-15 exists to catch: if stop_id isn't
+    # actually prefixed the same way route_id/trip_id are (or the demux
+    # fails to strip it), the "demuxed" side's stop_ids won't match the
+    # direct fetch's real stop_ids at all.
+    direct = _plain_feed()
+    _add_trip_update(direct, "e1", "T1", "R1", ["4015"])
+
+    demuxed = _plain_feed()
+    _add_trip_update(demuxed, "e1", "T1", "R1", ["SF:4015"])
+
+    report = compare_feeds(direct, demuxed)
+
+    assert report["stop_ids_only_in_direct"] == ["4015"]
+    assert report["stop_ids_only_in_demuxed"] == ["SF:4015"]
+
+
+def test_compare_feeds_surfaces_missing_entity() -> None:
+    direct = _plain_feed()
+    _add_trip_update(direct, "e1", "T1", "R1", ["4015"])
+    _add_trip_update(direct, "e2", "T2", "R2", ["4016"])
+
+    demuxed = _plain_feed()
+    _add_trip_update(demuxed, "e1", "T1", "R1", ["4015"])
+
+    report = compare_feeds(direct, demuxed)
+
+    assert report["entity_ids_only_in_direct"] == ["e2"]
+    assert report["entity_ids_only_in_demuxed"] == []
+    assert report["route_ids_only_in_direct"] == ["R2"]
+
+
+def test_compare_feeds_surfaces_route_id_mismatch() -> None:
+    direct = _plain_feed()
+    _add_trip_update(direct, "e1", "T1", "R1", ["4015"])
+
+    demuxed = _plain_feed()
+    _add_trip_update(demuxed, "e1", "T1", "SF:R1", ["4015"])
+
+    report = compare_feeds(direct, demuxed)
+
+    assert report["route_ids_only_in_direct"] == ["R1"]
+    assert report["route_ids_only_in_demuxed"] == ["SF:R1"]
+
+
+def test_compare_feeds_ignores_non_trip_update_entities() -> None:
+    direct = _plain_feed()
+    _add_trip_update(direct, "e1", "T1", "R1", ["4015"])
+    alert_only = direct.entity.add()
+    alert_only.id = "alert1"
+    alert_only.alert.header_text.translation.add().text = "Delay"
+
+    demuxed = _plain_feed()
+    _add_trip_update(demuxed, "e1", "T1", "R1", ["4015"])
+
+    report = compare_feeds(direct, demuxed)
+
+    assert report["direct_entity_count"] == 1
+    assert report["entity_ids_only_in_direct"] == []

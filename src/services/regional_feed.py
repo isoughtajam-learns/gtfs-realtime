@@ -18,7 +18,7 @@ entities, shapes, stops, or trip_modifications, so those aren't handled.
 """
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from generated import gtfs_realtime_pb2
 
@@ -132,3 +132,61 @@ def _stripped_entity(
                 informed.trip.route_id = _strip(informed.trip.route_id)
 
     return stripped
+
+
+def compare_feeds(
+    direct_feed: gtfs_realtime_pb2.FeedMessage,
+    demuxed_feed: gtfs_realtime_pb2.FeedMessage,
+) -> Dict[str, Any]:
+    """Compares a transit_system's own direct single-agency fetch against
+    its demuxed slice of a combined agency=RG fetch (see
+    split_feed_by_agency) - the live verification IRL-15 needs before
+    anything depends on the demux for real traffic. Returns a report dict
+    for manual inspection, not an assertion: a real-world mismatch here is
+    exactly the finding this comparison exists to surface (e.g. stop_id
+    still carrying an unstripped "<AGENCY-CODE>:" prefix would show up as
+    every stop_id appearing only on the demuxed side), not a bug in this
+    function itself.
+
+    Only compares TripUpdates entities/fields - ServiceAlerts comparison
+    isn't included here since this app's two feeds (realtime_url vs
+    alerts_url) are already fetched and compared separately by every other
+    call site; a caller comparing alert feeds should pass those feeds in
+    the same way instead."""
+    direct_by_id = {e.id: e for e in direct_feed.entity if e.HasField("trip_update")}
+    demuxed_by_id = {e.id: e for e in demuxed_feed.entity if e.HasField("trip_update")}
+
+    direct_route_ids = {
+        e.trip_update.trip.route_id
+        for e in direct_by_id.values()
+        if e.trip_update.trip.route_id
+    }
+    demuxed_route_ids = {
+        e.trip_update.trip.route_id
+        for e in demuxed_by_id.values()
+        if e.trip_update.trip.route_id
+    }
+
+    direct_stop_ids = {
+        stu.stop_id
+        for e in direct_by_id.values()
+        for stu in e.trip_update.stop_time_update
+        if stu.stop_id
+    }
+    demuxed_stop_ids = {
+        stu.stop_id
+        for e in demuxed_by_id.values()
+        for stu in e.trip_update.stop_time_update
+        if stu.stop_id
+    }
+
+    return {
+        "direct_entity_count": len(direct_by_id),
+        "demuxed_entity_count": len(demuxed_by_id),
+        "entity_ids_only_in_direct": sorted(set(direct_by_id) - set(demuxed_by_id)),
+        "entity_ids_only_in_demuxed": sorted(set(demuxed_by_id) - set(direct_by_id)),
+        "route_ids_only_in_direct": sorted(direct_route_ids - demuxed_route_ids),
+        "route_ids_only_in_demuxed": sorted(demuxed_route_ids - direct_route_ids),
+        "stop_ids_only_in_direct": sorted(direct_stop_ids - demuxed_stop_ids),
+        "stop_ids_only_in_demuxed": sorted(demuxed_stop_ids - direct_stop_ids),
+    }
