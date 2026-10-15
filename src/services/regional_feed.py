@@ -1,15 +1,12 @@
 """
 Splits a combined `agency=RG` GTFS-Realtime FeedMessage (511.org's
 region-wide Bay Area feed) into one FeedMessage per transit_system, by the
-`<AGENCY-CODE>:` prefix 511.org puts on entity ID fields - confirmed live
-for TripUpdates' trip_update.trip.route_id/trip_id (see
-docs/rate-limiting-and-scheduling.md's "Confirmed: a single request covers
-every Bay Area agency"). 511.org has separately confirmed ServiceAlerts
-also supports agency=RG, but the exact field-level prefixing there hasn't
-been checked against live data yet (see IRL-15) - this module strips
-alerts' informed_entity fields on the same assumption, which IRL-15 is
-responsible for confirming (or correcting) before anything depends on it
-for real traffic.
+`<AGENCY-CODE>:` prefix 511.org puts on entity ID fields. Confirmed
+correct against live SF-MTA data for both TripUpdates
+(trip_update.trip.route_id/trip_id/stop_time_update.stop_id) and
+ServiceAlerts (alert.informed_entity.route_id/trip.trip_id) - see IRL-15's
+findings - before this was ever wired up to real traffic (see
+RegionalFeedScheduler in src/services/quota_group_scheduler.py).
 
 Only strips the ID fields this app actually reads downstream - see
 main.py's transit_feed()/trip_detail() and service_alerts.py - not every
@@ -21,6 +18,12 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from generated import gtfs_realtime_pb2
+
+# 511.org's GTFS-RT endpoints - shared by RegionalFeedScheduler (real
+# traffic) and src/commands/regional_feed_diagnose.py (manual live
+# verification), so both hit the exact same URLs.
+REGIONAL_TRIP_UPDATES_URL = "https://api.511.org/Transit/TripUpdates"
+REGIONAL_SERVICE_ALERTS_URL = "https://api.511.org/Transit/ServiceAlerts"
 
 
 def split_feed_by_agency(

@@ -29,6 +29,8 @@ import requests
 
 from generated import gtfs_realtime_pb2
 from src.services.regional_feed import (
+    REGIONAL_SERVICE_ALERTS_URL,
+    REGIONAL_TRIP_UPDATES_URL,
     compare_alert_feeds,
     compare_feeds,
     split_feed_by_agency,
@@ -36,9 +38,6 @@ from src.services.regional_feed import (
 from src.settings import get_settings
 
 logger = logging.getLogger(__name__)
-
-TRIP_UPDATES_URL = "https://api.511.org/Transit/TripUpdates"
-SERVICE_ALERTS_URL = "https://api.511.org/Transit/ServiceAlerts"
 
 
 def _fetch(
@@ -76,8 +75,10 @@ def main() -> None:
         )
 
     print("=== TripUpdates ===")
-    direct_feed, direct_headers = _fetch(TRIP_UPDATES_URL, args.agency_code, api_key)
-    rg_feed, rg_headers = _fetch(TRIP_UPDATES_URL, "RG", api_key)
+    direct_feed, direct_headers = _fetch(
+        REGIONAL_TRIP_UPDATES_URL, args.agency_code, api_key
+    )
+    rg_feed, rg_headers = _fetch(REGIONAL_TRIP_UPDATES_URL, "RG", api_key)
     demuxed_by_system = split_feed_by_agency(
         rg_feed, {args.agency_code: args.transit_system}
     )
@@ -97,9 +98,9 @@ def main() -> None:
     print()
     print("=== ServiceAlerts ===")
     direct_alert_feed, direct_alert_headers = _fetch(
-        SERVICE_ALERTS_URL, args.agency_code, api_key
+        REGIONAL_SERVICE_ALERTS_URL, args.agency_code, api_key
     )
-    rg_alert_feed, rg_alert_headers = _fetch(SERVICE_ALERTS_URL, "RG", api_key)
+    rg_alert_feed, rg_alert_headers = _fetch(REGIONAL_SERVICE_ALERTS_URL, "RG", api_key)
     demuxed_alert_by_system = split_feed_by_agency(
         rg_alert_feed, {args.agency_code: args.transit_system}
     )

@@ -94,7 +94,14 @@ def get_active_quota_groups() -> list[str]:
 def get_quota_group_members(quota_group: str) -> list[dict[str, Any]]:
     """Every active system sharing `quota_group`, ordered by name for a
     deterministic round-robin - see
-    src/services/quota_group_scheduler.py's QuotaGroupScheduler."""
+    src/services/quota_group_scheduler.py's QuotaGroupScheduler.
+
+    Excludes a system with realtime_feed_agency_code set - that system is
+    fed by RegionalFeedScheduler instead (see get_regional_feed_members),
+    not its own direct realtime_url/alerts_url fetch, so it must not also
+    be a round-robin member here - the whole point of cutting a system
+    over to the regional feed is to stop making a separate direct request
+    for it, not to make two uncoordinated ones against the same budget."""
     with engine.begin() as connection:
         rows = connection.execute(
             select(
@@ -103,6 +110,7 @@ def get_quota_group_members(quota_group: str) -> list[dict[str, Any]]:
             .where(
                 TransitSystem.active.is_(True),
                 TransitSystem.quota_group == quota_group,
+                TransitSystem.realtime_feed_agency_code.is_(None),
             )
             .order_by(TransitSystem.name)
         ).all()
@@ -114,3 +122,21 @@ def get_quota_group_members(quota_group: str) -> list[dict[str, Any]]:
         }
         for row in rows
     ]
+
+
+def get_regional_feed_members(quota_group: str) -> dict[str, str]:
+    """{511.org agency_code: transit_system_name} for every active system
+    in `quota_group` that's been cut over to the regional feed (see
+    TransitSystem.realtime_feed_agency_code) - what
+    src/services/quota_group_scheduler.py's RegionalFeedScheduler demuxes
+    a combined agency=RG fetch against (see
+    src/services/regional_feed.py's split_feed_by_agency)."""
+    with engine.begin() as connection:
+        rows = connection.execute(
+            select(TransitSystem.name, TransitSystem.realtime_feed_agency_code).where(
+                TransitSystem.active.is_(True),
+                TransitSystem.quota_group == quota_group,
+                TransitSystem.realtime_feed_agency_code.is_not(None),
+            )
+        ).all()
+    return {row.realtime_feed_agency_code: row.name for row in rows}

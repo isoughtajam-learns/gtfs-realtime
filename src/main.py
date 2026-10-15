@@ -23,10 +23,15 @@ from src.models import (
 from src.services.positioning import get_location
 from src.services.quota_group_scheduler import (
     QuotaGroupScheduler,
+    RegionalFeedScheduler,
     next_realtime_update_at,
 )
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
+from src.services.regional_feed import (
+    REGIONAL_SERVICE_ALERTS_URL,
+    REGIONAL_TRIP_UPDATES_URL,
+)
 from src.services.schedule_cache import ScheduleCache
 from src.services.service_alerts import (
     build_service_alerts,
@@ -38,6 +43,7 @@ from src.services.transit_system_detail import (
     get_active_quota_groups,
     get_active_transit_systems,
     get_quota_group_members,
+    get_regional_feed_members,
     get_transit_system_config,
 )
 from src.services.trip_detail import get_scheduled_tail_stops, get_trip_schedule_context
@@ -49,12 +55,16 @@ logger = logging.getLogger(__name__)
 
 
 async def _start_quota_group_schedulers(app: FastAPI) -> list[asyncio.Task[None]]:
-    """One background QuotaGroupScheduler task per active quota_group
-    (currently just "511.org") - see that module for why proactive,
-    evenly-paced fetching replaces relying on inbound requests alone to
-    keep a shared-quota system's feed warm. Scheduler instances are kept
-    on app.state so get_transit_system_detail() can read
-    next_realtime_update_at off them; task handles are returned so
+    """One background task per active quota_group (currently just
+    "511.org") for each of its two possible member types: a
+    QuotaGroupScheduler for any member still on its own direct
+    realtime_url/alerts_url fetch, and/or a RegionalFeedScheduler for any
+    member cut over to the combined agency=RG feed (see
+    TransitSystem.realtime_feed_agency_code) - both draw from the same
+    SharedFeedQuota budget, so running both at once for a quota_group
+    that's mid-migration is safe, just not the steady state. Scheduler
+    instances are kept on app.state so get_transit_system_detail() can
+    read next_realtime_update_at off them; task handles are returned so
     lifespan() can cancel them cleanly on shutdown."""
     app.state.quota_group_schedulers = []
     tasks: list[asyncio.Task[None]] = []
@@ -71,12 +81,37 @@ async def _start_quota_group_schedulers(app: FastAPI) -> list[asyncio.Task[None]
                 "QUOTA_GROUP_LIMITS - not starting a scheduler for it."
             )
             continue
+
         members = await asyncio.to_thread(get_quota_group_members, group)
-        if not members:
-            continue
-        scheduler = QuotaGroupScheduler(group, members, _fetch_feed, budget)
-        app.state.quota_group_schedulers.append(scheduler)
-        tasks.append(asyncio.create_task(scheduler.run()))
+        if members:
+            scheduler = QuotaGroupScheduler(group, members, _fetch_feed, budget)
+            app.state.quota_group_schedulers.append(scheduler)
+            tasks.append(asyncio.create_task(scheduler.run()))
+
+        # The regional feed is currently 511.org-specific - the only
+        # source this app has a region-wide combined-fetch for (see
+        # src/services/regional_feed.py).
+        if group == "511.org":
+            regional_members = await asyncio.to_thread(get_regional_feed_members, group)
+            if regional_members:
+                api_key = get_settings().api_key_511_org
+                if not api_key:
+                    logger.warning(
+                        "API_KEY_511_ORG is not set - not starting the regional "
+                        f"feed scheduler for {len(regional_members)} system(s) "
+                        "cut over to it."
+                    )
+                else:
+                    regional_scheduler = RegionalFeedScheduler(
+                        group,
+                        regional_members,
+                        f"{REGIONAL_TRIP_UPDATES_URL}?api_key={api_key}&agency=RG",
+                        f"{REGIONAL_SERVICE_ALERTS_URL}?api_key={api_key}&agency=RG",
+                        _fetch_feed,
+                        budget,
+                    )
+                    app.state.quota_group_schedulers.append(regional_scheduler)
+                    tasks.append(asyncio.create_task(regional_scheduler.run()))
     return tasks
 
 

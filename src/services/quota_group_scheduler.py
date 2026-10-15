@@ -35,9 +35,11 @@ quota_group), a real HTTP request can still trigger a recovery fetch.
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol
 
 from src.services.realtime_feed_cache import RealtimeFeedCache
+from src.services.regional_feed import split_feed_by_agency
+from src.services.shared_feed_quota import SharedFeedQuota
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +134,96 @@ class QuotaGroupScheduler:
             await asyncio.sleep(self.tick_interval_seconds)
 
 
+class _HasNextUpdateAt(Protocol):
+    next_update_at: Dict[str, float]
+
+
+class RegionalFeedScheduler:
+    """Replaces QuotaGroupScheduler's per-system round-robin for every
+    511.org-backed system that's been cut over to the regional feed (see
+    TransitSystem.realtime_feed_agency_code, src/services/regional_feed.py)
+    - instead of round-robining one member's turn per tick (diluting the
+    group's fixed budget across however many members there are, the core
+    problem documented in docs/rate-limiting-and-scheduling.md), ONE fetch
+    per tick covers every regional-fed member at once, demuxed by agency
+    code. Confirmed correct for both TripUpdates and ServiceAlerts against
+    live SF-MTA data before ever being wired up to real traffic - see
+    IRL-15's findings.
+
+    Writes straight into RealtimeFeedCache via .set() rather than going
+    through .get() (unlike QuotaGroupScheduler) - there's no one URL per
+    member to inject as a `fetch` callable here, since a single response
+    covers every member at once."""
+
+    def __init__(
+        self,
+        quota_group: str,
+        agency_code_to_transit_system: Dict[str, str],
+        trip_updates_url: str,
+        alerts_url: str,
+        fetch: Callable[[str], Awaitable[Any]],
+        budget: int,
+    ) -> None:
+        self.quota_group = quota_group
+        self.agency_code_to_transit_system = agency_code_to_transit_system
+        self.trip_updates_url = trip_updates_url
+        self.alerts_url = alerts_url
+        self.fetch = fetch
+        self.tick_interval_seconds = 3600 / budget
+        self._tick_count = 0
+        now = time.time()
+        self.next_update_at: Dict[str, float] = {
+            transit_system: now + self.tick_interval_seconds
+            for transit_system in agency_code_to_transit_system.values()
+        }
+
+    async def tick(self) -> None:
+        self._tick_count += 1
+        if self._tick_count % ALERTS_TICK_EVERY == 0:
+            await self._tick_alerts()
+        else:
+            await self._tick_trip_updates()
+
+    async def _tick_trip_updates(self) -> None:
+        if not self.agency_code_to_transit_system:
+            return
+        # No RealtimeFeedCache.get() to delegate quota accounting to here
+        # (see this class's docstring) - check it directly, same backstop
+        # SharedFeedQuota.try_consume provides everywhere else. Skipping
+        # the tick on an exhausted budget leaves each member's existing
+        # cached feed in place (however stale), same fallback as .get()'s.
+        if not SharedFeedQuota.try_consume(self.quota_group):
+            return
+        feed = await self.fetch(self.trip_updates_url)
+        demuxed = split_feed_by_agency(feed, self.agency_code_to_transit_system)
+        now = time.time()
+        for transit_system, message in demuxed.items():
+            RealtimeFeedCache.set(transit_system, message)
+            self.next_update_at[transit_system] = now + self.tick_interval_seconds
+
+    async def _tick_alerts(self) -> None:
+        if not self.agency_code_to_transit_system:
+            return
+        if not SharedFeedQuota.try_consume(self.quota_group):
+            return
+        feed = await self.fetch(self.alerts_url)
+        demuxed = split_feed_by_agency(feed, self.agency_code_to_transit_system)
+        for transit_system, message in demuxed.items():
+            RealtimeFeedCache.set(f"{transit_system}:alerts", message)
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.tick()
+            except Exception as ex:
+                logger.error(
+                    f"Error in regional feed scheduler tick for {self.quota_group}: {ex}"
+                )
+            await asyncio.sleep(self.tick_interval_seconds)
+
+
 def next_realtime_update_at(
-    schedulers: List[QuotaGroupScheduler], transit_system: str
+    schedulers: List[_HasNextUpdateAt], transit_system: str
 ) -> Optional[int]:
     """Looked up by GET /transit_systems/{transit_system} - None for a
     system not in any scheduled quota_group (nothing proactively keeps it
