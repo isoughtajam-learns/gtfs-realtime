@@ -1,5 +1,9 @@
 from generated import gtfs_realtime_pb2
-from src.services.regional_feed import compare_feeds, split_feed_by_agency
+from src.services.regional_feed import (
+    compare_alert_feeds,
+    compare_feeds,
+    split_feed_by_agency,
+)
 
 AGENCY_MAP = {"SF": "SF-MTA", "AC": "AC_Transit"}
 
@@ -263,3 +267,62 @@ def test_compare_feeds_ignores_non_trip_update_entities() -> None:
 
     assert report["direct_entity_count"] == 1
     assert report["entity_ids_only_in_direct"] == []
+
+
+def _add_alert(
+    feed: gtfs_realtime_pb2.FeedMessage,
+    entity_id: str,
+    route_id: str,
+    trip_id: str,
+) -> None:
+    entity = feed.entity.add()
+    entity.id = entity_id
+    informed = entity.alert.informed_entity.add()
+    informed.route_id = route_id
+    informed.trip.trip_id = trip_id
+
+
+def test_compare_alert_feeds_reports_no_mismatch_when_identical() -> None:
+    direct = _plain_feed()
+    _add_alert(direct, "a1", "R1", "T1")
+
+    demuxed = _plain_feed()
+    _add_alert(demuxed, "a1", "R1", "T1")
+
+    report = compare_alert_feeds(direct, demuxed)
+
+    assert report["direct_entity_count"] == 1
+    assert report["matched_entity_count"] == 1
+    assert report["entity_ids_only_in_direct"] == []
+    assert report["entity_ids_only_in_demuxed"] == []
+    assert report["matched_informed_entity_mismatches"] == {}
+
+
+def test_compare_alert_feeds_surfaces_unstripped_informed_entity_prefix() -> None:
+    direct = _plain_feed()
+    _add_alert(direct, "a1", "R1", "T1")
+
+    demuxed = _plain_feed()
+    _add_alert(demuxed, "a1", "SF:R1", "SF:T1")
+
+    report = compare_alert_feeds(direct, demuxed)
+
+    assert report["matched_informed_entity_mismatches"] == {
+        "a1": {"direct": [("R1", "T1")], "demuxed": [("SF:R1", "SF:T1")]}
+    }
+
+
+def test_compare_alert_feeds_ignores_unmatched_churn() -> None:
+    direct = _plain_feed()
+    _add_alert(direct, "a1", "R1", "T1")
+    _add_alert(direct, "a2", "R2", "T2")  # only in direct
+
+    demuxed = _plain_feed()
+    _add_alert(demuxed, "a1", "R1", "T1")
+    _add_alert(demuxed, "a3", "R3", "T3")  # only in demuxed
+
+    report = compare_alert_feeds(direct, demuxed)
+
+    assert report["entity_ids_only_in_direct"] == ["a2"]
+    assert report["entity_ids_only_in_demuxed"] == ["a3"]
+    assert report["matched_informed_entity_mismatches"] == {}

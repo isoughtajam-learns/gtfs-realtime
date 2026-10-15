@@ -224,3 +224,46 @@ def compare_feeds(
         # anything here is a real demux bug, not explainable by churn.
         "matched_trip_stop_id_mismatches": matched_trip_stop_id_mismatches,
     }
+
+
+def compare_alert_feeds(
+    direct_feed: gtfs_realtime_pb2.FeedMessage,
+    demuxed_feed: gtfs_realtime_pb2.FeedMessage,
+) -> Dict[str, Any]:
+    """ServiceAlerts counterpart to compare_feeds() - 511.org has confirmed
+    agency=RG also covers ServiceAlerts, but whether informed_entity's
+    route_id/trip.trip_id are agency-prefixed the same way TripUpdates'
+    are hadn't been checked against live data (see IRL-15's open question
+    #2). Same matched-entity approach as compare_feeds(): the two fetches
+    aren't simultaneous, so only entity ids present on *both* sides give a
+    signal that isn't explainable by ordinary alert churn."""
+    direct_by_id = {e.id: e for e in direct_feed.entity if e.HasField("alert")}
+    demuxed_by_id = {e.id: e for e in demuxed_feed.entity if e.HasField("alert")}
+
+    def _informed_pairs(
+        entity: gtfs_realtime_pb2.FeedEntity,
+    ) -> List[Tuple[str, str]]:
+        return sorted(
+            (informed.route_id, informed.trip.trip_id)
+            for informed in entity.alert.informed_entity
+        )
+
+    matched_ids = set(direct_by_id) & set(demuxed_by_id)
+    matched_informed_entity_mismatches = {
+        entity_id: {
+            "direct": _informed_pairs(direct_by_id[entity_id]),
+            "demuxed": _informed_pairs(demuxed_by_id[entity_id]),
+        }
+        for entity_id in sorted(matched_ids)
+        if _informed_pairs(direct_by_id[entity_id])
+        != _informed_pairs(demuxed_by_id[entity_id])
+    }
+
+    return {
+        "direct_entity_count": len(direct_by_id),
+        "demuxed_entity_count": len(demuxed_by_id),
+        "matched_entity_count": len(matched_ids),
+        "entity_ids_only_in_direct": sorted(set(direct_by_id) - set(demuxed_by_id)),
+        "entity_ids_only_in_demuxed": sorted(set(demuxed_by_id) - set(direct_by_id)),
+        "matched_informed_entity_mismatches": matched_informed_entity_mismatches,
+    }
