@@ -1,17 +1,28 @@
 """
 Splits a combined `agency=RG` GTFS-Realtime FeedMessage (511.org's
-region-wide Bay Area feed) into one FeedMessage per transit_system, by the
-`<AGENCY-CODE>:` prefix 511.org puts on entity ID fields. Confirmed
-correct against live SF-MTA data for both TripUpdates
-(trip_update.trip.route_id/trip_id/stop_time_update.stop_id) and
-ServiceAlerts (alert.informed_entity.route_id/trip.trip_id) - see IRL-15's
-findings - before this was ever wired up to real traffic (see
-RegionalFeedScheduler in src/services/quota_group_scheduler.py).
+region-wide Bay Area feed) into one FeedMessage per transit_system.
 
-Only strips the ID fields this app actually reads downstream - see
-main.py's transit_feed()/trip_detail() and service_alerts.py - not every
-field the GTFS-RT spec defines. Nothing here reads VehiclePositions-only
-entities, shapes, stops, or trip_modifications, so those aren't handled.
+TripUpdates entities are attributed and demuxed by the `<AGENCY-CODE>:`
+prefix 511.org puts on trip_update.trip.route_id/trip_id/
+stop_time_update.stop_id - confirmed correct live against SF-MTA,
+Caltrain, VTA, and AC Transit (see IRL-15/IRL-17's findings) before this
+was ever wired up to real traffic (see RegionalFeedScheduler in
+src/services/quota_group_scheduler.py).
+
+ServiceAlerts entities do NOT use that prefix convention at all - route_id/
+trip_id/stop_id and entity.id are the owning agency's own raw, unprefixed
+values. Attribution instead uses informed_entity.agency_id, a dedicated
+EntitySelector field 511.org sets explicitly (confirmed live: AC Transit's
+alerts were being silently dropped entirely under the prefix-based
+approach, since AC's own native alert IDs merely happen to start with
+"AC_" as that agency's own internal convention, not a demux prefix - see
+_entity_agency_code's docstring for the full story).
+
+Only strips/reads the ID fields this app actually consumes downstream -
+see main.py's transit_feed()/trip_detail() and service_alerts.py - not
+every field the GTFS-RT spec defines. Nothing here reads
+VehiclePositions-only entities, shapes, stops, or trip_modifications, so
+those aren't handled.
 """
 
 from collections import defaultdict
@@ -73,15 +84,26 @@ def _agency_code_and_id(prefixed: str) -> Tuple[Optional[str], str]:
 
 
 def _entity_agency_code(entity: gtfs_realtime_pb2.FeedEntity) -> Optional[str]:
-    """Which 511.org agency code this entity belongs to, read from
-    whichever confirmed-prefixed field is present: trip_update.trip's
-    route_id/trip_id for TripUpdates (the only fields the original
-    agency=RG investigation actually verified are prefixed), or the first
-    informed_entity's equivalents for ServiceAlerts (assumed pending
-    IRL-15's live check). Falls back to entity.id itself - also
-    unconfirmed - only if neither trip field is usable, e.g. a source that
-    leaves both blank the way HSL does for trip_id alone (see
-    main.py's _entity_trip_id)."""
+    """Which 511.org agency code this entity belongs to.
+
+    TripUpdates: read from trip_update.trip's route_id/trip_id, which
+    carry the "<AGENCY-CODE>:" prefix (confirmed live against SF-MTA,
+    Caltrain, VTA, and AC Transit - see IRL-15/IRL-17's findings).
+
+    ServiceAlerts: DON'T use that same prefix convention at all - confirmed
+    live (AC Transit, IRL-17): a "stop closed" alert had route_id/trip_id/
+    stop_id all blank or unprefixed, and entity.id was AC Transit's own
+    native alert ID ("AC_14th Ave. at E. 33rd St. Stop Closed" - the "AC_"
+    is that agency's own internal naming convention, not a 511.org demux
+    prefix), causing the alert to be silently dropped entirely before this
+    fix - not just mis-attributed. The real, explicit signal is
+    informed_entity.agency_id, a dedicated EntitySelector field set to the
+    plain (unprefixed) agency code. Checked first for alerts; the
+    entity.id fallback below is kept only for the rare case agency_id
+    isn't set, and is coincidental/unreliable when it does match (confirmed
+    live: VTA's own native alert IDs happen to look colon-prefixed, purely
+    by that agency's own convention, unrelated to 511.org's regional
+    aggregation)."""
     if entity.HasField("trip_update"):
         trip = entity.trip_update.trip
         for value in (trip.route_id, trip.trip_id):
@@ -91,6 +113,8 @@ def _entity_agency_code(entity: gtfs_realtime_pb2.FeedEntity) -> Optional[str]:
 
     if entity.HasField("alert") and entity.alert.informed_entity:
         informed = entity.alert.informed_entity[0]
+        if informed.agency_id:
+            return informed.agency_id
         for value in (informed.route_id, informed.trip.trip_id):
             code, _ = _agency_code_and_id(value)
             if code:
