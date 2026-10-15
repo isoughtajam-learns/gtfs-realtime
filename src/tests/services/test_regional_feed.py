@@ -76,22 +76,49 @@ def test_strips_agency_prefix_from_trip_update_fields() -> None:
     assert stripped.trip_update.stop_time_update[0].stop_id == "4015"
 
 
-def test_strips_agency_prefix_from_alert_informed_entity_fields() -> None:
+def test_alerts_are_attributed_by_agency_id_not_a_prefix() -> None:
+    # Confirmed live (AC Transit, IRL-17): alerts don't use the
+    # <AGENCY-CODE>: prefix convention TripUpdates do at all -
+    # route_id/trip_id/stop_id and entity.id are the owning agency's own
+    # raw, unprefixed values (AC Transit's own native alert IDs happen to
+    # start with "AC_", that agency's own internal convention, unrelated
+    # to 511.org's demux). informed_entity.agency_id is the real signal.
     feed = _rg_feed()
 
     entity = feed.entity.add()
-    entity.id = "SF:alert1"
+    entity.id = "AC_14th Ave. at E. 33rd St. Stop Closed"
     informed = entity.alert.informed_entity.add()
-    informed.route_id = "SF:L"
-    informed.trip.trip_id = "SF:T1"
-    informed.stop_id = "SF:4015"
+    informed.stop_id = "55202"
+    informed.agency_id = "AC"
 
-    [stripped] = split_feed_by_agency(feed, AGENCY_MAP)["SF-MTA"].entity
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
 
-    informed_stripped = stripped.alert.informed_entity[0]
-    assert informed_stripped.route_id == "L"
-    assert informed_stripped.trip.trip_id == "T1"
-    assert informed_stripped.stop_id == "4015"
+    assert "AC_Transit" in messages
+    [result] = messages["AC_Transit"].entity
+    # Nothing is prefixed, so nothing should be stripped - the raw values
+    # pass through unchanged.
+    assert result.id == "AC_14th Ave. at E. 33rd St. Stop Closed"
+    assert result.alert.informed_entity[0].stop_id == "55202"
+
+
+def test_alert_with_only_stop_id_and_agency_id_is_not_dropped() -> None:
+    # The exact failure mode this fix addresses: before it, an alert whose
+    # informed_entity has no route_id/trip_id (common for a "stop closed"
+    # alert) and whose entity.id isn't colon-prefixed fell through every
+    # attribution path and was silently skipped entirely - not just
+    # mis-attributed.
+    feed = _rg_feed()
+
+    entity = feed.entity.add()
+    entity.id = "SomeNativeAlertId"
+    informed = entity.alert.informed_entity.add()
+    informed.agency_id = "SF"
+    informed.stop_id = "4015"
+
+    messages = split_feed_by_agency(feed, AGENCY_MAP)
+
+    assert "SF-MTA" in messages
+    assert len(messages["SF-MTA"].entity) == 1
 
 
 def test_agency_code_with_no_mapping_entry_is_skipped() -> None:
