@@ -25,6 +25,17 @@ services:
     command: sh -c "alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload"
     env_file:
       - .env.dev_docker
+    environment:
+      # Passed through from your own shell when set, not written into
+      # .env.dev_docker (committed) - same reasoning as every other
+      # 511.org-backed migration's guard (see settings.py's
+      # api_key_511_org). Only needed for `alembic upgrade head` to get
+      # past a migration that writes a 511.org URL; harmless/unused
+      # otherwise. Without it, `docker compose up` crash-loops this
+      # container on any such pending migration - confirmed live when
+      # IRL-16/17's migrations were the first ones run against an
+      # existing local compose Postgres volume.
+      - API_KEY_511_ORG
     ports:
       - "8000:8000"
     depends_on:
