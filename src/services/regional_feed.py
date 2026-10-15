@@ -18,7 +18,7 @@ entities, shapes, stops, or trip_modifications, so those aren't handled.
 """
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from generated import gtfs_realtime_pb2
 
@@ -132,3 +132,138 @@ def _stripped_entity(
                 informed.trip.route_id = _strip(informed.trip.route_id)
 
     return stripped
+
+
+def compare_feeds(
+    direct_feed: gtfs_realtime_pb2.FeedMessage,
+    demuxed_feed: gtfs_realtime_pb2.FeedMessage,
+) -> Dict[str, Any]:
+    """Compares a transit_system's own direct single-agency fetch against
+    its demuxed slice of a combined agency=RG fetch (see
+    split_feed_by_agency) - the live verification IRL-15 needs before
+    anything depends on the demux for real traffic. Returns a report dict
+    for manual inspection, not an assertion: a real-world mismatch here is
+    exactly the finding this comparison exists to surface (e.g. stop_id
+    still carrying an unstripped "<AGENCY-CODE>:" prefix would show up as
+    every stop_id appearing only on the demuxed side), not a bug in this
+    function itself.
+
+    Only compares TripUpdates entities/fields - ServiceAlerts comparison
+    isn't included here since this app's two feeds (realtime_url vs
+    alerts_url) are already fetched and compared separately by every other
+    call site; a caller comparing alert feeds should pass those feeds in
+    the same way instead."""
+    direct_by_id = {e.id: e for e in direct_feed.entity if e.HasField("trip_update")}
+    demuxed_by_id = {e.id: e for e in demuxed_feed.entity if e.HasField("trip_update")}
+
+    direct_route_ids = {
+        e.trip_update.trip.route_id
+        for e in direct_by_id.values()
+        if e.trip_update.trip.route_id
+    }
+    demuxed_route_ids = {
+        e.trip_update.trip.route_id
+        for e in demuxed_by_id.values()
+        if e.trip_update.trip.route_id
+    }
+
+    direct_stop_ids = {
+        stu.stop_id
+        for e in direct_by_id.values()
+        for stu in e.trip_update.stop_time_update
+        if stu.stop_id
+    }
+    demuxed_stop_ids = {
+        stu.stop_id
+        for e in demuxed_by_id.values()
+        for stu in e.trip_update.stop_time_update
+        if stu.stop_id
+    }
+
+    # The two fetches aren't simultaneous (direct, then RG, a network
+    # round-trip apart) - on a live feed, some trips naturally start/end
+    # between them, so set differences across the *whole* feed (above)
+    # can't tell a real stop_id-handling bug apart from ordinary churn: a
+    # trip that's merely absent from one side will of course contribute
+    # "extra" stop_ids to a flat set diff. Comparing stop_id sequences
+    # only for entity ids present on *both* sides isolates the real
+    # signal - same trip, observed in both feeds, so any difference here
+    # can't be explained by churn.
+    matched_ids = set(direct_by_id) & set(demuxed_by_id)
+    matched_trip_stop_id_mismatches = {
+        entity_id: {
+            "direct": [
+                stu.stop_id
+                for stu in direct_by_id[entity_id].trip_update.stop_time_update
+            ],
+            "demuxed": [
+                stu.stop_id
+                for stu in demuxed_by_id[entity_id].trip_update.stop_time_update
+            ],
+        }
+        for entity_id in sorted(matched_ids)
+        if [stu.stop_id for stu in direct_by_id[entity_id].trip_update.stop_time_update]
+        != [
+            stu.stop_id for stu in demuxed_by_id[entity_id].trip_update.stop_time_update
+        ]
+    }
+
+    return {
+        "direct_entity_count": len(direct_by_id),
+        "demuxed_entity_count": len(demuxed_by_id),
+        "matched_entity_count": len(matched_ids),
+        "entity_ids_only_in_direct": sorted(set(direct_by_id) - set(demuxed_by_id)),
+        "entity_ids_only_in_demuxed": sorted(set(demuxed_by_id) - set(direct_by_id)),
+        "route_ids_only_in_direct": sorted(direct_route_ids - demuxed_route_ids),
+        "route_ids_only_in_demuxed": sorted(demuxed_route_ids - direct_route_ids),
+        "stop_ids_only_in_direct": sorted(direct_stop_ids - demuxed_stop_ids),
+        "stop_ids_only_in_demuxed": sorted(demuxed_stop_ids - direct_stop_ids),
+        # The decisive signal for whether stop_id handling is actually
+        # correct (see this function's docstring) - empty means every
+        # trip observed on both sides had an identical stop sequence;
+        # anything here is a real demux bug, not explainable by churn.
+        "matched_trip_stop_id_mismatches": matched_trip_stop_id_mismatches,
+    }
+
+
+def compare_alert_feeds(
+    direct_feed: gtfs_realtime_pb2.FeedMessage,
+    demuxed_feed: gtfs_realtime_pb2.FeedMessage,
+) -> Dict[str, Any]:
+    """ServiceAlerts counterpart to compare_feeds() - 511.org has confirmed
+    agency=RG also covers ServiceAlerts, but whether informed_entity's
+    route_id/trip.trip_id are agency-prefixed the same way TripUpdates'
+    are hadn't been checked against live data (see IRL-15's open question
+    #2). Same matched-entity approach as compare_feeds(): the two fetches
+    aren't simultaneous, so only entity ids present on *both* sides give a
+    signal that isn't explainable by ordinary alert churn."""
+    direct_by_id = {e.id: e for e in direct_feed.entity if e.HasField("alert")}
+    demuxed_by_id = {e.id: e for e in demuxed_feed.entity if e.HasField("alert")}
+
+    def _informed_pairs(
+        entity: gtfs_realtime_pb2.FeedEntity,
+    ) -> List[Tuple[str, str]]:
+        return sorted(
+            (informed.route_id, informed.trip.trip_id)
+            for informed in entity.alert.informed_entity
+        )
+
+    matched_ids = set(direct_by_id) & set(demuxed_by_id)
+    matched_informed_entity_mismatches = {
+        entity_id: {
+            "direct": _informed_pairs(direct_by_id[entity_id]),
+            "demuxed": _informed_pairs(demuxed_by_id[entity_id]),
+        }
+        for entity_id in sorted(matched_ids)
+        if _informed_pairs(direct_by_id[entity_id])
+        != _informed_pairs(demuxed_by_id[entity_id])
+    }
+
+    return {
+        "direct_entity_count": len(direct_by_id),
+        "demuxed_entity_count": len(demuxed_by_id),
+        "matched_entity_count": len(matched_ids),
+        "entity_ids_only_in_direct": sorted(set(direct_by_id) - set(demuxed_by_id)),
+        "entity_ids_only_in_demuxed": sorted(set(demuxed_by_id) - set(direct_by_id)),
+        "matched_informed_entity_mismatches": matched_informed_entity_mismatches,
+    }
