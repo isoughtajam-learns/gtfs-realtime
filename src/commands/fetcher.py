@@ -670,7 +670,7 @@ class Fetcher:
             Route,
             routes,
             "uq_short_name",
-            ["short_name"],
+            ["transit_system_id", "short_name"],
             ["short_name", "long_name", "url", "color", "text_color", "route_type"],
         )
         logger.info(f"upsert routes result: {total} rows")

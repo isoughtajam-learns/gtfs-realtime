@@ -259,9 +259,10 @@ class Route(ORMBase):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
     route_id: Mapped[str]
-    short_name: Mapped[str] = mapped_column(
-        primary_key=True, unique=True, autoincrement=False
-    )
+    # NOT globally unique - see uq_short_name below. Composite PK with `id`
+    # kept as-is (not the source of the bug this comment is about), even
+    # though `id` alone already uniquely identifies every row.
+    short_name: Mapped[str] = mapped_column(primary_key=True, autoincrement=False)
     long_name: Mapped[str]
     url: Mapped[str]
     color: Mapped[str]
@@ -273,7 +274,23 @@ class Route(ORMBase):
 
     __table_args__ = (
         UniqueConstraint("id", "short_name", name="uq_route_short_name"),
-        UniqueConstraint("short_name", name="uq_short_name"),
+        # Scoped per transit_system, NOT globally unique across every
+        # system - it used to be global, deliberately, to dedupe a single
+        # agency's own route_short_name reuse (confirmed live: MBTA's
+        # routes.txt reuses one short_name across many distinct route_ids
+        # for shuttle-bus replacements). That reasoning never required
+        # global scope, and global scope turned out to actively corrupt
+        # data once multiple real Bay Area agencies went live together:
+        # confirmed live, 67 of 310 distinct short_name values collide
+        # across 2-4 different systems (plain numeric bus route codes like
+        # "22"/"52"/"F" are common across agencies) - _upsert_batched's
+        # ON CONFLICT (short_name) DO UPDATE doesn't update transit_system_id,
+        # so whichever system claimed a given short_name first kept
+        # permanent ownership of that row, and every other system's own
+        # same-numbered route silently vanished (upserted into the wrong
+        # system's row, visible as route_short_name/long_name/color all
+        # None for that system's own trips).
+        UniqueConstraint("transit_system_id", "short_name", name="uq_short_name"),
     )
 
 

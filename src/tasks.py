@@ -4,7 +4,7 @@ from sqlalchemy import select, func
 
 from src.database import engine
 from src.commands.fetcher import Fetcher
-from src.models import TransitSystem, Trip, Stop
+from src.models import TransitSystem, Trip, Stop, Route
 from src.services.transit_system_detail import get_active_transit_systems
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
@@ -50,10 +50,17 @@ def fetch_all_systems() -> None:
 @app.task
 def ensure_schedule_data() -> None:
     """
-    Safety net: catches a transit system with no trip/stop data at all - e.g.
-    a system that was just activated, or a previous fetch that upserted
-    transit_system but failed partway through trips/stops - and triggers a
-    fetch for it. Runs far more often than fetch_all_systems so a
+    Safety net: catches a transit system with no trip/stop/route data at
+    all - e.g. a system that was just activated, or a previous fetch that
+    upserted transit_system but failed partway through trips/stops/routes
+    - and triggers a fetch for it. Route is checked separately from
+    trip/stop since a fetch can fully succeed for trips/stops while
+    upsert_routes() silently produces zero usable rows for this system
+    specifically (confirmed live: Route.short_name's uniqueness being
+    global instead of per-transit_system let a colliding short_name from
+    another Bay Area agency silently claim every one of this system's
+    routes - see the migration that scoped it per-system). Runs far more
+    often than fetch_all_systems so a
     broken/empty system gets caught quickly, but Fetcher.fetched_today makes
     repeat calls for an already-healthy system a cheap no-op (single indexed
     SELECT, no network request), so running this frequently doesn't hammer
@@ -82,6 +89,14 @@ def ensure_schedule_data() -> None:
                 )
             )
         }
+        route_counts: dict[int, int] = {
+            transit_system_id: count
+            for transit_system_id, count in connection.execute(
+                select(Route.transit_system_id, func.count(Route.id)).group_by(
+                    Route.transit_system_id
+                )
+            )
+        }
 
     for system in get_active_transit_systems():
         name, url = system["name"], system["schedule_url"]
@@ -90,6 +105,7 @@ def ensure_schedule_data() -> None:
             transit_system_id is not None
             and trip_counts.get(transit_system_id, 0) > 0
             and stop_counts.get(transit_system_id, 0) > 0
+            and route_counts.get(transit_system_id, 0) > 0
         )
         if has_data:
             continue
