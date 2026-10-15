@@ -240,6 +240,16 @@ class TransitSystem(ORMBase):
     # system's fetches aren't coordinated with anyone else's - true for
     # every system with its own dedicated source/key.
     quota_group: Mapped[Optional[str]]
+    # This system's 511.org operator code (e.g. "SF", "AC", "CT" - see
+    # IRL-7's findings), when it's fed by the combined agency=RG regional
+    # fetch instead of its own direct realtime_url/alerts_url request - see
+    # src/services/regional_feed.py. None (the default) means this system
+    # isn't regional-fed: realtime_url/alerts_url stay its own direct
+    # fetch, same as before this column existed (every system today, and
+    # any future one with its own dedicated source/key - e.g. BART, which
+    # 511.org also lists but which already has its own standalone feed and
+    # is deliberately NOT being migrated to this - see IRL-7).
+    realtime_feed_agency_code: Mapped[Optional[str]]
     __table_args__ = (UniqueConstraint("name", name="uq_name"),)
 
 
