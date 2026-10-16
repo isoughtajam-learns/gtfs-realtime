@@ -30,6 +30,7 @@ class ScheduleCache:
     _short_names_by_route: Dict[str, Dict[str, str]] = {}
     _long_names_by_trip: Dict[str, Dict[str, str]] = {}
     _long_names_by_route: Dict[str, Dict[str, str]] = {}
+    _route_id_by_trip: Dict[str, Dict[str, str]] = {}
     _loaded_at: Dict[str, datetime] = {}
     _locks: Dict[str, asyncio.Lock] = {}
 
@@ -43,6 +44,7 @@ class ScheduleCache:
         Dict[str, Tuple[str, str]],
         Dict[str, Tuple[str, str]],
         Dict[str, Tuple[str, str]],
+        Dict[str, str],
         Dict[str, str],
         Dict[str, str],
         Dict[str, str],
@@ -64,6 +66,7 @@ class ScheduleCache:
             cls._short_names_by_route.get(transit_system, {}),
             cls._long_names_by_trip.get(transit_system, {}),
             cls._long_names_by_route.get(transit_system, {}),
+            cls._route_id_by_trip.get(transit_system, {}),
         )
 
     @classmethod
@@ -88,6 +91,7 @@ class ScheduleCache:
                 cls._short_names_by_route[transit_system] = {}
                 cls._long_names_by_trip[transit_system] = {}
                 cls._long_names_by_route[transit_system] = {}
+                cls._route_id_by_trip[transit_system] = {}
                 cls._loaded_at[transit_system] = datetime.utcnow()
                 return
             trip_rows = conn.execute(
@@ -179,5 +183,6 @@ class ScheduleCache:
         cls._short_names_by_route[transit_system] = short_names_by_route
         cls._long_names_by_trip[transit_system] = long_names_by_trip
         cls._long_names_by_route[transit_system] = long_names_by_route
+        cls._route_id_by_trip[transit_system] = route_id_by_trip
         cls._stops[transit_system] = {row.stop_id: row.name for row in stop_rows}
         cls._loaded_at[transit_system] = datetime.utcnow()

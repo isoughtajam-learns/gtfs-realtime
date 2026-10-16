@@ -298,6 +298,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             short_names_by_route,
             long_names_by_trip,
             long_names_by_route,
+            route_id_by_trip,
         ) = await ScheduleCache.get(transit_system)
         try:
             # Every connected client runs this same 30s loop independently -
@@ -336,7 +337,23 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                 # was never in Schedule data, so falling back there would
                 # just look up the wrong key.
                 trip_id = _entity_trip_id(entity)
-                route_id = trip_descriptor.route_id
+                # Trip-then-route fallback, same reasoning as route_short_name/
+                # route_long_name below - a source that leaves the live
+                # entity's own route_id blank (confirmed live: BART) still
+                # resolves to the trip's real route_id via stored Schedule
+                # data instead of surfacing "" to clients comparing
+                # route_short_name against it (see TripPosition.route_id).
+                route_id = trip_descriptor.route_id or route_id_by_trip.get(
+                    trip_descriptor.trip_id
+                )
+                # The dict lookups below need a plain str key (a protobuf
+                # string field, like trip_descriptor.route_id, is never None
+                # - only route_id_by_trip's fallback can be), so this
+                # preserves that for the lookups while route_id itself stays
+                # Optional for TripPosition.route_id above. "" is a safe
+                # placeholder: no route ever has it as a real route_id, so a
+                # miss here behaves exactly like the old no-fallback lookup.
+                route_id_for_lookup = route_id or ""
                 direction_id = (
                     trip_descriptor.direction_id
                     if trip_descriptor.HasField("direction_id")
@@ -357,12 +374,12 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                 )
                 headsign = (
                     trip_headsigns.get(trip_descriptor.trip_id)
-                    or headsigns_by_route_dir.get((route_id, direction_id))
+                    or headsigns_by_route_dir.get((route_id_for_lookup, direction_id))
                     or destination_headsign
                 )
                 colors = (
                     colors_by_trip.get(trip_descriptor.trip_id)
-                    or colors_by_route.get(route_id)
+                    or colors_by_route.get(route_id_for_lookup)
                     or (
                         colors_by_stop.get(destination_stop_id)
                         if destination_stop_id
@@ -376,10 +393,10 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                 # trip_detail()'s identical reasoning for BART).
                 route_short_name = short_names_by_trip.get(
                     trip_descriptor.trip_id
-                ) or short_names_by_route.get(route_id)
+                ) or short_names_by_route.get(route_id_for_lookup)
                 route_long_name = long_names_by_trip.get(
                     trip_descriptor.trip_id
-                ) or long_names_by_route.get(route_id)
+                ) or long_names_by_route.get(route_id_for_lookup)
                 # trip_update.timestamp ("last measured" time for this
                 # vehicle) is the ranking key RecentEventsCache uses to keep
                 # its most-recently-updated 50 - not every source sets it
@@ -397,6 +414,7 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     next=position.next,
                     status=position.status,
                     trip_headsign=headsign,
+                    route_id=route_id,
                     route_short_name=route_short_name,
                     route_long_name=route_long_name,
                     stop_name=stop_names.get(position.stop_id),
