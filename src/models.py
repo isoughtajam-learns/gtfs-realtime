@@ -24,6 +24,16 @@ class SimplePosition(BaseModel):
 class TripPosition(SimplePosition):
     trip_id: str
     trip_headsign: Optional[str] = None
+    # The raw GTFS route_id this trip belongs to - not shown directly, but
+    # needed client-side to tell whether route_short_name is a genuine
+    # rider-facing route identifier (route_short_name == route_id, e.g. AC
+    # Transit's "72") or an internal grouping code that doesn't match any
+    # route_id (BART's "Yellow-N" vs route_id "2") - see IRL-13/IRL-22.
+    # Trip-then-route fallback already applied server-side (see main.py),
+    # same as route_short_name/route_long_name below, so a source that
+    # leaves the live entity's own route_id blank (confirmed live: BART)
+    # still gets the correct value here.
+    route_id: Optional[str] = None
     # Real-world signage/colloquial route naming (e.g. SF Muni's "2", "48",
     # "14R") - distinct from trip_headsign, which is a destination
     # description, not a line identifier. Confirmed live: SF-MTA's own
