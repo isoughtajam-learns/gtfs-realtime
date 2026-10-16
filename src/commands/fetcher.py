@@ -311,7 +311,6 @@ class Fetcher:
         path = self.tmp_file(ROUTES_FILE)
         if not os.path.isfile(path):
             return {"present": False}
-        default_schedule_url = self._default_schedule_url()
         total = 0
         usable = 0
         missing_counts: dict[str, int] = defaultdict(int)
@@ -319,14 +318,9 @@ class Fetcher:
             reader = csv.DictReader(f)
             for row in reader:
                 total += 1
-                url = resolve_route_url(row.get("route_url"), default_schedule_url)
                 missing = missing_route_fields(
                     row.get("route_id"),
                     row.get("route_short_name"),
-                    row.get("route_long_name"),
-                    url,
-                    row.get("route_color"),
-                    row.get("route_text_color"),
                 )
                 if missing:
                     for field in missing:
@@ -643,13 +637,19 @@ class Fetcher:
             for row in reader:
                 route_id = row.get("route_id")
                 short_name = row.get("route_short_name")
-                long_name = row.get("route_long_name")
-                url = resolve_route_url(row.get("route_url"), default_schedule_url)
-                color = row.get("route_color")
-                text_color = row.get("route_text_color")
-                if missing_route_fields(
-                    route_id, short_name, long_name, url, color, text_color
-                ):
+                # `or None` normalizes a blank-but-present CSV column to the
+                # same None a wholly-absent column already produces (via
+                # dict.get) - callers like the frontend's `?? fallback`
+                # checks treat "" as a present value, not a missing one, so
+                # a stored "" would silently skip the intended fallback.
+                long_name = row.get("route_long_name") or None
+                url = (
+                    resolve_route_url(row.get("route_url"), default_schedule_url)
+                    or None
+                )
+                color = row.get("route_color") or None
+                text_color = row.get("route_text_color") or None
+                if missing_route_fields(route_id, short_name):
                     continue
                 routes.append(
                     {

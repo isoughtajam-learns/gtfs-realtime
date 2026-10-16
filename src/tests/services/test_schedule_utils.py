@@ -117,24 +117,27 @@ def test_parse_optional_float_blank_or_malformed_is_none() -> None:
 
 
 def test_missing_route_fields_empty_when_all_present() -> None:
-    assert (
-        missing_route_fields("R1", "1", "First Ave", "https://x", "FF0000", "FFFFFF")
-        == []
-    )
+    assert missing_route_fields("R1", "1") == []
 
 
 def test_missing_route_fields_reports_each_missing_field() -> None:
-    missing = missing_route_fields("R1", None, "First Ave", "https://x", None, "FFFFFF")
-    assert missing == ["route_short_name", "route_color"]
+    missing = missing_route_fields(None, None)
+    assert missing == ["route_id", "route_short_name"]
 
 
-def test_missing_route_fields_hsl_style_all_colors_missing() -> None:
-    """Real-world case: HSL's routes.txt has no route_color/route_text_color
-    columns at all, so every route is missing both."""
-    missing = missing_route_fields(
-        "1001", "1", "Eira - Lasipalatsi", "https://x", None, None
-    )
-    assert missing == ["route_color", "route_text_color"]
+def test_missing_route_fields_samtrans_style_missing_colors_still_usable() -> None:
+    """Real-world case: SamTrans's routes.txt has no route_color/
+    route_text_color columns at all - every route used to be dropped
+    entirely (0/75 usable) because those were wrongly treated as
+    required; they're cosmetic-optional per the GTFS spec."""
+    assert missing_route_fields("1001", "122") == []
+
+
+def test_missing_route_fields_caltrain_style_missing_long_name_still_usable() -> None:
+    """Real-world case: Caltrain only sets route_long_name on 1 of its 5
+    routes - route_short_name alone (e.g. "Local") is enough per the GTFS
+    spec, which only requires one of the short/long name pair."""
+    assert missing_route_fields("ct_local", "Local") == []
 
 
 def test_missing_stop_fields_empty_when_all_present() -> None:

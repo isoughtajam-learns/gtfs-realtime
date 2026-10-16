@@ -263,10 +263,17 @@ class Route(ORMBase):
     # kept as-is (not the source of the bug this comment is about), even
     # though `id` alone already uniquely identifies every row.
     short_name: Mapped[str] = mapped_column(primary_key=True, autoincrement=False)
-    long_name: Mapped[str]
-    url: Mapped[str]
-    color: Mapped[str]
-    text_color: Mapped[str]
+    # All four Optional per the GTFS spec - route_short_name/route_long_name
+    # only require *one* of the pair (short_name carries that requirement by
+    # staying non-nullable; long_name doesn't need to), and route_color/
+    # route_text_color/route_url are purely cosmetic. Confirmed live: making
+    # these required dropped every one of SamTrans's 75 routes (no colors in
+    # its routes.txt) and 4 of Caltrain's 5 (no long_name) - see
+    # missing_route_fields().
+    long_name: Mapped[Optional[str]]
+    url: Mapped[Optional[str]]
+    color: Mapped[Optional[str]]
+    text_color: Mapped[Optional[str]]
     # GTFS numeric mode enum (0=tram, 1=subway, 2=rail, 3=bus, 4=ferry, ...) -
     # optional here for the same reason zone_id is: not every field we'd
     # like to show needs to gate whether a route is usable at all.
