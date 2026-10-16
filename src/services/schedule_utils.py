@@ -143,24 +143,21 @@ def parse_optional_float(raw: Optional[str]) -> Optional[float]:
 def missing_route_fields(
     route_id: Optional[str],
     short_name: Optional[str],
-    long_name: Optional[str],
-    url: Optional[str],
-    color: Optional[str],
-    text_color: Optional[str],
 ) -> List[str]:
     """
-    Every field here is optional per the GTFS spec, but our `route` table
-    requires all of them - a row missing any one is dropped rather than
-    inserted with a blank column. Returns the GTFS field names that are
-    empty/missing; an empty list means the row is usable as-is.
+    route_id and route_short_name are the only fields a route row actually
+    needs to be usable: route_id for identity/joins, and short_name because
+    it's part of our table's primary key. long_name/url/color/text_color are
+    all genuinely optional per the GTFS spec - requiring them used to drop
+    every usable route from a source that simply doesn't populate one of
+    them (confirmed live: SamTrans has no route_color/route_text_color at
+    all - 0/75 routes usable; Caltrain only sets route_long_name on 1 of its
+    5 routes). Returns the GTFS field names that are empty/missing; an empty
+    list means the row is usable as-is.
     """
     candidates = {
         "route_id": route_id,
         "route_short_name": short_name,
-        "route_long_name": long_name,
-        "route_url": url,
-        "route_color": color,
-        "route_text_color": text_color,
     }
     return [name for name, value in candidates.items() if not value]
 

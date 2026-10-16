@@ -96,8 +96,9 @@ def db_engine(
 # lives for the whole pytest session, every test after the first hit a real
 # collision, not a flaky one. `default_schedule_url` is set to a real value
 # (not None) so Route tests exercise the normal case - a route with no own
-# route_url falling back to the system's default - rather than every row
-# being silently dropped by missing_route_fields() because both were None.
+# route_url falling back to the system's default - instead of every row
+# ending up with url=None (harmless either way now that missing_route_fields()
+# doesn't require url at all, but this keeps the fallback path covered).
 @pytest.fixture(scope="session")  # type: ignore[misc]
 def transit_system_id(db_engine: Engine) -> int:
     with db_engine.begin() as conn:
@@ -119,11 +120,10 @@ def transit_system_id(db_engine: Engine) -> int:
 
 # Runs after every test (autouse - no test needs to opt in or remember to
 # call this itself). Deletes only the rows a test could have created under
-# the shared transit_system_id above, scoped by that column everywhere
-# except Route.short_name (deliberately a *global* unique column - see
-# models.Route - but every row this suite writes still has the shared
-# transit_system_id, so filtering by it is still correct here). Leaves the
-# TransitSystem row itself alone so it doesn't need recreating every test.
+# the shared transit_system_id above, scoped by that column (Route.short_name
+# is unique per transit_system_id, not globally - see models.Route - so
+# filtering by transit_system_id is correct here). Leaves the TransitSystem
+# row itself alone so it doesn't need recreating every test.
 @pytest.fixture(autouse=True)  # type: ignore[misc]
 def _clean_schedule_tables(
     db_engine: Engine, transit_system_id: int
@@ -147,10 +147,8 @@ def _clean_schedule_tables(
 # untyped, so stubbing a method this way needs no type: ignore comments.
 # default_schedule_url is always stubbed too (harmless for file types that
 # don't call it) so routes.txt tests exercise the normal "falls back to the
-# system's default" path instead of every row being dropped by
-# missing_route_fields() because both route_url and default were None - see
-# Fetcher._default_schedule_url(), which otherwise queries the real app
-# database, not this test's isolated one.
+# system's default" path for route_url - see Fetcher._default_schedule_url(),
+# which otherwise queries the real app database, not this test's isolated one.
 @pytest.fixture  # type: ignore[misc]
 def make_fetcher(
     tmp_path: Path,

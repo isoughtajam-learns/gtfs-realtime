@@ -110,8 +110,17 @@ class ScheduleCache:
                 ).where(Route.transit_system_id == ts_id)
             ).all()
 
+        # Filtered on truthiness like short_names_by_route/long_names_by_route
+        # below - a route can now have color=text_color=None (see
+        # missing_route_fields(), no longer required per the GTFS spec), and
+        # an unfiltered (None, None) entry here would be truthy, short-
+        # circuiting main.py's `colors_by_trip.get(...) or
+        # colors_by_route.get(...) or colors_by_stop...` fallback chain
+        # before it ever reaches the colors_by_stop fallback.
         colors_by_route: Dict[str, Tuple[str, str]] = {
-            row.route_id: (row.color, row.text_color) for row in route_rows
+            row.route_id: (row.color, row.text_color)
+            for row in route_rows
+            if row.color and row.text_color
         }
         # route_short_name/route_long_name are real-world signage/colloquial
         # route naming (e.g. SF Muni's "L" short_name + "TARAVAL" long_name,
