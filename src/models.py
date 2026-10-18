@@ -434,3 +434,46 @@ class Transfer(ORMBase):
             "transit_system_id", "from_stop_id", "to_stop_id", name="uq_transfer"
         ),
     )
+
+
+class StopArea(ORMBase):
+    """Regional (MTC-curated) station-complex groupings, from the combined
+    511.org operator_id=RG schedule's stop_areas.txt - IRL-21/IRL-12's
+    investigation into whether the regional feed's transfer-adjacent data is
+    more useful than each individual feed's own transfers.txt.
+
+    Confirmed live: the regional transfers.txt itself is NOT an upgrade -
+    only 53 rows system-wide, and BART's own transfers.txt alone already
+    contains 40 of those same rows verbatim (just with agency-prefixed
+    route_ids) - zero genuine cross-agency transfer rows. transfers.txt
+    ingestion (see Transfer/upsert_transfers()) is unchanged by this.
+
+    stop_areas.txt is different: a real subset of its area_id groupings are
+    genuine multi-agency station complexes no individual feed could ever
+    represent (e.g. "mtc:powell" groups BART's Powell St platform stop_ids
+    with SF-MTA's nearby Muni stop_ids). But the file conflates this with
+    GTFS Fare-V2 fare-zone definitions re-using the same area_id/stop_id
+    shape (this feed also publishes fare_leg_rules.txt/fare_products.txt) -
+    confirmed live: area_ids like "AC:local" (4,675 stops), "SC:not-SJC"
+    (3,301), "ST:solano", "SO:zone:1"-"7", "GG:San Francisco", and a literal
+    "any" catch-all (21,632 stops) are fare zones spanning an entire
+    operator's service area, not walkable interchanges. Every real station
+    complex found was "mtc:"-prefixed and small (single digits of member
+    stops); every fare zone used some other prefix (or none) and was large.
+    See upsert_stop_areas() for the exact filter.
+
+    Deliberately NOT scoped to a transit_system_id (unlike every other table
+    here) - an area's whole value is spanning multiple agencies' own
+    stop_id namespaces at once. stop_id is stored exactly as the regional
+    feed gives it; matching it to a specific system's own Stop row (they
+    share the same raw stop_id values - confirmed live against BART's own
+    stops.txt) is left to the caller.
+    """
+
+    __tablename__ = "stop_area"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    area_id: Mapped[str]
+    stop_id: Mapped[str]
+
+    __table_args__ = (UniqueConstraint("area_id", "stop_id", name="uq_stop_area"),)

@@ -4,6 +4,12 @@ from sqlalchemy import select, func
 
 from src.database import engine
 from src.commands.fetcher import Fetcher
+from src.commands.regional_stop_areas import (
+    download_regional_schedule_zip,
+    filter_real_station_complexes,
+    parse_stop_areas,
+    upsert_stop_areas,
+)
 from src.models import TransitSystem, Trip, Stop, Route
 from src.services.transit_system_detail import get_active_transit_systems
 from src.settings import get_settings
@@ -26,6 +32,13 @@ app.conf.beat_schedule = {
         # attempt is a cheap no-op once TransitSystem.last_fetched_at is set
         # for today (see Fetcher.fetched_today), so frequent runs are safe.
         "schedule": crontab(minute="*/15"),
+    },
+    "fetch-regional-stop-areas-daily": {
+        "task": "src.tasks.fetch_regional_stop_areas",
+        # MTC's station-complex groupings (IRL-21/IRL-12) are curated
+        # reference data, not a live feed - daily is already far more often
+        # than it could plausibly change.
+        "schedule": crontab(minute=30, hour=3),
     },
 }
 app.conf.timezone = "UTC"  # type: ignore[misc,assignment]  # celery-types wrongly requires tzinfo; celery accepts a zone name string
@@ -118,3 +131,24 @@ def ensure_schedule_data() -> None:
             fetcher.fetch_metadata_update(force=True)
         except Exception as e:
             print(f"Error fetching for {name}: {e}")
+
+
+@app.task
+def fetch_regional_stop_areas() -> None:
+    """Ingests MTC's curated multi-agency station-complex groupings from
+    the regional (511.org operator_id=RG) schedule download's
+    stop_areas.txt - see models.StopArea's docstring for what this is and
+    why it's a separate, additive ingestion from each system's own
+    transfers.txt (unaffected by this)."""
+    api_key = get_settings().api_key_511_org
+    if not api_key:
+        print("API_KEY_511_ORG is not set - skipping regional stop_areas fetch")
+        return
+    try:
+        zip_bytes = download_regional_schedule_zip(api_key)
+        rows = filter_real_station_complexes(parse_stop_areas(zip_bytes))
+        with engine.begin() as connection:
+            total = upsert_stop_areas(connection, rows)
+        print(f"upsert stop_areas result: {total} rows")
+    except Exception as e:
+        print(f"Error fetching regional stop_areas: {e}")
