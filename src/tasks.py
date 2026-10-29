@@ -7,7 +7,10 @@ from src.commands.fetcher import Fetcher
 from src.commands.regional_stop_areas import (
     download_regional_schedule_zip,
     filter_real_station_complexes,
+    match_regional_stops,
     parse_stop_areas,
+    parse_stop_coordinates,
+    upsert_regional_stop_matches,
     upsert_stop_areas,
 )
 from src.models import TransitSystem, Trip, Stop, Route
@@ -139,7 +142,10 @@ def fetch_regional_stop_areas() -> None:
     the regional (511.org operator_id=RG) schedule download's
     stop_areas.txt - see models.StopArea's docstring for what this is and
     why it's a separate, additive ingestion from each system's own
-    transfers.txt (unaffected by this)."""
+    transfers.txt (unaffected by this). Also refreshes RegionalStopMatch,
+    the lat/lng crosswalk IRL-25 added for systems (today: just BART) whose
+    own stop_ids don't appear verbatim in this feed - reuses the same
+    downloaded zip rather than a second request."""
     api_key = get_settings().api_key_511_org
     if not api_key:
         print("API_KEY_511_ORG is not set - skipping regional stop_areas fetch")
@@ -150,5 +156,12 @@ def fetch_regional_stop_areas() -> None:
         with engine.begin() as connection:
             total = upsert_stop_areas(connection, rows)
         print(f"upsert stop_areas result: {total} rows")
+
+        member_stop_ids = {row["stop_id"] for row in rows}
+        coords = parse_stop_coordinates(zip_bytes, member_stop_ids)
+        with engine.begin() as connection:
+            match_rows = match_regional_stops(connection, coords)
+            match_total = upsert_regional_stop_matches(connection, match_rows)
+        print(f"upsert regional_stop_match result: {match_total} rows")
     except Exception as e:
         print(f"Error fetching regional stop_areas: {e}")

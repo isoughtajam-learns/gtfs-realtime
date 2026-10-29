@@ -29,6 +29,7 @@ from src.models import (
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
+from src.services.transfer_cache import TransferCache
 
 
 @pytest.fixture(autouse=True)  # type: ignore[misc]
@@ -50,6 +51,21 @@ def _clear_recent_events_cache() -> Generator[None, None, None]:
     RecentEventsCache._events.clear()
     RealtimeFeedCache._feed.clear()
     RealtimeFeedCache._fetched_at.clear()
+
+
+@pytest.fixture(autouse=True)  # type: ignore[misc]
+def _stub_transfer_lookups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[None, None, None]:
+    # Phase 3 transfers (see .claude/plans/development.md) - transit_feed()/
+    # trip_detail() both now call these; stubbed to harmless empty defaults
+    # here so every test in this file reaches the code paths it actually
+    # tests without separately wiring up Transfer/StopArea fixtures -
+    # transfer behavior itself is covered by
+    # src/tests/services/test_transfers.py and test_transfer_cache.py.
+    monkeypatch.setattr(TransferCache, "get", AsyncMock(return_value=({}, {}, {}, {})))
+    monkeypatch.setattr("src.main.get_transfers_for_stops", lambda *a, **k: {})
+    yield
 
 
 async def _first_event(transit_system: str) -> ServerSentEvent:
@@ -244,7 +260,7 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
@@ -280,6 +296,7 @@ def test_transit_feed_resolves_route_short_name_from_route_id(
                 {"R1": "2"},
                 {},
                 {"R1": "TARAVAL"},
+                {},
                 {},
             )
         ),
@@ -324,6 +341,7 @@ def test_transit_feed_route_short_name_falls_back_to_trip_level_lookup(
                 {"T1": "TARAVAL"},
                 {},
                 {"T1": "R1"},
+                {},
             )
         ),
     )
@@ -415,7 +433,7 @@ def test_transit_feed_filters_burst_entries_not_in_cached_live_feed(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config", _active_for("PeekFilterSystem")
@@ -479,7 +497,7 @@ def test_transit_feed_populates_recent_events_cache_after_a_poll(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
@@ -554,7 +572,7 @@ def test_transit_feed_falls_back_to_entity_id_for_blank_trip_id(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config",

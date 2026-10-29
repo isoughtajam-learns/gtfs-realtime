@@ -12,6 +12,21 @@ class Status(StrEnum):
     AT_STOP = "Stopped 🛑"
 
 
+class IntraSystemTransfer(BaseModel):
+    """One same-system route reachable via a transfer at a given stop (see
+    models.Transfer, src/services/transfers.py) - a small Route summary, not
+    a bare route_id, so the frontend can render a correctly-colored/labeled
+    pill for it without a second round-trip (same color/short_name/long_name
+    shape TripPosition/TripStopDetail already expose for the current trip's
+    own route)."""
+
+    route_id: str
+    route_short_name: Optional[str] = None
+    route_long_name: Optional[str] = None
+    color: Optional[str] = None
+    text_color: Optional[str] = None
+
+
 # BaseModels for transient, runtime data
 class SimplePosition(BaseModel):
     stop_id: str
@@ -52,6 +67,17 @@ class TripPosition(SimplePosition):
     # the per-trip one. Ranking key for RecentEventsCache - see
     # src/services/recent_events_cache.py - not otherwise used/displayed.
     timestamp: Optional[int] = None
+    # Phase 3 transfers (see .claude/plans/development.md): explicit
+    # same-system transfers from this system's own transfers.txt (Transfer
+    # table), excluding this trip's own route_id - see
+    # src/services/schedule_cache.py's intra_transfers_by_stop.
+    intra_system_transfers: list[IntraSystemTransfer] = []
+    # Other transit systems sharing a physical station complex with this
+    # stop_id, per the regional stop_areas.txt data (StopArea table) -
+    # confirmed live this session to correctly group e.g. BART's Powell St
+    # platforms with SF-MTA's nearby Muni stops under "mtc:powell". See
+    # src/services/transfer_cache.py.
+    inter_system_transfer_systems: list[str] = []
 
 
 class TripStopDetail(BaseModel):
@@ -72,6 +98,11 @@ class TripStopDetail(BaseModel):
     departure_time: Optional[int] = None
     departure_delay: Optional[int] = None
     schedule_relationship: str
+    # Phase 3 transfers - see TripPosition's identical fields above for what
+    # these mean; here they're per-stop across the whole remaining trip,
+    # not just the current position.
+    intra_system_transfers: list[IntraSystemTransfer] = []
+    inter_system_transfer_systems: list[str] = []
 
 
 class TripDetail(BaseModel):
@@ -465,9 +496,15 @@ class StopArea(ORMBase):
     Deliberately NOT scoped to a transit_system_id (unlike every other table
     here) - an area's whole value is spanning multiple agencies' own
     stop_id namespaces at once. stop_id is stored exactly as the regional
-    feed gives it; matching it to a specific system's own Stop row (they
-    share the same raw stop_id values - confirmed live against BART's own
-    stops.txt) is left to the caller.
+    feed gives it; matching it to a specific system's own Stop row is left
+    to the caller - true for 8 of 9 active systems (they share the same raw
+    stop_id values with the regional feed), but NOT for BART (IRL-25):
+    the regional feed renumbers BART's stops with its own internal ids
+    (e.g. BART's own "W40-3" at Millbrae is this feed's "906403"), so a
+    literal stop_id match against BART's own Stop rows always misses. See
+    RegionalStopMatch below for the lat/lng-based crosswalk that covers
+    this case, and TransferCache (src/services/transfer_cache.py) for how
+    callers actually use it.
     """
 
     __tablename__ = "stop_area"
@@ -477,3 +514,40 @@ class StopArea(ORMBase):
     stop_id: Mapped[str]
 
     __table_args__ = (UniqueConstraint("area_id", "stop_id", name="uq_stop_area"),)
+
+
+class RegionalStopMatch(ORMBase):
+    """IRL-25: a stop_id crosswalk between a transit system's own native
+    stop_id and the regional (511.org operator_id=RG) feed's stop_id for
+    the same physical stop, for the systems where StopArea's stop_id can't
+    be matched directly (today: just BART - see StopArea's docstring).
+
+    Built by proximity (lat/lng), not name matching - station names could
+    independently drift between a system's own feed and the regional one,
+    while physical coordinates for the same platform won't. Only computed
+    for stop_ids that are actually members of a real station complex (see
+    StopArea/upsert_stop_areas) - there's no reason to crosswalk every stop
+    a system has, just the ones StopArea could plausibly need to resolve.
+    See src/commands/regional_stop_areas.py's match_regional_stops() for
+    the matching itself.
+
+    Supplementary to StopArea, not a replacement: TransferCache first tries
+    a literal stop_id match (as StopArea already assumes), and only falls
+    back to this table when that misses - so this stays empty for every
+    system where direct matching already works.
+    """
+
+    __tablename__ = "regional_stop_match"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
+    stop_id: Mapped[str]
+    regional_stop_id: Mapped[str]
+    # Not used for matching logic (the nearest candidate always wins) - kept
+    # purely so a human can sanity-check a surprising match later without
+    # re-running the whole proximity search.
+    distance_meters: Mapped[float]
+
+    __table_args__ = (
+        UniqueConstraint("transit_system_id", "stop_id", name="uq_regional_stop_match"),
+    )

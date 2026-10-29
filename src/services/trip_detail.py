@@ -8,12 +8,14 @@ hot path across every trip in a system), these are single-trip, on-demand
 lookups - plain per-request queries, not cached.
 """
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import select
 
 from src.database import engine
 from src.models import Route, Stop, StopTime, TransitSystem, Trip
+from src.services.transfer_cache import resolve_inter_system_transfers
+from src.services.transfers import query_intra_transfers
 
 
 def get_trip_schedule_context(
@@ -119,6 +121,51 @@ def get_trip_schedule_context(
             }
 
         return {"trip": trip, "route": route, "stops": stops}
+
+
+def get_transfers_for_stops(
+    transit_system: str,
+    stop_ids: List[str],
+    area_ids_by_stop: Dict[str, List[str]],
+    members_by_area: Dict[str, List[str]],
+    systems_by_stop: Dict[str, Set[str]],
+    regional_id_by_native_stop: Dict[Tuple[str, str], str],
+) -> Dict[str, Dict[str, Any]]:
+    """Phase 3 transfers (see .claude/plans/development.md) for every stop
+    in one trip, batched (one query for all of stop_ids, not one per stop).
+    Stays a plain sync function, called via asyncio.to_thread like every
+    other lookup in this file - the inter-system args are what
+    TransferCache.get() already produced for this request (awaited once in
+    main.py's trip_detail(), not re-fetched per stop), so this function
+    itself never needs to be async.
+
+    Returns {stop_id: {"intra": [IntraSystemTransfer, ...], "inter": [system
+    name, ...]}} for every stop_id passed in, even one with nothing to show
+    (empty lists) - callers always index this dict unconditionally."""
+    with engine.begin() as connection:
+        transit_system_id = connection.execute(
+            select(TransitSystem.id).where(TransitSystem.name == transit_system)
+        ).scalar()
+        intra_by_stop = (
+            query_intra_transfers(connection, transit_system_id, stop_ids)
+            if transit_system_id is not None
+            else {}
+        )
+
+    return {
+        stop_id: {
+            "intra": intra_by_stop.get(stop_id, []),
+            "inter": resolve_inter_system_transfers(
+                transit_system,
+                stop_id,
+                area_ids_by_stop,
+                members_by_area,
+                systems_by_stop,
+                regional_id_by_native_stop,
+            ),
+        }
+        for stop_id in stop_ids
+    }
 
 
 def _tail_stops_after_anchor(
