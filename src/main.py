@@ -14,6 +14,7 @@ from starlette import status
 
 from generated import gtfs_realtime_pb2
 from src.models import (
+    IntraSystemTransfer,
     ServiceAlert,
     TransitSystemDetail,
     TripDetail,
@@ -39,6 +40,7 @@ from src.services.service_alerts import (
     get_alert_hydration_data,
 )
 from src.services.shared_feed_quota import QUOTA_GROUP_LIMITS
+from src.services.transfer_cache import TransferCache, resolve_inter_system_transfers
 from src.services.transit_system_detail import (
     get_active_quota_groups,
     get_active_transit_systems,
@@ -46,7 +48,11 @@ from src.services.transit_system_detail import (
     get_regional_feed_members,
     get_transit_system_config,
 )
-from src.services.trip_detail import get_scheduled_tail_stops, get_trip_schedule_context
+from src.services.trip_detail import (
+    get_scheduled_tail_stops,
+    get_transfers_for_stops,
+    get_trip_schedule_context,
+)
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
 
@@ -299,7 +305,14 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             long_names_by_trip,
             long_names_by_route,
             route_id_by_trip,
+            intra_transfers_by_stop,
         ) = await ScheduleCache.get(transit_system)
+        (
+            area_ids_by_stop,
+            members_by_area,
+            systems_by_stop,
+            regional_id_by_native_stop,
+        ) = await TransferCache.get()
         try:
             # Every connected client runs this same 30s loop independently -
             # without RealtimeFeedCache, N clients would mean N times the
@@ -407,6 +420,26 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     if entity.trip_update.HasField("timestamp")
                     else feed.header.timestamp
                 )
+                # Phase 3 transfers (see .claude/plans/development.md) - same-
+                # system routes reachable from here, excluding this trip's own
+                # route (transferring to the route you're already on isn't
+                # useful info), and other transit systems sharing this stop's
+                # physical station complex. Both precomputed (ScheduleCache/
+                # TransferCache above), so this is pure in-memory lookup, not
+                # a query per entity.
+                intra_system_transfers = [
+                    transfer
+                    for transfer in intra_transfers_by_stop.get(position.stop_id, [])
+                    if transfer.route_id != route_id
+                ]
+                inter_system_transfer_systems = resolve_inter_system_transfers(
+                    transit_system,
+                    position.stop_id,
+                    area_ids_by_stop,
+                    members_by_area,
+                    systems_by_stop,
+                    regional_id_by_native_stop,
+                )
                 trip_position = TripPosition(
                     trip_id=trip_id,
                     stop_id=position.stop_id,
@@ -421,6 +454,8 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
                     color=color,
                     text_color=text_color,
                     timestamp=timestamp,
+                    intra_system_transfers=intra_system_transfers,
+                    inter_system_transfer_systems=inter_system_transfer_systems,
                 )
                 positions_this_poll.append(trip_position)
                 yield ServerSentEvent(
@@ -523,6 +558,33 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
     route_schedule = context["route"] or {}
     stops_schedule = context["stops"]
 
+    # Phase 3 transfers (see .claude/plans/development.md) - same shape as
+    # transit_feed()'s per-entity lookup, but batched across every stop on
+    # this trip in one call rather than one per stop_id.
+    (
+        area_ids_by_stop,
+        members_by_area,
+        systems_by_stop,
+        regional_id_by_native_stop,
+    ) = await TransferCache.get()
+    this_trip_route_id = trip_descriptor.route_id or trip_schedule.get("route_id")
+    transfers_by_stop = await asyncio.to_thread(
+        get_transfers_for_stops,
+        transit_system,
+        live_stop_ids + tail_stop_ids,
+        area_ids_by_stop,
+        members_by_area,
+        systems_by_stop,
+        regional_id_by_native_stop,
+    )
+
+    def _intra_transfers(stop_id: str) -> list[IntraSystemTransfer]:
+        return [
+            transfer
+            for transfer in transfers_by_stop.get(stop_id, {}).get("intra", [])
+            if transfer.route_id != this_trip_route_id
+        ]
+
     stops = [
         TripStopDetail(
             stop_sequence=(
@@ -560,6 +622,10 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
             schedule_relationship=gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.ScheduleRelationship.Name(
                 stu.schedule_relationship
             ),
+            intra_system_transfers=_intra_transfers(stu.stop_id),
+            inter_system_transfer_systems=transfers_by_stop.get(stu.stop_id, {}).get(
+                "inter", []
+            ),
         )
         for stu in trip_update.stop_time_update
     ]
@@ -580,6 +646,10 @@ async def trip_detail(transit_system: str, trip_id: str) -> TripDetail:
             departure_time=None,
             departure_delay=None,
             schedule_relationship="NO_DATA",
+            intra_system_transfers=_intra_transfers(stop_id),
+            inter_system_transfer_systems=transfers_by_stop.get(stop_id, {}).get(
+                "inter", []
+            ),
         )
         for sequence, stop_id in tail_stops
     )

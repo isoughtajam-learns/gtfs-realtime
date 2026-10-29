@@ -51,6 +51,13 @@ services:
     command: watchmedo auto-restart --directory=/app --pattern=*.py --recursive -- celery -A src.tasks worker --loglevel=info
     env_file:
       - .env.dev_docker
+    environment:
+      # Same passthrough as backend above, for the same reason: without
+      # this, fetch_regional_stop_areas (which actually runs here, not in
+      # celery-beat - beat only schedules it) silently no-ops every time
+      # it fires, logging "API_KEY_511_ORG is not set - skipping" instead
+      # of populating stop_area.
+      - API_KEY_511_ORG
     depends_on:
       - db
       - redis

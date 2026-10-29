@@ -5,6 +5,11 @@ IRL-21/IRL-12's investigation into whether the regional feed's
 transfer-adjacent data is more useful than each individual feed's own
 transfers.txt (see models.StopArea's docstring for the full finding).
 
+Also builds RegionalStopMatch, a lat/lng-based crosswalk for the systems
+(today: just BART - IRL-25) whose own stop_ids don't appear verbatim in
+this feed, so StopArea membership alone can't resolve them. See
+match_regional_stops() and models.RegionalStopMatch's docstring.
+
 transfers.txt itself is untouched by this - that's still each system's own
 Fetcher.upsert_transfers(). This is a separate, additive ingestion for data
 that only exists in the combined regional feed.
@@ -17,16 +22,17 @@ import argparse
 import csv
 import io
 import logging
+import math
 import zipfile
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
-from sqlalchemy import Connection
+from sqlalchemy import Connection, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database import engine
-from src.models import StopArea
+from src.models import RegionalStopMatch, Stop, StopArea, TransitSystem
 from src.services.schedule_utils import dedupe_rows_by_columns
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
@@ -35,7 +41,15 @@ logger = logging.getLogger(__name__)
 
 DATAFEEDS_URL = "http://api.511.org/transit/datafeeds"
 STOP_AREAS_FILE = "stop_areas.txt"
+STOPS_FILE = "stops.txt"
 UPSERT_BATCH_SIZE = 2000
+EARTH_RADIUS_METERS = 6_371_000.0
+# Generous enough to cover a real station's multiple platforms/entrances
+# (confirmed live: BART's own Millbrae platform and the regional feed's
+# representation of it are well under this), narrow enough that it
+# shouldn't accidentally match a genuinely different, merely nearby stop -
+# see models.RegionalStopMatch's docstring and IRL-25.
+MAX_MATCH_DISTANCE_METERS = 150.0
 
 # Confirmed live: every real multi-agency station complex found (e.g.
 # "mtc:powell", "mtc:daly-city-bart") uses this prefix and groups a handful
@@ -112,6 +126,113 @@ def upsert_stop_areas(connection: Connection, rows: List[Dict[str, Any]]) -> int
     return total
 
 
+def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lng points, in meters."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    )
+    return 2 * EARTH_RADIUS_METERS * math.asin(math.sqrt(a))
+
+
+def parse_stop_coordinates(
+    zip_bytes: bytes, stop_ids: Set[str]
+) -> Dict[str, Tuple[float, float]]:
+    """regional stop_id -> (lat, lon), scoped to just the given stop_ids -
+    station-complex members (see match_regional_stops), not every stop in
+    the whole region. That's the only set a crosswalk could ever need to
+    resolve, and the regional feed's stops.txt has tens of thousands of
+    rows total."""
+    coords: Dict[str, Tuple[float, float]] = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        with z.open(STOPS_FILE) as raw:
+            reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig"))
+            for row in reader:
+                stop_id = row.get("stop_id")
+                if stop_id not in stop_ids:
+                    continue
+                lat, lon = row.get("stop_lat"), row.get("stop_lon")
+                if lat and lon:
+                    coords[stop_id] = (float(lat), float(lon))
+    return coords
+
+
+def match_regional_stops(
+    connection: Connection, regional_stop_coords: Dict[str, Tuple[float, float]]
+) -> List[Dict[str, Any]]:
+    """For every regional stop_id in regional_stop_coords that doesn't
+    already match an active system's own native stop_id verbatim (the
+    normal StopArea/TransferCache path - true for 8 of 9 active systems,
+    see models.RegionalStopMatch's docstring), find the nearest native stop
+    across every active system within MAX_MATCH_DISTANCE_METERS and return
+    it as a RegionalStopMatch row ready for upsert_regional_stop_matches().
+    O(members x native stops) - fine at today's scale (a few hundred
+    station-complex members, a few thousand native stops total), not
+    something to run against the full regional feed."""
+    native_stops = connection.execute(
+        select(Stop.transit_system_id, Stop.stop_id, Stop.lat, Stop.lon)
+        .select_from(Stop)
+        .join(TransitSystem, TransitSystem.id == Stop.transit_system_id)
+        .where(
+            TransitSystem.active.is_(True),
+            Stop.lat.is_not(None),
+            Stop.lon.is_not(None),
+        )
+    ).all()
+    native_stop_ids = {row.stop_id for row in native_stops}
+
+    rows: List[Dict[str, Any]] = []
+    for regional_stop_id, (lat, lon) in regional_stop_coords.items():
+        if regional_stop_id in native_stop_ids:
+            continue
+        best: Optional[Tuple[int, str, float]] = None
+        for native in native_stops:
+            distance = _haversine_meters(lat, lon, native.lat, native.lon)
+            if distance > MAX_MATCH_DISTANCE_METERS:
+                continue
+            if best is None or distance < best[2]:
+                best = (native.transit_system_id, native.stop_id, distance)
+        if best is not None:
+            transit_system_id, stop_id, distance = best
+            rows.append(
+                {
+                    "transit_system_id": transit_system_id,
+                    "stop_id": stop_id,
+                    "regional_stop_id": regional_stop_id,
+                    "distance_meters": distance,
+                }
+            )
+    return rows
+
+
+def upsert_regional_stop_matches(
+    connection: Connection, rows: List[Dict[str, Any]]
+) -> int:
+    """Insert-or-update, unlike upsert_stop_areas: a later run finding a
+    closer/different match (upstream stops.txt or our own Stop data
+    changed) should overwrite a stale one rather than being silently
+    dropped."""
+    if not rows:
+        return 0
+    rows = dedupe_rows_by_columns(rows, ["transit_system_id", "stop_id"])
+    total = 0
+    for start in range(0, len(rows), UPSERT_BATCH_SIZE):
+        batch = rows[start : start + UPSERT_BATCH_SIZE]
+        insert_stmt = pg_insert(RegionalStopMatch).values(batch)
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            constraint="uq_regional_stop_match",
+            set_={
+                "regional_stop_id": insert_stmt.excluded.regional_stop_id,
+                "distance_meters": insert_stmt.excluded.distance_meters,
+            },
+        )
+        total += connection.execute(upsert_stmt).rowcount
+    return total
+
+
 def main() -> None:
     api_key = get_settings().api_key_511_org
     if not api_key:
@@ -131,6 +252,17 @@ def main() -> None:
     with engine.begin() as connection:
         total = upsert_stop_areas(connection, rows)
     logger.info(f"upsert stop_areas result: {total} rows")
+
+    member_stop_ids = {row["stop_id"] for row in rows}
+    coords = parse_stop_coordinates(zip_bytes, member_stop_ids)
+    with engine.begin() as connection:
+        match_rows = match_regional_stops(connection, coords)
+        match_total = upsert_regional_stop_matches(connection, match_rows)
+    logger.info(
+        f"{len(coords)} station-complex members had coordinates, "
+        f"{len(match_rows)} needed a crosswalk match (not a direct stop_id "
+        f"hit), upsert_regional_stop_matches result: {match_total} rows"
+    )
 
 
 if __name__ == "__main__":

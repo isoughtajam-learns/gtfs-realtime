@@ -15,6 +15,7 @@ wheels/
 # Local MCP server config - holds real API keys (e.g. Linear), never commit
 .mcp.json
 .mcp.json.swp
+.playwright-mcp/
 
 # IDE
 .idea/*

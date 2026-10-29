@@ -8,12 +8,13 @@ transit system and refresh on a TTL, since Schedule data updates at most daily.
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 
 from src.database import engine
-from src.models import TransitSystem, Trip, Stop, Route
+from src.models import IntraSystemTransfer, TransitSystem, Trip, Stop, Route
+from src.services.transfers import query_intra_transfers
 
 
 TTL = timedelta(hours=6)
@@ -31,6 +32,11 @@ class ScheduleCache:
     _long_names_by_trip: Dict[str, Dict[str, str]] = {}
     _long_names_by_route: Dict[str, Dict[str, str]] = {}
     _route_id_by_trip: Dict[str, Dict[str, str]] = {}
+    # Phase 3 (see .claude/plans/development.md) - intra-system transfers
+    # reachable from each stop, keyed by stop_id. See
+    # src/services/transfers.py's query_intra_transfers for the query itself
+    # and why it's shared with trip_detail.py's narrower, per-request version.
+    _intra_transfers_by_stop: Dict[str, Dict[str, List[IntraSystemTransfer]]] = {}
     _loaded_at: Dict[str, datetime] = {}
     _locks: Dict[str, asyncio.Lock] = {}
 
@@ -49,6 +55,7 @@ class ScheduleCache:
         Dict[str, str],
         Dict[str, str],
         Dict[str, str],
+        Dict[str, List[IntraSystemTransfer]],
     ]:
         if not cls._is_fresh(transit_system):
             lock = cls._locks.setdefault(transit_system, asyncio.Lock())
@@ -67,6 +74,7 @@ class ScheduleCache:
             cls._long_names_by_trip.get(transit_system, {}),
             cls._long_names_by_route.get(transit_system, {}),
             cls._route_id_by_trip.get(transit_system, {}),
+            cls._intra_transfers_by_stop.get(transit_system, {}),
         )
 
     @classmethod
@@ -92,6 +100,7 @@ class ScheduleCache:
                 cls._long_names_by_trip[transit_system] = {}
                 cls._long_names_by_route[transit_system] = {}
                 cls._route_id_by_trip[transit_system] = {}
+                cls._intra_transfers_by_stop[transit_system] = {}
                 cls._loaded_at[transit_system] = datetime.utcnow()
                 return
             trip_rows = conn.execute(
@@ -113,6 +122,7 @@ class ScheduleCache:
                     Route.long_name,
                 ).where(Route.transit_system_id == ts_id)
             ).all()
+            intra_transfers_by_stop = query_intra_transfers(conn, ts_id)
 
         # Filtered on truthiness like short_names_by_route/long_names_by_route
         # below - a route can now have color=text_color=None (see
@@ -184,5 +194,6 @@ class ScheduleCache:
         cls._long_names_by_trip[transit_system] = long_names_by_trip
         cls._long_names_by_route[transit_system] = long_names_by_route
         cls._route_id_by_trip[transit_system] = route_id_by_trip
+        cls._intra_transfers_by_stop[transit_system] = intra_transfers_by_stop
         cls._stops[transit_system] = {row.stop_id: row.name for row in stop_rows}
         cls._loaded_at[transit_system] = datetime.utcnow()
