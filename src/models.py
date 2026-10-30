@@ -27,6 +27,26 @@ class IntraSystemTransfer(BaseModel):
     text_color: Optional[str] = None
 
 
+class LineSummary(BaseModel):
+    """IRL-26: one row per distinct (route_id, trip_headsign) pair a transit
+    system's trips actually use - response shape for GET /lines/{transit_system},
+    which exists so the frontend's Line filter checklist can show every line
+    the system has, not just whatever's in its live SSE buffer right now.
+
+    Deliberately not just a Route summary: route_short_name/route_long_name
+    alone aren't always what riders see as "the line" - BART's short_name is
+    an internal code never shown (see TripPosition.route_short_name and
+    gtfs-dashboard's routeLineLabel), so its real Line identity is the trip's
+    headsign instead. Shaped identically to the subset of TripPosition fields
+    the frontend's lineLabel() already consumes, so that same client-side
+    formatting logic runs unchanged against this data too."""
+
+    route_id: str
+    route_short_name: Optional[str] = None
+    route_long_name: Optional[str] = None
+    trip_headsign: Optional[str] = None
+
+
 # BaseModels for transient, runtime data
 class SimplePosition(BaseModel):
     stop_id: str

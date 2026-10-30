@@ -13,6 +13,8 @@ from generated import gtfs_realtime_pb2
 from src.main import (
     _entity_trip_id,
     _fetch_feed,
+    get_lines,
+    get_stops,
     get_transit_system_detail,
     get_transit_systems,
     service_alerts,
@@ -1109,3 +1111,119 @@ def test_service_alerts_degrades_gracefully_without_hydration_match(
         AffectedTrip(trip_id="T1", trip_headsign=None, route_id=None)
     ]
     assert alerts[0].affected_routes == []
+
+
+def test_get_lines_404s_for_unknown_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for())
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(get_lines("NotASystem"))
+    assert exc_info.value.status_code == 404
+
+
+def test_get_lines_dedupes_by_route_and_headsign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mirrors BART's own Line identity (see LineSummary's docstring):
+    # route_short_name/route_long_name alone can't distinguish direction,
+    # so two trips on the same route but different headsigns (T1/T2) stay
+    # distinct, while two trips that share both (T1/T3) collapse to one row.
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(
+            return_value=(
+                {"T1": "Richmond", "T2": "Daly City", "T3": "Richmond"},  # trips
+                {},  # stops
+                {},  # headsigns_by_route_dir
+                {},  # colors_by_trip
+                {},  # colors_by_route
+                {},  # colors_by_stop
+                {},  # short_names_by_trip
+                {"R1": "Yellow-N"},  # short_names_by_route
+                {},  # long_names_by_trip
+                {"R1": "Antioch to SFO/Millbrae"},  # long_names_by_route
+                {"T1": "R1", "T2": "R1", "T3": "R1"},  # route_id_by_trip
+                {},  # intra_transfers_by_stop
+            )
+        ),
+    )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    lines = asyncio.run(get_lines("BART"))
+
+    assert sorted((line.route_id, line.trip_headsign) for line in lines) == [
+        ("R1", "Daly City"),
+        ("R1", "Richmond"),
+    ]
+    assert all(line.route_short_name == "Yellow-N" for line in lines)
+    assert all(line.route_long_name == "Antioch to SFO/Millbrae" for line in lines)
+
+
+def test_get_lines_skips_trips_with_no_resolved_route_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A trip_id with no entry in route_id_by_trip (schedule data never
+    # resolved a route for it) contributes nothing, rather than a
+    # LineSummary with route_id=None.
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(
+            return_value=(
+                {"T1": "Richmond"},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},  # route_id_by_trip - empty, T1 unresolved
+                {},
+            )
+        ),
+    )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    assert asyncio.run(get_lines("BART")) == []
+
+
+def test_get_stops_404s_for_unknown_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for())
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(get_stops("NotASystem"))
+    assert exc_info.value.status_code == 404
+
+
+def test_get_stops_returns_distinct_sorted_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two different stop_ids sharing one display name (e.g. two platforms
+    # both named "Richmond") collapse to a single filter-checklist entry.
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(
+            return_value=(
+                {},
+                {"S1": "Richmond", "S2": "Daly City", "S3": "Richmond"},  # stops
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+            )
+        ),
+    )
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    assert asyncio.run(get_stops("BART")) == ["Daly City", "Richmond"]
