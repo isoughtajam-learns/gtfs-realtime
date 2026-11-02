@@ -15,6 +15,7 @@ from starlette import status
 from generated import gtfs_realtime_pb2
 from src.models import (
     IntraSystemTransfer,
+    LineSummary,
     ServiceAlert,
     TransitSystemDetail,
     TripDetail,
@@ -769,6 +770,86 @@ async def get_transit_system_detail(transit_system: str) -> TransitSystemDetail:
         auth_required=config["auth_required"],
         next_realtime_update_at=next_realtime_update_at(schedulers, transit_system),
     )
+
+
+@app.get("/lines/{transit_system}")
+async def get_lines(transit_system: str) -> list[LineSummary]:
+    """Every distinct (route_id, trip_headsign) pair this system's trips
+    use - backs the frontend's Line filter checklist (IRL-26). The live SSE
+    buffer alone only ever shows whatever's streamed through the last
+    MAX_MESSAGES events, not every line a system actually has. Derived
+    entirely from ScheduleCache's existing per-system preload (no new DB
+    query) - see LineSummary's own docstring for why trip_headsign rides
+    alongside the route fields rather than this just being a route list."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+
+    (
+        trips,
+        _stops,
+        _headsigns_by_route_dir,
+        _colors_by_trip,
+        _colors_by_route,
+        _colors_by_stop,
+        _short_names_by_trip,
+        short_names_by_route,
+        _long_names_by_trip,
+        long_names_by_route,
+        route_id_by_trip,
+        _intra_transfers_by_stop,
+    ) = await ScheduleCache.get(transit_system)
+
+    seen: set[tuple[str, str | None]] = set()
+    lines: list[LineSummary] = []
+    for trip_id, trip_headsign in trips.items():
+        route_id = route_id_by_trip.get(trip_id)
+        if route_id is None:
+            continue
+        key = (route_id, trip_headsign)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(
+            LineSummary(
+                route_id=route_id,
+                route_short_name=short_names_by_route.get(route_id),
+                route_long_name=long_names_by_route.get(route_id),
+                trip_headsign=trip_headsign,
+            )
+        )
+    return lines
+
+
+@app.get("/stops/{transit_system}")
+async def get_stops(transit_system: str) -> list[str]:
+    """Every distinct stop name this system has - backs the frontend's
+    Station filter checklist (IRL-26), same reasoning as get_lines() above.
+    Derived from ScheduleCache's existing per-system `stops` preload, no
+    new DB query."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+
+    (
+        _trips,
+        stops,
+        _headsigns_by_route_dir,
+        _colors_by_trip,
+        _colors_by_route,
+        _colors_by_stop,
+        _short_names_by_trip,
+        _short_names_by_route,
+        _long_names_by_trip,
+        _long_names_by_route,
+        _route_id_by_trip,
+        _intra_transfers_by_stop,
+    ) = await ScheduleCache.get(transit_system)
+    return sorted(set(stops.values()))
 
 
 @app.get("/info")
