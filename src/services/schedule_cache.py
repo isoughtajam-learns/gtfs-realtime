@@ -52,11 +52,15 @@ class ScheduleCache:
     # hundred rows even for a large system), not the full StopTime table.
     _calendar_rows: Dict[str, List[CalendarRow]] = {}
     _calendar_date_rows: Dict[str, List[CalendarDateRow]] = {}
-    # service_id -> (min_departure_seconds, max_arrival_seconds), from one
-    # aggregate SQL query - never raw stop_time rows (Helsinki's table is
-    # 7.8M rows/~700MB; a GROUP BY aggregate returns at most one row per
-    # distinct service_id regardless of system size).
-    _operating_windows_by_service_id: Dict[str, Dict[str, Tuple[int, int]]] = {}
+    # service_id -> list of per-*trip* (min_departure_seconds,
+    # max_arrival_seconds) windows, from one aggregate SQL query grouped by
+    # (service_id, trip_id) - never raw stop_time rows (Helsinki's table is
+    # 7.8M rows/~700MB). Bounded by trip count, not stop_time count - the
+    # same order of magnitude `_trips` below already holds in full, and
+    # deliberately per-trip rather than one merged span per service_id: a
+    # service_id with an early-morning trip and a separate late-night trip
+    # must not read as "in service" for the whole span in between.
+    _operating_windows_by_service_id: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
     _loaded_at: Dict[str, datetime] = {}
     _locks: Dict[str, asyncio.Lock] = {}
 
@@ -78,7 +82,7 @@ class ScheduleCache:
         Dict[str, List[IntraSystemTransfer]],
         List[CalendarRow],
         List[CalendarDateRow],
-        Dict[str, Tuple[int, int]],
+        Dict[str, List[Tuple[int, int]]],
     ]:
         if not cls._is_fresh(transit_system):
             lock = cls._locks.setdefault(transit_system, asyncio.Lock())
@@ -175,11 +179,17 @@ class ScheduleCache:
             ).all()
             # Aggregate only - never raw stop_time rows (see this module's
             # docstring reference and StopTime's own docstring on
-            # Helsinki's 7.8M-row table). Returns at most one row per
-            # distinct service_id.
+            # Helsinki's 7.8M-row table). Grouped by (service_id, trip_id)
+            # - one row per *trip*, not per service_id - so a service_id's
+            # disjoint trips (e.g. an early-morning run and a separate
+            # late-night run) don't collapse into one merged span that
+            # would wrongly look "in service" through the gap between
+            # them. Bounded by trip count, same order of magnitude as
+            # `trips` above holds in full already.
             operating_window_rows = conn.execute(
                 select(
                     Trip.service_id,
+                    StopTime.trip_id,
                     func.min(StopTime.departure_time_seconds),
                     func.max(StopTime.arrival_time_seconds),
                 )
@@ -193,7 +203,7 @@ class ScheduleCache:
                     StopTime.transit_system_id == ts_id,
                     Trip.service_id.is_not(None),
                 )
-                .group_by(Trip.service_id)
+                .group_by(Trip.service_id, StopTime.trip_id)
             ).all()
 
         # Filtered on truthiness like short_names_by_route/long_names_by_route
@@ -293,9 +303,14 @@ class ScheduleCache:
             )
             for row in calendar_date_rows_raw
         ]
-        cls._operating_windows_by_service_id[transit_system] = {
-            row[0]: (row[1], row[2])
-            for row in operating_window_rows
-            if row[1] is not None and row[2] is not None
-        }
+        operating_windows_by_service_id: Dict[str, List[Tuple[int, int]]] = {}
+        for service_id, _trip_id, min_departure, max_arrival in operating_window_rows:
+            if min_departure is None or max_arrival is None:
+                continue
+            operating_windows_by_service_id.setdefault(service_id, []).append(
+                (min_departure, max_arrival)
+            )
+        cls._operating_windows_by_service_id[transit_system] = (
+            operating_windows_by_service_id
+        )
         cls._loaded_at[transit_system] = datetime.utcnow()

@@ -328,7 +328,7 @@ def test_transit_feed_emits_operating_hours_outside_and_skips_poll(
                 {},
                 [always_on],  # calendar_rows
                 [],  # calendar_date_rows
-                {"S1": (5 * 3600, 23 * 3600)},  # operating_windows_by_service_id
+                {"S1": [(5 * 3600, 23 * 3600)]},  # operating_windows_by_service_id
             )
         ),
     )
@@ -377,7 +377,7 @@ def test_transit_feed_emits_operating_hours_in_service_then_polls(
                 {},
                 [always_on],
                 [],
-                {"S1": (0, 24 * 3600)},
+                {"S1": [(0, 24 * 3600)]},
             )
         ),
     )

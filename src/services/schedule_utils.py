@@ -264,16 +264,22 @@ class OperatingHoursResult:
 
 def is_outside_operating_hours(
     now_local: datetime,
-    windows_by_service_id: Dict[str, Tuple[int, int]],
+    windows_by_service_id: Dict[str, List[Tuple[int, int]]],
     calendar_rows: List[CalendarRow],
     calendar_date_rows: List[CalendarDateRow],
 ) -> OperatingHoursResult:
     """Whether `now_local` (a timezone-aware datetime in the transit
     system's own local timezone) falls outside every currently-active
     service_id's scheduled window. `windows_by_service_id` is
-    service_id -> (min_departure_seconds, max_arrival_seconds), aggregated
-    in SQL by ScheduleCache - never raw stop_time rows (see that module's
-    docstring on Helsinki's 7.8M-row table).
+    service_id -> list of per-*trip* (min_departure_seconds,
+    max_arrival_seconds) windows, aggregated in SQL by ScheduleCache -
+    never raw stop_time rows (see that module's docstring on Helsinki's
+    7.8M-row table). Deliberately per-trip, not one merged span per
+    service_id: a service_id with an early-morning trip and a separate
+    late-night trip (nothing in between) must not read as "in service"
+    for the whole span, including the midday gap when nothing is actually
+    running - exactly the shape a low-frequency system like a ferry can
+    have.
 
     Checks both today's and *yesterday's* active service_ids: GTFS
     routinely represents a trip past midnight with times >= 24:00:00,
@@ -284,11 +290,17 @@ def is_outside_operating_hours(
     full day, putting it on the same footing as yesterday's >=24:00:00
     times.
 
-    Fails open (returns outside_operating_hours=False) when there's no
-    calendar data at all for this system - "unknown" is not the same as
-    "closed," same precedent as every other optional-GTFS-field gap in
-    this codebase (Helsinki's missing route colors, Kiev's missing
-    zone_id)."""
+    Fails open (returns outside_operating_hours=False) in two cases,
+    both "unknown" rather than "closed": no calendar data at all for this
+    system (same precedent as every other optional-GTFS-field gap in this
+    codebase - Helsinki's missing route colors, Kiev's missing zone_id),
+    or calendar data says a service_id should be active but
+    `windows_by_service_id` has no timing data for *any* currently-active
+    service_id (today's or yesterday's) - e.g. right after this feature's
+    migration ships, before stop_time's new time columns have been
+    backfilled by a fresh fetch. A real GTFS gap (data present, service
+    genuinely not running right now) is unaffected: that case has at
+    least one active service_id's window data to check against."""
     if not calendar_rows and not calendar_date_rows:
         return OperatingHoursResult(outside_operating_hours=False)
 
@@ -299,14 +311,21 @@ def is_outside_operating_hours(
     today_services = resolve_active_service_ids(
         calendar_rows, calendar_date_rows, today
     )
+    yesterday_services = resolve_active_service_ids(
+        calendar_rows, calendar_date_rows, yesterday
+    )
+
+    known_services = (
+        today_services | yesterday_services
+    ) & windows_by_service_id.keys()
+    if not known_services:
+        return OperatingHoursResult(outside_operating_hours=False)
+
     in_service = _time_in_any_window(
         seconds_today, today_services, windows_by_service_id
     )
 
     if not in_service:
-        yesterday_services = resolve_active_service_ids(
-            calendar_rows, calendar_date_rows, yesterday
-        )
         in_service = _time_in_any_window(
             seconds_today + DAY_SECONDS, yesterday_services, windows_by_service_id
         )
@@ -325,15 +344,12 @@ def is_outside_operating_hours(
 def _time_in_any_window(
     seconds: int,
     service_ids: Set[str],
-    windows_by_service_id: Dict[str, Tuple[int, int]],
+    windows_by_service_id: Dict[str, List[Tuple[int, int]]],
 ) -> bool:
     for service_id in service_ids:
-        window = windows_by_service_id.get(service_id)
-        if window is None:
-            continue
-        start, end = window
-        if start <= seconds <= end:
-            return True
+        for start, end in windows_by_service_id.get(service_id, []):
+            if start <= seconds <= end:
+                return True
     return False
 
 
@@ -341,13 +357,14 @@ def _next_service_start(
     now_local: datetime,
     calendar_rows: List[CalendarRow],
     calendar_date_rows: List[CalendarDateRow],
-    windows_by_service_id: Dict[str, Tuple[int, int]],
+    windows_by_service_id: Dict[str, List[Tuple[int, int]]],
 ) -> Optional[datetime]:
     """Best-effort only, per is_outside_operating_hours's docstring - checks
     just today's remaining active service and tomorrow's, returning the
-    earliest still-upcoming departure found; None if neither has one (e.g.
-    no calendar data for tomorrow yet, or a system with irregular/rare
-    service this function isn't meant to search arbitrarily far for)."""
+    earliest still-upcoming departure found (across every trip window of
+    every active service_id); None if neither has one (e.g. no calendar
+    data for tomorrow yet, or a system with irregular/rare service this
+    function isn't meant to search arbitrarily far for)."""
     today = now_local.date()
     seconds_now = now_local.hour * 3600 + now_local.minute * 60 + now_local.second
 
@@ -356,9 +373,9 @@ def _next_service_start(
             calendar_rows, calendar_date_rows, service_date
         )
         starts = [
-            windows_by_service_id[service_id][0]
+            window[0]
             for service_id in service_ids
-            if service_id in windows_by_service_id
+            for window in windows_by_service_id.get(service_id, [])
         ]
         if days_ahead == 0:
             starts = [start for start in starts if start > seconds_now]

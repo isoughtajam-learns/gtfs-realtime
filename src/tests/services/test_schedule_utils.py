@@ -326,7 +326,7 @@ def test_is_outside_operating_hours_within_todays_window() -> None:
         end_date=date(2026, 12, 31),
     )
     # 05:00 - 23:00 window.
-    windows = {"ALL_DAYS": (5 * 3600, 23 * 3600)}
+    windows = {"ALL_DAYS": [(5 * 3600, 23 * 3600)]}
     result = is_outside_operating_hours(
         _local(2026, 11, 16, 12), windows, [service], []
     )
@@ -340,7 +340,7 @@ def test_is_outside_operating_hours_outside_todays_window() -> None:
         start_date=date(2026, 1, 1),
         end_date=date(2026, 12, 31),
     )
-    windows = {"ALL_DAYS": (5 * 3600, 23 * 3600)}
+    windows = {"ALL_DAYS": [(5 * 3600, 23 * 3600)]}
     result = is_outside_operating_hours(_local(2026, 11, 16, 2), windows, [service], [])
     assert result.outside_operating_hours is True
 
@@ -355,7 +355,7 @@ def test_is_outside_operating_hours_cross_midnight_via_yesterday_service() -> No
         start_date=date(2026, 1, 1),
         end_date=date(2026, 12, 31),
     )
-    windows = {"ALL_DAYS": (18 * 3600, 25 * 3600 + 30 * 60)}
+    windows = {"ALL_DAYS": [(18 * 3600, 25 * 3600 + 30 * 60)]}
     result = is_outside_operating_hours(_local(2026, 11, 16, 1), windows, [service], [])
     assert result.outside_operating_hours is False
 
@@ -367,7 +367,60 @@ def test_is_outside_operating_hours_next_service_starts_at_today() -> None:
         start_date=date(2026, 1, 1),
         end_date=date(2026, 12, 31),
     )
-    windows = {"ALL_DAYS": (5 * 3600, 23 * 3600)}
+    windows = {"ALL_DAYS": [(5 * 3600, 23 * 3600)]}
     result = is_outside_operating_hours(_local(2026, 11, 16, 2), windows, [service], [])
     assert result.outside_operating_hours is True
     assert result.next_service_starts_at == _local(2026, 11, 16, 5)
+
+
+def test_is_outside_operating_hours_fails_open_when_no_timing_data_for_active_service() -> (
+    None
+):
+    # Calendar data says ALL_DAYS should be running right now, but there's
+    # no entry for it in windows_by_service_id at all - e.g. right after
+    # this feature's migration ships, before a fresh fetch backfills
+    # stop_time's new arrival/departure columns. "Unknown" must not read
+    # as "closed," unlike a real gap (covered by the disjoint-trips test
+    # below), where at least one active service_id DOES have window data.
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    result = is_outside_operating_hours(_local(2026, 11, 16, 12), {}, [service], [])
+    assert result.outside_operating_hours is False
+
+
+def test_is_outside_operating_hours_detects_real_gap_between_disjoint_trips() -> None:
+    # One service_id with two unrelated trips - an early-morning run and a
+    # separate evening run, nothing in between (a real shape for a
+    # low-frequency system like a ferry). Collapsing these into one merged
+    # 05:00-23:00 span would wrongly say "in service" at noon; per-trip
+    # windows must catch the real midday gap.
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    windows = {
+        "ALL_DAYS": [
+            (5 * 3600, 9 * 3600),  # morning trip: 05:00-09:00
+            (17 * 3600, 23 * 3600),  # evening trip: 17:00-23:00
+        ]
+    }
+    midday = is_outside_operating_hours(
+        _local(2026, 11, 16, 12), windows, [service], []
+    )
+    assert midday.outside_operating_hours is True
+
+    morning = is_outside_operating_hours(
+        _local(2026, 11, 16, 6), windows, [service], []
+    )
+    assert morning.outside_operating_hours is False
+
+    evening = is_outside_operating_hours(
+        _local(2026, 11, 16, 20), windows, [service], []
+    )
+    assert evening.outside_operating_hours is False
