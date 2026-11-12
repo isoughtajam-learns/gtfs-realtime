@@ -1,8 +1,10 @@
 import asyncio
 import atexit
 from contextlib import asynccontextmanager
+from datetime import datetime
 import logging
 from typing import Any, AsyncGenerator, AsyncIterator
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +18,7 @@ from generated import gtfs_realtime_pb2
 from src.models import (
     IntraSystemTransfer,
     LineSummary,
+    OperatingHoursStatus,
     ServiceAlert,
     TransitSystemDetail,
     TripDetail,
@@ -35,6 +38,7 @@ from src.services.regional_feed import (
     REGIONAL_TRIP_UPDATES_URL,
 )
 from src.services.schedule_cache import ScheduleCache
+from src.services.schedule_utils import is_outside_operating_hours
 from src.services.service_alerts import (
     build_service_alerts,
     extract_referenced_ids,
@@ -293,6 +297,12 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             continue
         yield ServerSentEvent(data=cached_position, event="trip_update", retry=5000)
 
+    # Tracks the last `operating_hours` status emitted on this connection,
+    # so the event only goes out on the first tick and when the status
+    # actually changes - not on every 30s poll. See OperatingHoursStatus.
+    last_outside_operating_hours: bool | None = None
+    system_timezone = config.get("timezone")
+
     while True:
         (
             trip_headsigns,
@@ -307,7 +317,43 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             long_names_by_route,
             route_id_by_trip,
             intra_transfers_by_stop,
+            calendar_rows,
+            calendar_date_rows,
+            operating_windows_by_service_id,
         ) = await ScheduleCache.get(transit_system)
+
+        # Fails open when the system's timezone isn't known (can't resolve
+        # "now" in local time) - same as is_outside_operating_hours's own
+        # no-calendar-data fail-open case.
+        if system_timezone is not None:
+            operating_hours = is_outside_operating_hours(
+                datetime.now(ZoneInfo(system_timezone)),
+                operating_windows_by_service_id,
+                calendar_rows,
+                calendar_date_rows,
+            )
+            if operating_hours.outside_operating_hours != last_outside_operating_hours:
+                last_outside_operating_hours = operating_hours.outside_operating_hours
+                yield ServerSentEvent(
+                    data=OperatingHoursStatus(
+                        outside_operating_hours=operating_hours.outside_operating_hours,
+                        next_service_starts_at=operating_hours.next_service_starts_at,
+                    ),
+                    event="operating_hours",
+                    retry=5000,
+                )
+            if operating_hours.outside_operating_hours:
+                # Known closed right now - skip this tick's realtime poll
+                # entirely rather than spending an outbound fetch (and, for
+                # 511.org-backed systems, shared quota - see
+                # SharedFeedQuota) on a system with no chance of live data.
+                # Only affects this per-connection demand poll, not the
+                # background QuotaGroupScheduler/RegionalFeedScheduler
+                # warming (src/services/quota_group_scheduler.py), which
+                # keeps running regardless.
+                await asyncio.sleep(30)
+                continue
+
         (
             area_ids_by_stop,
             members_by_area,
@@ -800,6 +846,9 @@ async def get_lines(transit_system: str) -> list[LineSummary]:
         long_names_by_route,
         route_id_by_trip,
         _intra_transfers_by_stop,
+        _calendar_rows,
+        _calendar_date_rows,
+        _operating_windows_by_service_id,
     ) = await ScheduleCache.get(transit_system)
 
     seen: set[tuple[str, str | None]] = set()
@@ -848,6 +897,9 @@ async def get_stops(transit_system: str) -> list[str]:
         _long_names_by_route,
         _route_id_by_trip,
         _intra_transfers_by_stop,
+        _calendar_rows,
+        _calendar_date_rows,
+        _operating_windows_by_service_id,
     ) = await ScheduleCache.get(transit_system)
     return sorted(set(stops.values()))
 

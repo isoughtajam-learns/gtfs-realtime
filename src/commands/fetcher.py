@@ -15,16 +15,26 @@ import os
 import shutil
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 import requests
 from sqlalchemy import select, update, Connection
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database import engine
-from src.models import ORMBase, TransitSystem, Trip, Stop, StopTime, Route, Transfer
+from src.models import (
+    ORMBase,
+    TransitSystem,
+    Trip,
+    Stop,
+    StopTime,
+    Route,
+    Transfer,
+    Calendar,
+    CalendarDate,
+)
 from src.telemetry import configure_posthog_logging
 from src.services.schedule_utils import (
     dedupe_rows_by_columns,
@@ -32,6 +42,7 @@ from src.services.schedule_utils import (
     is_later_stop_sequence,
     missing_route_fields,
     missing_stop_fields,
+    parse_gtfs_time_to_seconds,
     parse_optional_float,
     parse_optional_int,
     resolve_route_url,
@@ -53,6 +64,8 @@ STOP_TIMES_FILE = "stop_times.txt"
 ROUTES_FILE = "routes.txt"
 AGENCY_FILE = "agency.txt"
 TRANSFERS_FILE = "transfers.txt"
+CALENDAR_FILE = "calendar.txt"
+CALENDAR_DATES_FILE = "calendar_dates.txt"
 METADATA_FILE_LIST = [
     TRIPS_FILE,
     STOPS_FILE,
@@ -60,6 +73,8 @@ METADATA_FILE_LIST = [
     ROUTES_FILE,
     AGENCY_FILE,
     TRANSFERS_FILE,
+    CALENDAR_FILE,
+    CALENDAR_DATES_FILE,
 ]
 UPDATED_METADATA_FILE = "updated_metadata.txt"
 
@@ -106,6 +121,18 @@ def _upsert_batched(
         )
         total += connection.execute(upsert_stmt).rowcount
     return total
+
+
+def _parse_gtfs_date(raw: Optional[str]) -> Optional[date]:
+    """Parses calendar.txt/calendar_dates.txt's "YYYYMMDD" into a date.
+    None on blank/malformed input - same permissive handling as every
+    other optional-in-practice GTFS field."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%d").date()
+    except ValueError:
+        return None
 
 
 class Fetcher:
@@ -579,6 +606,8 @@ class Fetcher:
                 self.upsert_routes(connection)
                 self.upsert_stop_times(connection)
                 self.upsert_transfers(connection)
+                self.upsert_calendar(connection)
+                self.upsert_calendar_dates(connection)
             except Exception as ex:
                 logger.error(f"Error: {ex}")
         logger.info(f"Upserts completed for {', '.join(METADATA_FILE_LIST)}")
@@ -818,6 +847,7 @@ class Fetcher:
                             row.get("wheelchair_accessible")
                         ),
                         "bikes_allowed": parse_optional_int(row.get("bikes_allowed")),
+                        "service_id": row.get("service_id") or None,
                     }
                 )
         if not rows_to_write:
@@ -834,6 +864,7 @@ class Fetcher:
                 "trip_short_name",
                 "wheelchair_accessible",
                 "bikes_allowed",
+                "service_id",
             ],
         )
         logger.info(f"upsert trips result: {total} rows")
@@ -954,6 +985,12 @@ class Fetcher:
                         "trip_id": trip_id,
                         "stop_sequence": stop_sequence,
                         "stop_id": stop_id,
+                        "arrival_time_seconds": parse_gtfs_time_to_seconds(
+                            row.get("arrival_time")
+                        ),
+                        "departure_time_seconds": parse_gtfs_time_to_seconds(
+                            row.get("departure_time")
+                        ),
                     }
                 )
                 if len(batch) >= UPSERT_BATCH_SIZE:
@@ -970,7 +1007,11 @@ class Fetcher:
         insert_stmt = pg_insert(StopTime).values(deduped)
         upsert_stmt = insert_stmt.on_conflict_do_update(
             constraint="uq_stop_time",
-            set_={"stop_id": insert_stmt.excluded.stop_id},
+            set_={
+                "stop_id": insert_stmt.excluded.stop_id,
+                "arrival_time_seconds": insert_stmt.excluded.arrival_time_seconds,
+                "departure_time_seconds": insert_stmt.excluded.departure_time_seconds,
+            },
         )
         return connection.execute(upsert_stmt).rowcount
 
@@ -1049,6 +1090,108 @@ class Fetcher:
             ],
         )
         logger.info(f"upsert transfers result: {total} rows")
+
+    def upsert_calendar(self, connection: Connection) -> None:
+        """Materializes calendar.txt into the Calendar table - day-of-week
+        service rules consumed by
+        src/services/schedule_utils.py's is_outside_operating_hours.
+        Optional per the GTFS spec (a feed can define service entirely via
+        calendar_dates.txt instead) - same missing-file handling as
+        upsert_transfers above, so its absence doesn't abort the rest of
+        the fetch."""
+        path = self.real_file(CALENDAR_FILE)
+        if not os.path.isfile(path):
+            logger.info(f"No calendar.txt for {self.transit_system} - skipping")
+            return
+
+        transit_system_id = self.select_transit_system(connection)
+        weekday_columns = (
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+        )
+        rows_to_write = []
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                service_id = row.get("service_id")
+                start_date = _parse_gtfs_date(row.get("start_date"))
+                end_date = _parse_gtfs_date(row.get("end_date"))
+                if not service_id or start_date is None or end_date is None:
+                    continue
+                entry = {
+                    "transit_system_id": transit_system_id,
+                    "service_id": service_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                }
+                for column in weekday_columns:
+                    entry[column] = row.get(column) == "1"
+                rows_to_write.append(entry)
+
+        if not rows_to_write:
+            logger.info(f"No calendar records to upsert for {self.transit_system}")
+            return
+
+        total = _upsert_batched(
+            connection,
+            Calendar,
+            rows_to_write,
+            "uq_calendar_service",
+            ["transit_system_id", "service_id"],
+            [*weekday_columns, "start_date", "end_date"],
+        )
+        logger.info(f"upsert calendar result: {total} rows")
+
+    def upsert_calendar_dates(self, connection: Connection) -> None:
+        """Materializes calendar_dates.txt into the CalendarDate table - the
+        one-off service-added/removed exceptions
+        is_outside_operating_hours layers on top of Calendar's day-of-week
+        rules. Always optional per the GTFS spec; missing-file handling
+        matches upsert_calendar/upsert_transfers above."""
+        path = self.real_file(CALENDAR_DATES_FILE)
+        if not os.path.isfile(path):
+            logger.info(f"No calendar_dates.txt for {self.transit_system} - skipping")
+            return
+
+        transit_system_id = self.select_transit_system(connection)
+        rows_to_write = []
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                service_id = row.get("service_id")
+                exception_date = _parse_gtfs_date(row.get("date"))
+                exception_type = parse_optional_int(row.get("exception_type"))
+                if not service_id or exception_date is None or exception_type is None:
+                    continue
+                rows_to_write.append(
+                    {
+                        "transit_system_id": transit_system_id,
+                        "service_id": service_id,
+                        "date": exception_date,
+                        "exception_type": exception_type,
+                    }
+                )
+
+        if not rows_to_write:
+            logger.info(
+                f"No calendar_dates records to upsert for {self.transit_system}"
+            )
+            return
+
+        total = _upsert_batched(
+            connection,
+            CalendarDate,
+            rows_to_write,
+            "uq_calendar_date",
+            ["transit_system_id", "service_id", "date"],
+            ["exception_type"],
+        )
+        logger.info(f"upsert calendar_dates result: {total} rows")
 
 
 if __name__ == "__main__":

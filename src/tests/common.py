@@ -9,7 +9,17 @@ from sqlalchemy import insert, delete
 from sqlalchemy.engine import Engine
 
 from src.commands.fetcher import Fetcher
-from src.models import ORMBase, TransitSystem, Route, Trip, StopTime, Stop, Transfer
+from src.models import (
+    ORMBase,
+    TransitSystem,
+    Route,
+    Trip,
+    StopTime,
+    Stop,
+    Transfer,
+    Calendar,
+    CalendarDate,
+)
 from src.settings import get_settings
 
 
@@ -130,7 +140,7 @@ def _clean_schedule_tables(
 ) -> Generator[None, None, None]:
     yield
     with db_engine.begin() as conn:
-        for Model in (Transfer, StopTime, Stop, Route, Trip):
+        for Model in (Transfer, StopTime, Stop, Route, Trip, CalendarDate, Calendar):
             conn.execute(
                 delete(Model).where(Model.transit_system_id == transit_system_id)
             )

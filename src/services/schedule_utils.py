@@ -9,7 +9,9 @@ Also used by fetcher.py's --diagnose mode to report exactly where a source
 falls short of what these rules expect.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def dedupe_rows_by_columns(
@@ -179,3 +181,191 @@ def missing_stop_fields(trip_id: Optional[str], name: Optional[str]) -> List[str
         "stop_name": name,
     }
     return [name for name, value in candidates.items() if not value]
+
+
+DAY_SECONDS = 86400
+
+
+def parse_gtfs_time_to_seconds(raw: Optional[str]) -> Optional[int]:
+    """Parses a stop_times.txt arrival_time/departure_time ("HH:MM:SS") into
+    seconds since midnight of its trip's service day. Hours routinely exceed
+    24 for a trip running past midnight - GTFS attributes that trip to the
+    *previous* day's service_id rather than rolling the clock over, so this
+    deliberately does NOT wrap mod 24h: is_outside_operating_hours below
+    depends on telling a 25:30:00 trip apart from a 01:30:00 one. Blank,
+    missing, or malformed values (legal for interpolated/non-timepoint
+    stops) become None rather than failing the row."""
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (int(part) for part in parts)
+    except ValueError:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+@dataclass(frozen=True)
+class CalendarRow:
+    """Plain, DB-independent mirror of one models.Calendar row - weekdays is
+    (monday, tuesday, ..., sunday), matching date.weekday()'s Monday=0
+    ordering."""
+
+    service_id: str
+    weekdays: Tuple[bool, bool, bool, bool, bool, bool, bool]
+    start_date: date
+    end_date: date
+
+
+@dataclass(frozen=True)
+class CalendarDateRow:
+    """Plain, DB-independent mirror of one models.CalendarDate row."""
+
+    service_id: str
+    date: date
+    exception_type: int  # GTFS enum: 1 = added, 2 = removed
+
+
+def resolve_active_service_ids(
+    calendar_rows: List[CalendarRow],
+    calendar_date_rows: List[CalendarDateRow],
+    target_date: date,
+) -> Set[str]:
+    """Which service_ids actually run on `target_date`: Calendar's day-of-
+    week rule (within its start/end date range) as the base set, then
+    CalendarDate's one-off exceptions for that exact date layered on top
+    (exception_type=1 adds a service_id even if Calendar didn't already
+    include it - the only way service ever gets defined at all for a feed
+    with no calendar.txt; exception_type=2 removes one Calendar said should
+    run, e.g. a holiday)."""
+    weekday_index = target_date.weekday()
+    active = {
+        row.service_id
+        for row in calendar_rows
+        if row.weekdays[weekday_index] and row.start_date <= target_date <= row.end_date
+    }
+    for exception in calendar_date_rows:
+        if exception.date != target_date:
+            continue
+        if exception.exception_type == 1:
+            active.add(exception.service_id)
+        elif exception.exception_type == 2:
+            active.discard(exception.service_id)
+    return active
+
+
+@dataclass(frozen=True)
+class OperatingHoursResult:
+    outside_operating_hours: bool
+    next_service_starts_at: Optional[datetime] = None
+
+
+def is_outside_operating_hours(
+    now_local: datetime,
+    windows_by_service_id: Dict[str, Tuple[int, int]],
+    calendar_rows: List[CalendarRow],
+    calendar_date_rows: List[CalendarDateRow],
+) -> OperatingHoursResult:
+    """Whether `now_local` (a timezone-aware datetime in the transit
+    system's own local timezone) falls outside every currently-active
+    service_id's scheduled window. `windows_by_service_id` is
+    service_id -> (min_departure_seconds, max_arrival_seconds), aggregated
+    in SQL by ScheduleCache - never raw stop_time rows (see that module's
+    docstring on Helsinki's 7.8M-row table).
+
+    Checks both today's and *yesterday's* active service_ids: GTFS
+    routinely represents a trip past midnight with times >= 24:00:00,
+    still attributed to the previous day's service_id, so a late-running
+    trip from yesterday can still be "in service" right now even though
+    today's own service_ids haven't started yet. Yesterday's window is
+    compared by shifting `now_local`'s seconds-since-midnight forward by a
+    full day, putting it on the same footing as yesterday's >=24:00:00
+    times.
+
+    Fails open (returns outside_operating_hours=False) when there's no
+    calendar data at all for this system - "unknown" is not the same as
+    "closed," same precedent as every other optional-GTFS-field gap in
+    this codebase (Helsinki's missing route colors, Kiev's missing
+    zone_id)."""
+    if not calendar_rows and not calendar_date_rows:
+        return OperatingHoursResult(outside_operating_hours=False)
+
+    today = now_local.date()
+    yesterday = today - timedelta(days=1)
+    seconds_today = now_local.hour * 3600 + now_local.minute * 60 + now_local.second
+
+    today_services = resolve_active_service_ids(
+        calendar_rows, calendar_date_rows, today
+    )
+    in_service = _time_in_any_window(
+        seconds_today, today_services, windows_by_service_id
+    )
+
+    if not in_service:
+        yesterday_services = resolve_active_service_ids(
+            calendar_rows, calendar_date_rows, yesterday
+        )
+        in_service = _time_in_any_window(
+            seconds_today + DAY_SECONDS, yesterday_services, windows_by_service_id
+        )
+
+    if in_service:
+        return OperatingHoursResult(outside_operating_hours=False)
+
+    return OperatingHoursResult(
+        outside_operating_hours=True,
+        next_service_starts_at=_next_service_start(
+            now_local, calendar_rows, calendar_date_rows, windows_by_service_id
+        ),
+    )
+
+
+def _time_in_any_window(
+    seconds: int,
+    service_ids: Set[str],
+    windows_by_service_id: Dict[str, Tuple[int, int]],
+) -> bool:
+    for service_id in service_ids:
+        window = windows_by_service_id.get(service_id)
+        if window is None:
+            continue
+        start, end = window
+        if start <= seconds <= end:
+            return True
+    return False
+
+
+def _next_service_start(
+    now_local: datetime,
+    calendar_rows: List[CalendarRow],
+    calendar_date_rows: List[CalendarDateRow],
+    windows_by_service_id: Dict[str, Tuple[int, int]],
+) -> Optional[datetime]:
+    """Best-effort only, per is_outside_operating_hours's docstring - checks
+    just today's remaining active service and tomorrow's, returning the
+    earliest still-upcoming departure found; None if neither has one (e.g.
+    no calendar data for tomorrow yet, or a system with irregular/rare
+    service this function isn't meant to search arbitrarily far for)."""
+    today = now_local.date()
+    seconds_now = now_local.hour * 3600 + now_local.minute * 60 + now_local.second
+
+    for days_ahead, service_date in ((0, today), (1, today + timedelta(days=1))):
+        service_ids = resolve_active_service_ids(
+            calendar_rows, calendar_date_rows, service_date
+        )
+        starts = [
+            windows_by_service_id[service_id][0]
+            for service_id in service_ids
+            if service_id in windows_by_service_id
+        ]
+        if days_ahead == 0:
+            starts = [start for start in starts if start > seconds_now]
+        if not starts:
+            continue
+        service_midnight = datetime.combine(
+            service_date, datetime.min.time(), tzinfo=now_local.tzinfo
+        )
+        return service_midnight + timedelta(seconds=min(starts))
+    return None
