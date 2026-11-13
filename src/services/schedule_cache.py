@@ -10,10 +10,20 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.database import engine
-from src.models import IntraSystemTransfer, TransitSystem, Trip, Stop, Route
+from src.models import (
+    Calendar,
+    CalendarDate,
+    IntraSystemTransfer,
+    TransitSystem,
+    Trip,
+    Stop,
+    StopTime,
+    Route,
+)
+from src.services.schedule_utils import CalendarRow, CalendarDateRow
 from src.services.transfers import query_intra_transfers
 
 
@@ -37,6 +47,20 @@ class ScheduleCache:
     # src/services/transfers.py's query_intra_transfers for the query itself
     # and why it's shared with trip_detail.py's narrower, per-request version.
     _intra_transfers_by_stop: Dict[str, Dict[str, List[IntraSystemTransfer]]] = {}
+    # Operating-hours awareness (see src/services/schedule_utils.py's
+    # is_outside_operating_hours) - plain, small row lists (at most a few
+    # hundred rows even for a large system), not the full StopTime table.
+    _calendar_rows: Dict[str, List[CalendarRow]] = {}
+    _calendar_date_rows: Dict[str, List[CalendarDateRow]] = {}
+    # service_id -> list of per-*trip* (min_departure_seconds,
+    # max_arrival_seconds) windows, from one aggregate SQL query grouped by
+    # (service_id, trip_id) - never raw stop_time rows (Helsinki's table is
+    # 7.8M rows/~700MB). Bounded by trip count, not stop_time count - the
+    # same order of magnitude `_trips` below already holds in full, and
+    # deliberately per-trip rather than one merged span per service_id: a
+    # service_id with an early-morning trip and a separate late-night trip
+    # must not read as "in service" for the whole span in between.
+    _operating_windows_by_service_id: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
     _loaded_at: Dict[str, datetime] = {}
     _locks: Dict[str, asyncio.Lock] = {}
 
@@ -56,6 +80,9 @@ class ScheduleCache:
         Dict[str, str],
         Dict[str, str],
         Dict[str, List[IntraSystemTransfer]],
+        List[CalendarRow],
+        List[CalendarDateRow],
+        Dict[str, List[Tuple[int, int]]],
     ]:
         if not cls._is_fresh(transit_system):
             lock = cls._locks.setdefault(transit_system, asyncio.Lock())
@@ -75,6 +102,9 @@ class ScheduleCache:
             cls._long_names_by_route.get(transit_system, {}),
             cls._route_id_by_trip.get(transit_system, {}),
             cls._intra_transfers_by_stop.get(transit_system, {}),
+            cls._calendar_rows.get(transit_system, []),
+            cls._calendar_date_rows.get(transit_system, []),
+            cls._operating_windows_by_service_id.get(transit_system, {}),
         )
 
     @classmethod
@@ -101,6 +131,9 @@ class ScheduleCache:
                 cls._long_names_by_route[transit_system] = {}
                 cls._route_id_by_trip[transit_system] = {}
                 cls._intra_transfers_by_stop[transit_system] = {}
+                cls._calendar_rows[transit_system] = []
+                cls._calendar_date_rows[transit_system] = []
+                cls._operating_windows_by_service_id[transit_system] = {}
                 cls._loaded_at[transit_system] = datetime.utcnow()
                 return
             trip_rows = conn.execute(
@@ -123,6 +156,55 @@ class ScheduleCache:
                 ).where(Route.transit_system_id == ts_id)
             ).all()
             intra_transfers_by_stop = query_intra_transfers(conn, ts_id)
+            calendar_rows_raw = conn.execute(
+                select(
+                    Calendar.service_id,
+                    Calendar.monday,
+                    Calendar.tuesday,
+                    Calendar.wednesday,
+                    Calendar.thursday,
+                    Calendar.friday,
+                    Calendar.saturday,
+                    Calendar.sunday,
+                    Calendar.start_date,
+                    Calendar.end_date,
+                ).where(Calendar.transit_system_id == ts_id)
+            ).all()
+            calendar_date_rows_raw = conn.execute(
+                select(
+                    CalendarDate.service_id,
+                    CalendarDate.date,
+                    CalendarDate.exception_type,
+                ).where(CalendarDate.transit_system_id == ts_id)
+            ).all()
+            # Aggregate only - never raw stop_time rows (see this module's
+            # docstring reference and StopTime's own docstring on
+            # Helsinki's 7.8M-row table). Grouped by (service_id, trip_id)
+            # - one row per *trip*, not per service_id - so a service_id's
+            # disjoint trips (e.g. an early-morning run and a separate
+            # late-night run) don't collapse into one merged span that
+            # would wrongly look "in service" through the gap between
+            # them. Bounded by trip count, same order of magnitude as
+            # `trips` above holds in full already.
+            operating_window_rows = conn.execute(
+                select(
+                    Trip.service_id,
+                    StopTime.trip_id,
+                    func.min(StopTime.departure_time_seconds),
+                    func.max(StopTime.arrival_time_seconds),
+                )
+                .select_from(StopTime)
+                .join(
+                    Trip,
+                    (Trip.transit_system_id == StopTime.transit_system_id)
+                    & (Trip.trip_id == StopTime.trip_id),
+                )
+                .where(
+                    StopTime.transit_system_id == ts_id,
+                    Trip.service_id.is_not(None),
+                )
+                .group_by(Trip.service_id, StopTime.trip_id)
+            ).all()
 
         # Filtered on truthiness like short_names_by_route/long_names_by_route
         # below - a route can now have color=text_color=None (see
@@ -196,4 +278,39 @@ class ScheduleCache:
         cls._route_id_by_trip[transit_system] = route_id_by_trip
         cls._intra_transfers_by_stop[transit_system] = intra_transfers_by_stop
         cls._stops[transit_system] = {row.stop_id: row.name for row in stop_rows}
+        cls._calendar_rows[transit_system] = [
+            CalendarRow(
+                service_id=row.service_id,
+                weekdays=(
+                    row.monday,
+                    row.tuesday,
+                    row.wednesday,
+                    row.thursday,
+                    row.friday,
+                    row.saturday,
+                    row.sunday,
+                ),
+                start_date=row.start_date,
+                end_date=row.end_date,
+            )
+            for row in calendar_rows_raw
+        ]
+        cls._calendar_date_rows[transit_system] = [
+            CalendarDateRow(
+                service_id=row.service_id,
+                date=row.date,
+                exception_type=row.exception_type,
+            )
+            for row in calendar_date_rows_raw
+        ]
+        operating_windows_by_service_id: Dict[str, List[Tuple[int, int]]] = {}
+        for service_id, _trip_id, min_departure, max_arrival in operating_window_rows:
+            if min_departure is None or max_arrival is None:
+                continue
+            operating_windows_by_service_id.setdefault(service_id, []).append(
+                (min_departure, max_arrival)
+            )
+        cls._operating_windows_by_service_id[transit_system] = (
+            operating_windows_by_service_id
+        )
         cls._loaded_at[transit_system] = datetime.utcnow()

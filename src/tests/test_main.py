@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Generator
 from unittest.mock import AsyncMock, Mock
 
@@ -31,6 +31,7 @@ from src.models import (
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
+from src.services.schedule_utils import CalendarRow
 from src.services.transfer_cache import TransferCache
 
 
@@ -97,6 +98,13 @@ def _active_for(*names: str) -> Any:
     """monkeypatch target for src.main.get_transit_system_config - returns a
     config for any of `names`, None (unknown/inactive system) otherwise."""
     return lambda name: _mock_transit_system_config() if name in names else None
+
+
+def _active_for_with(**overrides: Any) -> Any:
+    """Like _active_for, but for the single-system operating-hours tests
+    that need a real `timezone` (every other test's config deliberately
+    leaves it None, which skips the operating-hours feature entirely)."""
+    return lambda name: _mock_transit_system_config(**overrides)
 
 
 def _mock_response(content: bytes, status_code: int = 200) -> Mock:
@@ -262,7 +270,9 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(
+            return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], {})
+        ),
     )
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
@@ -270,6 +280,123 @@ def test_transit_feed_survives_a_request_error_and_keeps_streaming(
 
     assert call_count["n"] == 2
     assert event.data.trip_id == "T1"
+
+
+class _FrozenDatetime:
+    """Stand-in for src.main's `datetime` import, so
+    datetime.now(ZoneInfo(...)) returns a fixed instant instead of the real
+    wall clock - the only call site in main.py (see is_outside_operating_hours
+    tests below)."""
+
+    def __init__(self, fixed: datetime) -> None:
+        self._fixed = fixed
+
+    def now(self, tz: Any = None) -> datetime:
+        return self._fixed
+
+
+def test_transit_feed_emits_operating_hours_outside_and_skips_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 02:00 local, with a service that only runs 05:00-23:00 (today and
+    # yesterday both) - clearly outside operating hours.
+    monkeypatch.setattr(
+        "src.main.datetime", _FrozenDatetime(datetime(2026, 11, 16, 2, 0))
+    )
+    always_on = CalendarRow(
+        service_id="S1",
+        weekdays=(True, True, True, True, True, True, True),
+        start_date=date(2020, 1, 1),
+        end_date=date(2030, 12, 31),
+    )
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(
+            return_value=(
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                [always_on],  # calendar_rows
+                [],  # calendar_date_rows
+                {"S1": [(5 * 3600, 23 * 3600)]},  # operating_windows_by_service_id
+            )
+        ),
+    )
+    fetch_mock = Mock(side_effect=AssertionError("should not poll while closed"))
+    monkeypatch.setattr(requests, "get", fetch_mock)
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config",
+        _active_for_with(timezone="America/Los_Angeles"),
+    )
+
+    event = asyncio.run(_first_event("SF_Bay_Ferry"))
+
+    assert event.event == "operating_hours"
+    assert event.data.outside_operating_hours is True
+    fetch_mock.assert_not_called()
+
+
+def test_transit_feed_emits_operating_hours_in_service_then_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.main.datetime", _FrozenDatetime(datetime(2026, 11, 16, 12, 0))
+    )
+    always_on = CalendarRow(
+        service_id="S1",
+        weekdays=(True, True, True, True, True, True, True),
+        start_date=date(2020, 1, 1),
+        end_date=date(2030, 12, 31),
+    )
+    monkeypatch.setattr(
+        ScheduleCache,
+        "get",
+        AsyncMock(
+            return_value=(
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                [always_on],
+                [],
+                {"S1": [(0, 24 * 3600)]},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: _mock_response(_feed_with_one_active_trip_update()),
+    )
+    monkeypatch.setattr(
+        "src.main.get_transit_system_config",
+        _active_for_with(timezone="America/Los_Angeles"),
+    )
+
+    first, second = asyncio.run(_first_two_events("SF_Bay_Ferry"))
+
+    assert first.event == "operating_hours"
+    assert first.data.outside_operating_hours is False
+    assert second.event == "trip_update"
+    assert second.data.trip_id == "T1"
 
 
 def test_transit_feed_resolves_route_short_name_from_route_id(
@@ -299,6 +426,9 @@ def test_transit_feed_resolves_route_short_name_from_route_id(
                 {},
                 {"R1": "TARAVAL"},
                 {},
+                {},
+                [],
+                [],
                 {},
             )
         ),
@@ -343,6 +473,9 @@ def test_transit_feed_route_short_name_falls_back_to_trip_level_lookup(
                 {"T1": "TARAVAL"},
                 {},
                 {"T1": "R1"},
+                {},
+                [],
+                [],
                 {},
             )
         ),
@@ -435,7 +568,9 @@ def test_transit_feed_filters_burst_entries_not_in_cached_live_feed(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(
+            return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], {})
+        ),
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config", _active_for("PeekFilterSystem")
@@ -499,7 +634,9 @@ def test_transit_feed_populates_recent_events_cache_after_a_poll(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(
+            return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], {})
+        ),
     )
     monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
@@ -574,7 +711,9 @@ def test_transit_feed_falls_back_to_entity_id_for_blank_trip_id(
     monkeypatch.setattr(
         ScheduleCache,
         "get",
-        AsyncMock(return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})),
+        AsyncMock(
+            return_value=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], {})
+        ),
     )
     monkeypatch.setattr(
         "src.main.get_transit_system_config",
@@ -1145,6 +1284,9 @@ def test_get_lines_dedupes_by_route_and_headsign(
                 {"R1": "Antioch to SFO/Millbrae"},  # long_names_by_route
                 {"T1": "R1", "T2": "R1", "T3": "R1"},  # route_id_by_trip
                 {},  # intra_transfers_by_stop
+                [],  # calendar_rows
+                [],  # calendar_date_rows
+                {},  # operating_windows_by_service_id
             )
         ),
     )
@@ -1183,6 +1325,9 @@ def test_get_lines_skips_trips_with_no_resolved_route_id(
                 {},
                 {},  # route_id_by_trip - empty, T1 unresolved
                 {},
+                [],
+                [],
+                {},
             )
         ),
     )
@@ -1220,6 +1365,9 @@ def test_get_stops_returns_distinct_sorted_names(
                 {},
                 {},
                 {},
+                {},
+                [],
+                [],
                 {},
             )
         ),

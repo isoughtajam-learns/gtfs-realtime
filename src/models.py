@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Optional
 
@@ -227,6 +227,18 @@ class TransitSystemDetail(BaseModel):
     next_realtime_update_at: Optional[int] = None
 
 
+class OperatingHoursStatus(BaseModel):
+    """SSE event payload for transit_feed()'s new `operating_hours` event -
+    see src/services/schedule_utils.py's is_outside_operating_hours. Emitted
+    only on a connection's first tick and whenever the status changes, not
+    on every 30s poll - see main.py's transit_feed()."""
+
+    outside_operating_hours: bool
+    # Best-effort only (see is_outside_operating_hours's docstring) - None
+    # when it can't be determined, even if outside_operating_hours is True.
+    next_service_starts_at: Optional[datetime] = None
+
+
 class ORMBase(DeclarativeBase):
     pass
 
@@ -378,6 +390,12 @@ class Trip(ORMBase):
     # not every source publishes them.
     wheelchair_accessible: Mapped[Optional[int]]
     bikes_allowed: Mapped[Optional[int]]
+    # trips.txt's service_id, joining (loosely - no FK, same as route_id
+    # above) to Calendar/CalendarDate below. Lets
+    # src/services/schedule_utils.py's is_outside_operating_hours resolve
+    # which trips are actually running today without re-reading GTFS
+    # Schedule files.
+    service_id: Mapped[Optional[str]]
     __table_args__ = (
         ForeignKeyConstraint(["id", "trip_id"], ["trip.id", "trip.trip_id"]),
         UniqueConstraint("transit_system_id", "trip_id", name="uq_trip"),
@@ -401,6 +419,16 @@ class StopTime(ORMBase):
     trip_id: Mapped[str]
     stop_sequence: Mapped[int]
     stop_id: Mapped[str]
+    # Seconds since midnight of the trip's service day, parsed from GTFS's
+    # "HH:MM:SS" (src/services/schedule_utils.py's
+    # parse_gtfs_time_to_seconds) - can exceed 86400 (24:00:00) for a trip
+    # that runs past midnight, still attributed to its own service day per
+    # the GTFS convention. None when the source row's time is blank (legal
+    # for interpolated/non-timepoint stops). Used by
+    # is_outside_operating_hours via an aggregate MIN/MAX query, not loaded
+    # as raw rows - see ScheduleCache.
+    arrival_time_seconds: Mapped[Optional[int]]
+    departure_time_seconds: Mapped[Optional[int]]
 
     __table_args__ = (
         # Also serves as the index get_scheduled_tail_stops queries against:
@@ -408,6 +436,60 @@ class StopTime(ORMBase):
         # a prefix scan of this same constraint's btree index.
         UniqueConstraint(
             "transit_system_id", "trip_id", "stop_sequence", name="uq_stop_time"
+        ),
+    )
+
+
+class Calendar(ORMBase):
+    """One row of calendar.txt - which days of the week a service_id runs,
+    within a date range. Optional per the GTFS spec (a feed can define
+    service entirely via CalendarDate exceptions instead) - see
+    src/commands/fetcher.py's upsert_calendar for the missing-file
+    handling, and is_outside_operating_hours for how this combines with
+    CalendarDate to resolve "is this service_id running today"."""
+
+    __tablename__ = "calendar"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
+    service_id: Mapped[str]
+    monday: Mapped[bool]
+    tuesday: Mapped[bool]
+    wednesday: Mapped[bool]
+    thursday: Mapped[bool]
+    friday: Mapped[bool]
+    saturday: Mapped[bool]
+    sunday: Mapped[bool]
+    start_date: Mapped[date]
+    end_date: Mapped[date]
+
+    __table_args__ = (
+        UniqueConstraint("transit_system_id", "service_id", name="uq_calendar_service"),
+    )
+
+
+class CalendarDate(ORMBase):
+    """One row of calendar_dates.txt - a one-off exception (service added
+    or removed) for a service_id on a specific date, overriding whatever
+    Calendar's day-of-week rule would otherwise say. Always optional per
+    the GTFS spec, but load-bearing for feeds that define service entirely
+    this way (no calendar.txt at all)."""
+
+    __tablename__ = "calendar_date"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
+    service_id: Mapped[str]
+    date: Mapped[date]
+    # GTFS enum: 1 = service added for this date, 2 = service removed.
+    exception_type: Mapped[int]
+
+    __table_args__ = (
+        UniqueConstraint(
+            "transit_system_id",
+            "service_id",
+            "date",
+            name="uq_calendar_date",
         ),
     )
 

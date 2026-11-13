@@ -1,14 +1,25 @@
+from datetime import date, datetime, timezone
+
 from src.services.schedule_utils import (
+    CalendarDateRow,
+    CalendarRow,
     dedupe_rows_by_columns,
     is_earlier_stop_sequence,
     is_later_stop_sequence,
+    is_outside_operating_hours,
     missing_route_fields,
     missing_stop_fields,
+    parse_gtfs_time_to_seconds,
     parse_optional_float,
     parse_optional_int,
+    resolve_active_service_ids,
     resolve_route_url,
     resolve_trip_headsign,
 )
+
+# Monday=0 .. Sunday=6, matching date.weekday().
+WEEKDAYS_ALL = (True, True, True, True, True, True, True)
+WEEKDAYS_NONE = (False, False, False, False, False, False, False)
 
 
 def test_resolve_trip_headsign_prefers_destination_stop_name() -> None:
@@ -212,3 +223,204 @@ def test_dedupe_rows_by_columns_composite_key() -> None:
 
 def test_dedupe_rows_by_columns_empty_list() -> None:
     assert dedupe_rows_by_columns([], ["id"]) == []
+
+
+def test_parse_gtfs_time_to_seconds_normal() -> None:
+    assert parse_gtfs_time_to_seconds("06:15:30") == 6 * 3600 + 15 * 60 + 30
+
+
+def test_parse_gtfs_time_to_seconds_past_midnight_not_wrapped() -> None:
+    # 25:30:00 is a real, common GTFS value for a trip past midnight - must
+    # stay >= 86400, not wrap to 01:30:00, so is_outside_operating_hours can
+    # tell the two apart.
+    assert parse_gtfs_time_to_seconds("25:30:00") == 25 * 3600 + 30 * 60
+
+
+def test_parse_gtfs_time_to_seconds_blank_or_malformed() -> None:
+    assert parse_gtfs_time_to_seconds(None) is None
+    assert parse_gtfs_time_to_seconds("") is None
+    assert parse_gtfs_time_to_seconds("not a time") is None
+
+
+def test_resolve_active_service_ids_day_of_week_match() -> None:
+    weekday_service = CalendarRow(
+        service_id="WEEKDAY",
+        weekdays=(True, True, True, True, True, False, False),
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    weekend_service = CalendarRow(
+        service_id="WEEKEND",
+        weekdays=(False, False, False, False, False, True, True),
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    # 2026-11-16 is a Monday.
+    active = resolve_active_service_ids(
+        [weekday_service, weekend_service], [], date(2026, 11, 16)
+    )
+    assert active == {"WEEKDAY"}
+
+
+def test_resolve_active_service_ids_respects_date_range() -> None:
+    expired_service = CalendarRow(
+        service_id="EXPIRED",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 6, 30),
+    )
+    active = resolve_active_service_ids([expired_service], [], date(2026, 11, 16))
+    assert active == set()
+
+
+def test_resolve_active_service_ids_exception_adds_service() -> None:
+    # A holiday-only service with no base Calendar day at all - only
+    # reachable via a calendar_dates.txt exception_type=1 row, the only way
+    # service is ever defined for a calendar_dates-only feed.
+    holiday_service = CalendarRow(
+        service_id="HOLIDAY",
+        weekdays=WEEKDAYS_NONE,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    exception = CalendarDateRow(
+        service_id="HOLIDAY", date=date(2026, 11, 26), exception_type=1
+    )
+    active = resolve_active_service_ids(
+        [holiday_service], [exception], date(2026, 11, 26)
+    )
+    assert active == {"HOLIDAY"}
+
+
+def test_resolve_active_service_ids_exception_removes_service() -> None:
+    weekday_service = CalendarRow(
+        service_id="WEEKDAY",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    # Thanksgiving 2026-11-26 is a Thursday - normally a WEEKDAY service day.
+    exception = CalendarDateRow(
+        service_id="WEEKDAY", date=date(2026, 11, 26), exception_type=2
+    )
+    active = resolve_active_service_ids(
+        [weekday_service], [exception], date(2026, 11, 26)
+    )
+    assert active == set()
+
+
+def _local(y: int, m: int, d: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(y, m, d, hour, minute, tzinfo=timezone.utc)
+
+
+def test_is_outside_operating_hours_no_calendar_data_fails_open() -> None:
+    result = is_outside_operating_hours(_local(2026, 11, 16, 3), {}, [], [])
+    assert result.outside_operating_hours is False
+
+
+def test_is_outside_operating_hours_within_todays_window() -> None:
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    # 05:00 - 23:00 window.
+    windows = {"ALL_DAYS": [(5 * 3600, 23 * 3600)]}
+    result = is_outside_operating_hours(
+        _local(2026, 11, 16, 12), windows, [service], []
+    )
+    assert result.outside_operating_hours is False
+
+
+def test_is_outside_operating_hours_outside_todays_window() -> None:
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    windows = {"ALL_DAYS": [(5 * 3600, 23 * 3600)]}
+    result = is_outside_operating_hours(_local(2026, 11, 16, 2), windows, [service], [])
+    assert result.outside_operating_hours is True
+
+
+def test_is_outside_operating_hours_cross_midnight_via_yesterday_service() -> None:
+    # Service runs 18:00 one day through 01:30 the next (recorded as
+    # 18:00:00-25:30:00, GTFS's past-midnight convention) - "now" at 01:00
+    # should still be in service, attributed to *yesterday*'s service_id.
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    windows = {"ALL_DAYS": [(18 * 3600, 25 * 3600 + 30 * 60)]}
+    result = is_outside_operating_hours(_local(2026, 11, 16, 1), windows, [service], [])
+    assert result.outside_operating_hours is False
+
+
+def test_is_outside_operating_hours_next_service_starts_at_today() -> None:
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    windows = {"ALL_DAYS": [(5 * 3600, 23 * 3600)]}
+    result = is_outside_operating_hours(_local(2026, 11, 16, 2), windows, [service], [])
+    assert result.outside_operating_hours is True
+    assert result.next_service_starts_at == _local(2026, 11, 16, 5)
+
+
+def test_is_outside_operating_hours_fails_open_when_no_timing_data_for_active_service() -> (
+    None
+):
+    # Calendar data says ALL_DAYS should be running right now, but there's
+    # no entry for it in windows_by_service_id at all - e.g. right after
+    # this feature's migration ships, before a fresh fetch backfills
+    # stop_time's new arrival/departure columns. "Unknown" must not read
+    # as "closed," unlike a real gap (covered by the disjoint-trips test
+    # below), where at least one active service_id DOES have window data.
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    result = is_outside_operating_hours(_local(2026, 11, 16, 12), {}, [service], [])
+    assert result.outside_operating_hours is False
+
+
+def test_is_outside_operating_hours_detects_real_gap_between_disjoint_trips() -> None:
+    # One service_id with two unrelated trips - an early-morning run and a
+    # separate evening run, nothing in between (a real shape for a
+    # low-frequency system like a ferry). Collapsing these into one merged
+    # 05:00-23:00 span would wrongly say "in service" at noon; per-trip
+    # windows must catch the real midday gap.
+    service = CalendarRow(
+        service_id="ALL_DAYS",
+        weekdays=WEEKDAYS_ALL,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+    )
+    windows = {
+        "ALL_DAYS": [
+            (5 * 3600, 9 * 3600),  # morning trip: 05:00-09:00
+            (17 * 3600, 23 * 3600),  # evening trip: 17:00-23:00
+        ]
+    }
+    midday = is_outside_operating_hours(
+        _local(2026, 11, 16, 12), windows, [service], []
+    )
+    assert midday.outside_operating_hours is True
+
+    morning = is_outside_operating_hours(
+        _local(2026, 11, 16, 6), windows, [service], []
+    )
+    assert morning.outside_operating_hours is False
+
+    evening = is_outside_operating_hours(
+        _local(2026, 11, 16, 20), windows, [service], []
+    )
+    assert evening.outside_operating_hours is False
