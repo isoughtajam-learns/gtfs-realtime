@@ -4,14 +4,16 @@ CRUD surface - see src/services/auth.py for password hashing/sessions."""
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
 from src.database import engine
 from src.models import AppUser
 
 EMAIL_UNIQUE_CONSTRAINT = "uq_app_user_email"
-USERNAME_UNIQUE_CONSTRAINT = "uq_app_user_username"
+# Index, not a plain UniqueConstraint - see AppUser's own docstring for why
+# username uniqueness/lookup has to be case-insensitive.
+USERNAME_UNIQUE_CONSTRAINT = "uq_app_user_username_lower"
 
 
 class EmailAlreadyRegistered(Exception):
@@ -56,6 +58,6 @@ def get_user_by_username(username: str) -> Optional[dict[str, Any]]:
         row = connection.execute(
             select(
                 AppUser.id, AppUser.email, AppUser.username, AppUser.password_hash
-            ).where(AppUser.username == username)
+            ).where(func.lower(AppUser.username) == username.lower())
         ).first()
         return row._asdict() if row is not None else None

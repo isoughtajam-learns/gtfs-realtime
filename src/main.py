@@ -975,8 +975,13 @@ async def login(body: LoginRequest, response: Response) -> AuthUser:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",
         )
-    _set_session_cookie(response, int(user["id"]), str(user["email"]), body.username)
-    return AuthUser(email=str(user["email"]), username=body.username)
+    # The account's own stored casing, not body.username - lookup is
+    # case-insensitive (see get_user_by_username), so echoing back
+    # whatever case the client happened to type would show a different
+    # username than the one on the account across two logins.
+    stored_username = str(user["username"])
+    _set_session_cookie(response, int(user["id"]), str(user["email"]), stored_username)
+    return AuthUser(email=str(user["email"]), username=stored_username)
 
 
 @app.post("/auth/logout")

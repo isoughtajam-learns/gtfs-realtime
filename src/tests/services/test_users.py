@@ -48,3 +48,19 @@ def test_create_user_rejects_duplicate_username() -> None:
 
 def test_get_user_by_username_unknown_returns_none() -> None:
     assert get_user_by_username("nobody") is None
+
+
+def test_username_lookup_and_uniqueness_are_case_insensitive() -> None:
+    # Confirmed live: a case-sensitive match here meant a differently-cased
+    # login attempt failed with the same generic 401 as a wrong password.
+    user_id = create_user("rider@example.com", "RiderName", "hashed-password")
+
+    found = get_user_by_username("ridername")
+    assert found is not None
+    assert found["id"] == user_id
+    assert found["username"] == "RiderName"  # stored casing preserved
+
+    assert get_user_by_username("RIDERNAME") is not None
+
+    with pytest.raises(UsernameAlreadyRegistered):
+        create_user("other@example.com", "ridername", "hash-2")
