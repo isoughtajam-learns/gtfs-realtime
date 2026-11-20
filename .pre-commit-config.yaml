@@ -25,6 +25,8 @@ repos:
           - sse-starlette==3.4.8
           - celery==5.6.3
           - celery-types==0.26.0
+          - bcrypt==5.0.0
+          - pyjwt==2.15.1
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Get the latest version tag from the repo
     rev: v0.15.20

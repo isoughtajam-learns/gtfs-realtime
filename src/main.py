@@ -7,7 +7,7 @@ from typing import Any, AsyncGenerator, AsyncIterator
 from zoneinfo import ZoneInfo
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.sse import EventSourceResponse, ServerSentEvent
@@ -16,14 +16,29 @@ from starlette import status
 
 from generated import gtfs_realtime_pb2
 from src.models import (
+    AuthUser,
     IntraSystemTransfer,
     LineSummary,
+    LoginRequest,
     OperatingHoursStatus,
+    SavedStationCreate,
+    SavedStationOut,
+    SavedStationUpdate,
     ServiceAlert,
+    SignupRequest,
     TransitSystemDetail,
     TripDetail,
     TripPosition,
     TripStopDetail,
+)
+from src.services.auth import (
+    SESSION_COOKIE_NAME,
+    create_session_token,
+    get_current_user,
+    get_current_user_id,
+    hash_password,
+    is_secure_cookie_env,
+    verify_password,
 )
 from src.services.positioning import get_location
 from src.services.quota_group_scheduler import (
@@ -36,6 +51,17 @@ from src.services.recent_events_cache import RecentEventsCache
 from src.services.regional_feed import (
     REGIONAL_SERVICE_ALERTS_URL,
     REGIONAL_TRIP_UPDATES_URL,
+)
+from src.services.saved_stations import (
+    SavedStationAlreadyExists,
+    SavedStationLimitReached,
+    SavedStationNotFound,
+    UnknownStopName,
+    create_saved_station,
+    delete_saved_station,
+    list_all_saved_stations,
+    list_saved_stations_for_system,
+    update_saved_station,
 )
 from src.services.schedule_cache import ScheduleCache
 from src.services.schedule_utils import is_outside_operating_hours
@@ -58,6 +84,7 @@ from src.services.trip_detail import (
     get_transfers_for_stops,
     get_trip_schedule_context,
 )
+from src.services.users import EmailAlreadyRegistered, create_user, get_user_by_email
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
 
@@ -902,6 +929,186 @@ async def get_stops(transit_system: str) -> list[str]:
         _operating_windows_by_service_id,
     ) = await ScheduleCache.get(transit_system)
     return sorted(set(stops.values()))
+
+
+def _set_session_cookie(response: Response, user_id: int, email: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=create_session_token(user_id, email),
+        httponly=True,
+        samesite="lax",
+        secure=is_secure_cookie_env(),
+        max_age=60 * 60 * 24 * 30,
+    )
+
+
+@app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
+async def signup(body: SignupRequest, response: Response) -> AuthUser:
+    try:
+        user_id = await asyncio.to_thread(
+            create_user, body.email, hash_password(body.password)
+        )
+    except EmailAlreadyRegistered:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
+        )
+    _set_session_cookie(response, user_id, body.email)
+    return AuthUser(email=body.email)
+
+
+@app.post("/auth/login")
+async def login(body: LoginRequest, response: Response) -> AuthUser:
+    user = await asyncio.to_thread(get_user_by_email, body.email)
+    if user is None or not verify_password(body.password, str(user["password_hash"])):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+    _set_session_cookie(response, int(user["id"]), body.email)
+    return AuthUser(email=body.email)
+
+
+@app.post("/auth/logout")
+async def logout(response: Response) -> dict[str, bool]:
+    response.delete_cookie(key=SESSION_COOKIE_NAME)
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+async def me(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    return user
+
+
+@app.get("/saved_stations")
+async def get_all_saved_stations(
+    user_id: int = Depends(get_current_user_id),
+) -> list[SavedStationOut]:
+    rows = await asyncio.to_thread(list_all_saved_stations, user_id)
+    return [SavedStationOut(**row) for row in rows]
+
+
+@app.get("/saved_stations/{transit_system}")
+async def get_saved_stations(
+    transit_system: str, user_id: int = Depends(get_current_user_id)
+) -> list[SavedStationOut]:
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+    rows = await asyncio.to_thread(
+        list_saved_stations_for_system, user_id, config["id"]
+    )
+    return [SavedStationOut(**row) for row in rows]
+
+
+@app.post("/saved_stations/{transit_system}", status_code=status.HTTP_201_CREATED)
+async def save_station(
+    transit_system: str,
+    body: SavedStationCreate,
+    user_id: int = Depends(get_current_user_id),
+) -> SavedStationOut:
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+    (
+        _trips,
+        stops,
+        _headsigns_by_route_dir,
+        _colors_by_trip,
+        _colors_by_route,
+        _colors_by_stop,
+        _short_names_by_trip,
+        _short_names_by_route,
+        _long_names_by_trip,
+        _long_names_by_route,
+        _route_id_by_trip,
+        _intra_transfers_by_stop,
+        _calendar_rows,
+        _calendar_date_rows,
+        _operating_windows_by_service_id,
+    ) = await ScheduleCache.get(transit_system)
+    known_stop_names = set(stops.values())
+
+    try:
+        row = await asyncio.to_thread(
+            create_saved_station,
+            user_id,
+            config["id"],
+            body.stop_name,
+            known_stop_names,
+            body.alert_enabled,
+            body.alert_lead_minutes,
+        )
+    except UnknownStopName:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown stop_name"
+        )
+    except SavedStationLimitReached:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At most 10 saved stations per transit system",
+        )
+    except SavedStationAlreadyExists:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Station already saved"
+        )
+    return SavedStationOut(**row)
+
+
+@app.patch("/saved_stations/{transit_system}")
+async def patch_saved_station(
+    transit_system: str,
+    stop_name: str,
+    body: SavedStationUpdate,
+    user_id: int = Depends(get_current_user_id),
+) -> SavedStationOut:
+    """stop_name is a query param, not a path segment - a real stop_name
+    can contain '/' (confirmed live: BART's own "12th Street / Oakland
+    City Center"), which a plain {stop_name} path converter can't match
+    regardless of percent-encoding."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+    try:
+        row = await asyncio.to_thread(
+            update_saved_station,
+            user_id,
+            config["id"],
+            stop_name,
+            body.alert_enabled,
+            body.alert_lead_minutes,
+        )
+    except SavedStationNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Saved station not found"
+        )
+    return SavedStationOut(**row)
+
+
+@app.delete(
+    "/saved_stations/{transit_system}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_saved_station(
+    transit_system: str, stop_name: str, user_id: int = Depends(get_current_user_id)
+) -> None:
+    """stop_name is a query param - see patch_saved_station above."""
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    if not config:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
+        )
+    try:
+        await asyncio.to_thread(delete_saved_station, user_id, config["id"], stop_name)
+    except SavedStationNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Saved station not found"
+        )
 
 
 @app.get("/info")

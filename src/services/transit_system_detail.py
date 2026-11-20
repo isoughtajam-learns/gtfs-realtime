@@ -24,6 +24,7 @@ def get_transit_system_config(transit_system: str) -> Optional[dict[str, Any]]:
     with engine.begin() as connection:
         row = connection.execute(
             select(
+                TransitSystem.id,
                 TransitSystem.realtime_url,
                 TransitSystem.schedule_url,
                 TransitSystem.timezone,
@@ -39,6 +40,10 @@ def get_transit_system_config(transit_system: str) -> Optional[dict[str, Any]]:
     if row is None:
         return None
     return {
+        # Phase 4 (.claude/plans/development.md) - saved_stations.py needs
+        # the numeric id for the saved_station FK; every pre-existing
+        # caller of this function already ignores unknown dict keys.
+        "id": row.id,
         "realtime_url": row.realtime_url,
         "schedule_url": row.schedule_url,
         "timezone": row.timezone,
