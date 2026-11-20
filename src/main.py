@@ -84,7 +84,12 @@ from src.services.trip_detail import (
     get_transfers_for_stops,
     get_trip_schedule_context,
 )
-from src.services.users import EmailAlreadyRegistered, create_user, get_user_by_email
+from src.services.users import (
+    EmailAlreadyRegistered,
+    UsernameAlreadyRegistered,
+    create_user,
+    get_user_by_username,
+)
 from src.settings import get_settings
 from src.telemetry import configure_posthog_logging
 
@@ -931,10 +936,12 @@ async def get_stops(transit_system: str) -> list[str]:
     return sorted(set(stops.values()))
 
 
-def _set_session_cookie(response: Response, user_id: int, email: str) -> None:
+def _set_session_cookie(
+    response: Response, user_id: int, email: str, username: str
+) -> None:
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
-        value=create_session_token(user_id, email),
+        value=create_session_token(user_id, email, username),
         httponly=True,
         samesite="lax",
         secure=is_secure_cookie_env(),
@@ -946,26 +953,30 @@ def _set_session_cookie(response: Response, user_id: int, email: str) -> None:
 async def signup(body: SignupRequest, response: Response) -> AuthUser:
     try:
         user_id = await asyncio.to_thread(
-            create_user, body.email, hash_password(body.password)
+            create_user, body.email, body.username, hash_password(body.password)
         )
     except EmailAlreadyRegistered:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Email already registered"
         )
-    _set_session_cookie(response, user_id, body.email)
-    return AuthUser(email=body.email)
+    except UsernameAlreadyRegistered:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Username already taken"
+        )
+    _set_session_cookie(response, user_id, body.email, body.username)
+    return AuthUser(email=body.email, username=body.username)
 
 
 @app.post("/auth/login")
 async def login(body: LoginRequest, response: Response) -> AuthUser:
-    user = await asyncio.to_thread(get_user_by_email, body.email)
+    user = await asyncio.to_thread(get_user_by_username, body.username)
     if user is None or not verify_password(body.password, str(user["password_hash"])):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
+            detail="Invalid username or password",
         )
-    _set_session_cookie(response, int(user["id"]), body.email)
-    return AuthUser(email=body.email)
+    _set_session_cookie(response, int(user["id"]), str(user["email"]), body.username)
+    return AuthUser(email=str(user["email"]), username=body.username)
 
 
 @app.post("/auth/logout")

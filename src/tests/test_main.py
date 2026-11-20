@@ -48,7 +48,7 @@ from src.services.saved_stations import (
     SavedStationNotFound,
     UnknownStopName,
 )
-from src.services.users import EmailAlreadyRegistered
+from src.services.users import EmailAlreadyRegistered, UsernameAlreadyRegistered
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
@@ -1425,26 +1425,52 @@ def _stops_schedule_cache_return(stops: dict[str, str]) -> AsyncMock:
 
 
 def test_signup_sets_cookie_and_returns_email(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("src.main.create_user", lambda email, password_hash: 1)
+    monkeypatch.setattr(
+        "src.main.create_user", lambda email, username, password_hash: 1
+    )
     response = Response()
 
     result = asyncio.run(
-        signup(SignupRequest(email="rider@example.com", password="pw"), response)
+        signup(
+            SignupRequest(email="rider@example.com", username="rider", password="pw"),
+            response,
+        )
     )
 
-    assert result == AuthUser(email="rider@example.com")
+    assert result == AuthUser(email="rider@example.com", username="rider")
     assert any(b"session=" in value for _, value in response.raw_headers)
 
 
 def test_signup_rejects_duplicate_email(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _boom(email: str, password_hash: str) -> int:
+    def _boom(email: str, username: str, password_hash: str) -> int:
         raise EmailAlreadyRegistered(email)
 
     monkeypatch.setattr("src.main.create_user", _boom)
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(
-            signup(SignupRequest(email="dup@example.com", password="pw"), Response())
+            signup(
+                SignupRequest(email="dup@example.com", username="rider", password="pw"),
+                Response(),
+            )
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_signup_rejects_duplicate_username(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(email: str, username: str, password_hash: str) -> int:
+        raise UsernameAlreadyRegistered(username)
+
+    monkeypatch.setattr("src.main.create_user", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            signup(
+                SignupRequest(
+                    email="rider@example.com", username="dupname", password="pw"
+                ),
+                Response(),
+            )
         )
     assert exc_info.value.status_code == 409
 
@@ -1453,38 +1479,44 @@ def test_login_succeeds_with_correct_password(monkeypatch: pytest.MonkeyPatch) -
     from src.services.auth import hash_password
 
     monkeypatch.setattr(
-        "src.main.get_user_by_email",
-        lambda email: {"id": 1, "email": email, "password_hash": hash_password("pw")},
+        "src.main.get_user_by_username",
+        lambda username: {
+            "id": 1,
+            "email": "rider@example.com",
+            "username": username,
+            "password_hash": hash_password("pw"),
+        },
     )
 
     result = asyncio.run(
-        login(LoginRequest(email="rider@example.com", password="pw"), Response())
+        login(LoginRequest(username="rider", password="pw"), Response())
     )
-    assert result == AuthUser(email="rider@example.com")
+    assert result == AuthUser(email="rider@example.com", username="rider")
 
 
 def test_login_rejects_wrong_password(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.services.auth import hash_password
 
     monkeypatch.setattr(
-        "src.main.get_user_by_email",
-        lambda email: {"id": 1, "email": email, "password_hash": hash_password("pw")},
+        "src.main.get_user_by_username",
+        lambda username: {
+            "id": 1,
+            "email": "rider@example.com",
+            "username": username,
+            "password_hash": hash_password("pw"),
+        },
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            login(LoginRequest(email="rider@example.com", password="wrong"), Response())
-        )
+        asyncio.run(login(LoginRequest(username="rider", password="wrong"), Response()))
     assert exc_info.value.status_code == 401
 
 
-def test_login_rejects_unknown_email(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("src.main.get_user_by_email", lambda email: None)
+def test_login_rejects_unknown_username(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_user_by_username", lambda username: None)
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            login(LoginRequest(email="nobody@example.com", password="pw"), Response())
-        )
+        asyncio.run(login(LoginRequest(username="nobody", password="pw"), Response()))
     assert exc_info.value.status_code == 401
 
 
@@ -1496,8 +1528,9 @@ def test_logout_clears_cookie() -> None:
 
 
 def test_me_returns_current_user() -> None:
-    result = asyncio.run(me(user=AuthUser(email="rider@example.com")))
-    assert result == AuthUser(email="rider@example.com")
+    user = AuthUser(email="rider@example.com", username="rider")
+    result = asyncio.run(me(user=user))
+    assert result == user
 
 
 def test_save_station_404s_for_unknown_system(monkeypatch: pytest.MonkeyPatch) -> None:

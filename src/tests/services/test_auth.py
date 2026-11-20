@@ -37,11 +37,14 @@ def test_hash_password_roundtrip() -> None:
 
 
 def test_create_and_decode_session_token() -> None:
-    token = create_session_token(user_id=42, email="rider@example.com")
+    token = create_session_token(
+        user_id=42, email="rider@example.com", username="rider"
+    )
     payload = decode_session_token(token)
     assert payload is not None
     assert payload["sub"] == "42"
     assert payload["email"] == "rider@example.com"
+    assert payload["username"] == "rider"
 
 
 @pytest.mark.parametrize("garbage_token", ["not-a-jwt", "", "a.b.c"])  # type: ignore[misc]
@@ -55,6 +58,7 @@ def test_decode_session_token_rejects_expired() -> None:
         {
             "sub": "1",
             "email": "rider@example.com",
+            "username": "rider",
             "exp": datetime.now(timezone.utc) - timedelta(days=1),
         },
         settings.secret_key,
@@ -64,14 +68,15 @@ def test_decode_session_token_rejects_expired() -> None:
 
 
 def test_get_current_session_from_real_cookie_header() -> None:
-    token = create_session_token(user_id=7, email="rider@example.com")
+    token = create_session_token(user_id=7, email="rider@example.com", username="rider")
     claims = get_current_session(_request_with_cookie(SESSION_COOKIE_NAME, token))
     assert claims.user_id == 7
     assert claims.email == "rider@example.com"
+    assert claims.username == "rider"
 
-    assert get_current_user(_request_with_cookie(SESSION_COOKIE_NAME, token)).email == (
-        "rider@example.com"
-    )
+    user = get_current_user(_request_with_cookie(SESSION_COOKIE_NAME, token))
+    assert user.email == "rider@example.com"
+    assert user.username == "rider"
     assert get_current_user_id(_request_with_cookie(SESSION_COOKIE_NAME, token)) == 7
 
 

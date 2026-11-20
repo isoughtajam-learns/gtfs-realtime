@@ -240,19 +240,22 @@ class OperatingHoursStatus(BaseModel):
 
 
 class AuthUser(BaseModel):
-    """Response shape for the /auth/* endpoints - deliberately just the
-    email, not the numeric id or password_hash (see models.AppUser)."""
+    """Response shape for the /auth/* endpoints - deliberately just email/
+    username, not the numeric id or password_hash (see models.AppUser)."""
 
     email: str
+    username: str
 
 
 class SignupRequest(BaseModel):
     email: str
+    username: str = Field(min_length=3, max_length=30)
     password: str
 
 
 class LoginRequest(BaseModel):
-    email: str
+    # username, not email - see models.AppUser's own docstring for why.
+    username: str
     password: str
 
 
@@ -699,18 +702,24 @@ class RegionalStopMatch(ORMBase):
 
 class AppUser(ORMBase):
     """Phase 4 (.claude/plans/development.md): a registered rider account -
-    email + password (bcrypt hash, see src/services/auth.py), nothing else
-    yet. Named app_user, not user - "user" is a reserved word in Postgres
-    (maps to CURRENT_USER) and, while quotable, isn't worth the footgun."""
+    email + username + password (bcrypt hash, see src/services/auth.py).
+    username is the sign-in identifier (see /auth/login) - email is kept
+    alongside it for account contact/recovery, not used to log in. Named
+    app_user, not user - "user" is a reserved word in Postgres (maps to
+    CURRENT_USER) and, while quotable, isn't worth the footgun."""
 
     __tablename__ = "app_user"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     email: Mapped[str]
+    username: Mapped[str]
     password_hash: Mapped[str]
     created_at: Mapped[datetime]
 
-    __table_args__ = (UniqueConstraint("email", name="uq_app_user_email"),)
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_app_user_email"),
+        UniqueConstraint("username", name="uq_app_user_username"),
+    )
 
 
 class SavedStation(ORMBase):

@@ -21,6 +21,7 @@ from src.settings import AppEnv, get_settings
 class SessionClaims:
     user_id: int
     email: str
+    username: str
 
 
 SESSION_COOKIE_NAME = "session"
@@ -36,13 +37,14 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
-def create_session_token(user_id: int, email: str) -> str:
+def create_session_token(user_id: int, email: str, username: str) -> str:
     settings = get_settings()
     payload = {
         # PyJWT requires "sub" to be a string - decode_session_token casts
         # it back to int (see get_current_session).
         "sub": str(user_id),
         "email": email,
+        "username": username,
         "exp": datetime.now(timezone.utc) + SESSION_TTL,
     }
     return jwt.encode(payload, settings.secret_key, algorithm=JWT_ALGORITHM)
@@ -69,15 +71,25 @@ def get_current_session(request: Request) -> SessionClaims:
 
     token = request.cookies.get(SESSION_COOKIE_NAME)
     payload = decode_session_token(token) if token else None
-    if payload is None or "sub" not in payload or "email" not in payload:
+    if (
+        payload is None
+        or "sub" not in payload
+        or "email" not in payload
+        or "username" not in payload
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
         )
-    return SessionClaims(user_id=int(payload["sub"]), email=str(payload["email"]))
+    return SessionClaims(
+        user_id=int(payload["sub"]),
+        email=str(payload["email"]),
+        username=str(payload["username"]),
+    )
 
 
 def get_current_user(request: Request) -> AuthUser:
-    return AuthUser(email=get_current_session(request).email)
+    session = get_current_session(request)
+    return AuthUser(email=session.email, username=session.username)
 
 
 def get_current_user_id(request: Request) -> int:

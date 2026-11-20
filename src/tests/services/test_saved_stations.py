@@ -34,6 +34,7 @@ def user_id(db_engine: Engine) -> Generator[int, None, None]:
             insert(AppUser)
             .values(
                 email="rider+saved_stations@example.com",
+                username="rider_saved_stations",
                 password_hash="hash",
                 created_at=datetime.now(timezone.utc),
             )
@@ -124,6 +125,7 @@ def test_saved_stations_are_isolated_per_user(
             insert(AppUser)
             .values(
                 email="other+saved_stations@example.com",
+                username="other_saved_stations",
                 password_hash="hash",
                 created_at=datetime.now(timezone.utc),
             )
