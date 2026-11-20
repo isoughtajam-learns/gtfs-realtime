@@ -2,8 +2,16 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Optional
 
-from pydantic import BaseModel
-from sqlalchemy import ForeignKey, ForeignKeyConstraint, UniqueConstraint, false
+from pydantic import BaseModel, Field
+from sqlalchemy import (
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    UniqueConstraint,
+    false,
+    text,
+    true,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -237,6 +245,51 @@ class OperatingHoursStatus(BaseModel):
     # Best-effort only (see is_outside_operating_hours's docstring) - None
     # when it can't be determined, even if outside_operating_hours is True.
     next_service_starts_at: Optional[datetime] = None
+
+
+class AuthUser(BaseModel):
+    """Response shape for the /auth/* endpoints - deliberately just email/
+    username, not the numeric id or password_hash (see models.AppUser)."""
+
+    email: str
+    username: str
+
+
+class SignupRequest(BaseModel):
+    email: str
+    username: str = Field(min_length=3, max_length=30)
+    password: str
+
+
+class LoginRequest(BaseModel):
+    # username, not email - see models.AppUser's own docstring for why.
+    username: str
+    password: str
+
+
+class SavedStationOut(BaseModel):
+    """Response shape for GET /saved_stations (all systems) and
+    GET /saved_stations/{transit_system} - see models.SavedStation.
+    Phase 4 (.claude/plans/development.md): keyed by stop_name, not
+    stop_id - see src/services/saved_stations.py's own docstring for why."""
+
+    stop_name: str
+    alert_enabled: bool
+    alert_lead_minutes: int
+    # Only meaningful (and populated) on the all-systems listing - the
+    # per-system endpoint's caller already knows which system it asked for.
+    transit_system: Optional[str] = None
+
+
+class SavedStationCreate(BaseModel):
+    stop_name: str
+    alert_enabled: bool = True
+    alert_lead_minutes: int = Field(default=5, ge=1, le=60)
+
+
+class SavedStationUpdate(BaseModel):
+    alert_enabled: Optional[bool] = None
+    alert_lead_minutes: Optional[int] = Field(default=None, ge=1, le=60)
 
 
 class ORMBase(DeclarativeBase):
@@ -652,4 +705,72 @@ class RegionalStopMatch(ORMBase):
 
     __table_args__ = (
         UniqueConstraint("transit_system_id", "stop_id", name="uq_regional_stop_match"),
+    )
+
+
+class AppUser(ORMBase):
+    """Phase 4 (.claude/plans/development.md): a registered rider account -
+    email + username + password (bcrypt hash, see src/services/auth.py).
+    username is the sign-in identifier (see /auth/login) - email is kept
+    alongside it for account contact/recovery, not used to log in. Named
+    app_user, not user - "user" is a reserved word in Postgres (maps to
+    CURRENT_USER) and, while quotable, isn't worth the footgun.
+
+    username uniqueness/lookup is case-insensitive (a functional unique
+    index on lower(username), not a plain UniqueConstraint) - stored
+    casing is preserved for display, but "Alice" and "alice" can't both
+    register, and either logs in as the same account. Confirmed live this
+    was the actual UX bug: a case-sensitive match on a username backfilled
+    from an email's (lowercase) local part rejected any differently-cased
+    login attempt with the same generic 401 as a wrong password, giving
+    no signal that case was the problem."""
+
+    __tablename__ = "app_user"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str]
+    username: Mapped[str]
+    password_hash: Mapped[str]
+    created_at: Mapped[datetime]
+
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_app_user_email"),
+        # A plain UniqueConstraint("username", ...) is case-sensitive -
+        # this functional index on lower(username) is what actually makes
+        # uniqueness (and the lookup in get_user_by_username below) treat
+        # "Alice"/"alice" as the same account. References the column by
+        # its string name, not AppUser.username - at this point in the
+        # class body the declarative attribute isn't built yet.
+        Index("uq_app_user_username_lower", text("lower(username)"), unique=True),
+    )
+
+
+class SavedStation(ORMBase):
+    """Phase 4: one station a user has saved for a given transit system, to
+    default their feed view to and optionally get an in-app alert N minutes
+    before a train reaches it (alert_lead_minutes/alert_enabled).
+
+    Keyed by stop_name, not stop_id, deliberately - the whole existing
+    Station filter (gtfs-dashboard's useTripFilters.ts, GET /stops below)
+    already treats "station" as a name-identified concept and discards
+    stop_id entirely past ingestion; matching that means the default-filter
+    and alert-matching logic on the frontend are plain reuses of data
+    shapes that already exist, not a second notion of station identity."""
+
+    __tablename__ = "saved_station"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("app_user.id"))
+    transit_system_id: Mapped[int] = mapped_column(ForeignKey("transit_system.id"))
+    stop_name: Mapped[str]
+    alert_enabled: Mapped[bool] = mapped_column(default=True, server_default=true())
+    # 1-60, enforced by SavedStationCreate/SavedStationUpdate at the API
+    # boundary, not here - this column has no DB-level check constraint.
+    alert_lead_minutes: Mapped[int] = mapped_column(default=5, server_default="5")
+    created_at: Mapped[datetime]
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "transit_system_id", "stop_name", name="uq_saved_station"
+        ),
     )
