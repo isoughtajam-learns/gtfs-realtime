@@ -620,6 +620,7 @@ dependencies = [
     { name = "requests" },
     { name = "sqlalchemy" },
     { name = "sse-starlette" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "watchdog" },
 ]
@@ -647,6 +648,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.34.2" },
     { name = "sqlalchemy", specifier = ">=2.0.51" },
     { name = "sse-starlette", specifier = ">=3.4.6" },
+    { name = "tzdata", specifier = ">=2026.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
     { name = "watchdog", specifier = ">=6.0.0" },
 ]

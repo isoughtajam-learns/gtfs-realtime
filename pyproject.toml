@@ -23,6 +23,16 @@ dependencies = [
     "opentelemetry-api",
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp",
+    # Debian's own tzdata package (installed via apt by the base image) no
+    # longer ships the IANA "backward" compatibility links - zone names
+    # like "US/Pacific" that some GTFS feeds' agency.txt uses instead of
+    # the canonical name (e.g. "America/Los_Angeles"). Confirmed live:
+    # AC_Transit's agency.txt says "US/Pacific", which crashed with
+    # ZoneInfoNotFoundError against this image's system zoneinfo but
+    # resolves fine once Python's own tzdata package (which still includes
+    # those links) is installed - zoneinfo.ZoneInfo() checks it before
+    # giving up, regardless of platform.
+    "tzdata>=2026.3",
 ]
 
 [tool.mypy]
