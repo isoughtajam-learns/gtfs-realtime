@@ -280,7 +280,14 @@ def _strip_whitespace(value: str) -> str:
 
 class SignupRequest(BaseModel):
     email: str
-    username: str = Field(min_length=3, max_length=30)
+    # ASCII-only, not just a length bound - get_user_by_username matches
+    # case-insensitively via SQL lower() (Postgres) vs. Python's
+    # username.lower(), two different case-folding tables that can
+    # disagree on non-ASCII input (confirmed: this app's Postgres image
+    # is musl-based with limited locale data, unlike Python's full
+    # Unicode-aware str.lower()) - a mismatch there would let a
+    # just-registered non-ASCII username fail to log back in.
+    username: str = Field(min_length=3, max_length=30, pattern=r"^[A-Za-z0-9_-]+$")
     # min_length only here, not on LoginRequest below - this rejects a
     # weak/empty password at account creation without also locking out
     # login for some hypothetical already-existing short password (there

@@ -33,6 +33,7 @@ from src.models import (
 )
 from src.services.auth import (
     SESSION_COOKIE_NAME,
+    SESSION_TTL,
     create_session_token,
     get_current_user,
     get_current_user_id,
@@ -960,7 +961,10 @@ def _set_session_cookie(
         httponly=True,
         samesite="lax",
         secure=is_secure_cookie_env(),
-        max_age=60 * 60 * 24 * 30,
+        # Derived from SESSION_TTL, not a separate literal - the JWT's own
+        # exp claim already uses SESSION_TTL, so a mismatch here would let
+        # the cookie outlive (or expire before) the token it carries.
+        max_age=int(SESSION_TTL.total_seconds()),
     )
 
 

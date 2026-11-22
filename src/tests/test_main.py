@@ -1454,6 +1454,17 @@ def test_signup_request_strips_before_enforcing_username_min_length() -> None:
         )
 
 
+def test_signup_request_rejects_non_ascii_username() -> None:
+    # get_user_by_username matches case-insensitively via SQL lower()
+    # (Postgres) vs. Python's str.lower() - two case-folding tables that
+    # can disagree on non-ASCII input on this project's musl-based
+    # Postgres image. ASCII-only sidesteps the mismatch entirely.
+    with pytest.raises(ValueError):
+        SignupRequest(
+            email="rider@example.com", username="Émile", password="password123"
+        )
+
+
 def test_login_request_strips_username_whitespace() -> None:
     body = LoginRequest(username="  rider  ", password="password123")
     assert body.username == "rider"
@@ -1480,7 +1491,17 @@ def test_signup_sets_cookie_and_returns_email(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert result == AuthUser(email="rider@example.com", username="rider")
-    assert any(b"session=" in value for _, value in response.raw_headers)
+    set_cookie_values = [
+        value for name, value in response.raw_headers if name == b"set-cookie"
+    ]
+    assert any(b"session=" in value for value in set_cookie_values)
+    # Derived from SESSION_TTL (see main.py's _set_session_cookie) - not a
+    # separately-maintained literal that could silently drift from the
+    # JWT's own exp claim.
+    from src.services.auth import SESSION_TTL
+
+    expected_max_age = f"max-age={int(SESSION_TTL.total_seconds())}".encode()
+    assert any(expected_max_age in value.lower() for value in set_cookie_values)
 
 
 def test_signup_rejects_duplicate_email(monkeypatch: pytest.MonkeyPatch) -> None:
