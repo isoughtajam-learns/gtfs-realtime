@@ -7,9 +7,7 @@ from sqlalchemy.engine import Engine
 
 from src.models import AppUser, SavedStation
 from src.services.saved_stations import (
-    MAX_SAVED_STATIONS_PER_SYSTEM,
     SavedStationAlreadyExists,
-    SavedStationLimitReached,
     SavedStationNotFound,
     UnknownStopName,
     create_saved_station,
@@ -92,20 +90,17 @@ def test_create_rejects_duplicate(user_id: int, transit_system_id: int) -> None:
         )
 
 
-def test_create_enforces_per_system_cap(user_id: int, transit_system_id: int) -> None:
-    known = {f"Stop {i}" for i in range(MAX_SAVED_STATIONS_PER_SYSTEM + 1)}
-    for i in range(MAX_SAVED_STATIONS_PER_SYSTEM):
+def test_create_has_no_per_system_cap(user_id: int, transit_system_id: int) -> None:
+    # Deliberately unlimited - confirmed with the user. A count well past
+    # the old cap (10) saves cleanly and all show up in the listing.
+    station_count = 15
+    known = {f"Stop {i}" for i in range(station_count)}
+    for i in range(station_count):
         create_saved_station(user_id, transit_system_id, f"Stop {i}", known, True, 5)
 
-    with pytest.raises(SavedStationLimitReached):
-        create_saved_station(
-            user_id,
-            transit_system_id,
-            f"Stop {MAX_SAVED_STATIONS_PER_SYSTEM}",
-            known,
-            True,
-            5,
-        )
+    assert (
+        len(list_saved_stations_for_system(user_id, transit_system_id)) == station_count
+    )
 
 
 def test_update_and_delete_raise_not_found_when_missing(

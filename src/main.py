@@ -54,7 +54,6 @@ from src.services.regional_feed import (
 )
 from src.services.saved_stations import (
     SavedStationAlreadyExists,
-    SavedStationLimitReached,
     SavedStationNotFound,
     UnknownStopName,
     create_saved_station,
@@ -1077,11 +1076,6 @@ async def save_station(
     except UnknownStopName:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown stop_name"
-        )
-    except SavedStationLimitReached:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At most 10 saved stations per transit system",
         )
     except SavedStationAlreadyExists:
         raise HTTPException(

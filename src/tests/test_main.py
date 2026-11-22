@@ -44,7 +44,6 @@ from src.models import (
 )
 from src.services.saved_stations import (
     SavedStationAlreadyExists,
-    SavedStationLimitReached,
     SavedStationNotFound,
     UnknownStopName,
 )
@@ -1561,24 +1560,6 @@ def test_save_station_404s_for_unknown_stop_name(
             save_station("BART", SavedStationCreate(stop_name="Nowhere"), user_id=1)
         )
     assert exc_info.value.status_code == 404
-
-
-def test_save_station_400s_at_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
-    monkeypatch.setattr(
-        ScheduleCache, "get", _stops_schedule_cache_return({"S1": "Embarcadero"})
-    )
-
-    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise SavedStationLimitReached(1)
-
-    monkeypatch.setattr("src.main.create_saved_station", _boom)
-
-    with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(
-            save_station("BART", SavedStationCreate(stop_name="Embarcadero"), user_id=1)
-        )
-    assert exc_info.value.status_code == 400
 
 
 def test_save_station_409s_on_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,7 +1,7 @@
-"""Phase 4 (.claude/plans/development.md): per-user saved stations - up to
-10 per transit system, each with its own in-app-alert on/off + lead-time
-setting. See models.SavedStation's own docstring for why this is keyed by
-stop_name, not stop_id.
+"""Phase 4 (.claude/plans/development.md): per-user saved stations - no
+cap on how many a user can save per transit system, each with its own
+in-app-alert on/off + lead-time setting. See models.SavedStation's own
+docstring for why this is keyed by stop_name, not stop_id.
 
 Deliberately plain, sync functions (matching the engine.begin() convention
 every other services/*.py module here uses) - validating a stop_name
@@ -13,20 +13,14 @@ itself."""
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from src.database import engine
 from src.models import SavedStation, TransitSystem
 
-MAX_SAVED_STATIONS_PER_SYSTEM = 10
-
 
 class UnknownStopName(Exception):
-    pass
-
-
-class SavedStationLimitReached(Exception):
     pass
 
 
@@ -89,17 +83,6 @@ def create_saved_station(
         raise UnknownStopName(stop_name)
 
     with engine.begin() as connection:
-        existing_count = connection.execute(
-            select(func.count())
-            .select_from(SavedStation)
-            .where(
-                SavedStation.user_id == user_id,
-                SavedStation.transit_system_id == transit_system_id,
-            )
-        ).scalar_one()
-        if existing_count >= MAX_SAVED_STATIONS_PER_SYSTEM:
-            raise SavedStationLimitReached(transit_system_id)
-
         try:
             connection.execute(
                 insert(SavedStation).values(
