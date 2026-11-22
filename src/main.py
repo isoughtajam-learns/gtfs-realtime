@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import logging
 from typing import Any, AsyncGenerator, AsyncIterator
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -334,6 +334,22 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
     # actually changes - not on every 30s poll. See OperatingHoursStatus.
     last_outside_operating_hours: bool | None = None
     system_timezone = config.get("timezone")
+    local_tz: ZoneInfo | None = None
+    if system_timezone is not None:
+        try:
+            local_tz = ZoneInfo(system_timezone)
+        except ZoneInfoNotFoundError:
+            # agency.txt's agency_timezone is free text, not guaranteed to
+            # be the IANA-canonical spelling - AC_Transit's says
+            # "US/Pacific" (a legacy backward-compatibility alias for
+            # "America/Los_Angeles"), and not every tzdata install ships
+            # those legacy links. Logged once per connection (not inside the
+            # loop below, which would spam this every 30s) and treated the
+            # same as "timezone isn't known at all" - fail open rather than
+            # letting an unresolvable string crash the whole stream.
+            logger.error(
+                f"Unknown IANA timezone {system_timezone!r} for {transit_system}"
+            )
 
     while True:
         (
@@ -354,12 +370,12 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
             operating_windows_by_service_id,
         ) = await ScheduleCache.get(transit_system)
 
-        # Fails open when the system's timezone isn't known (can't resolve
-        # "now" in local time) - same as is_outside_operating_hours's own
-        # no-calendar-data fail-open case.
-        if system_timezone is not None:
+        # Fails open when the system's timezone isn't known or couldn't be
+        # resolved (can't resolve "now" in local time) - same as
+        # is_outside_operating_hours's own no-calendar-data fail-open case.
+        if local_tz is not None:
             operating_hours = is_outside_operating_hours(
-                datetime.now(ZoneInfo(system_timezone)),
+                datetime.now(local_tz),
                 operating_windows_by_service_id,
                 calendar_rows,
                 calendar_date_rows,
