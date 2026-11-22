@@ -966,9 +966,14 @@ def _set_session_cookie(
 
 @app.post("/auth/signup", status_code=status.HTTP_201_CREATED)
 async def signup(body: SignupRequest, response: Response) -> AuthUser:
+    # bcrypt hashing is CPU-bound (~100-300ms at this cost factor) - run it
+    # off the event loop like the DB call below, or every other concurrent
+    # request on this worker (including every open SSE connection's 30s
+    # poll tick) stalls for that whole window.
+    password_hash = await asyncio.to_thread(hash_password, body.password)
     try:
         user_id = await asyncio.to_thread(
-            create_user, body.email, body.username, hash_password(body.password)
+            create_user, body.email, body.username, password_hash
         )
     except EmailAlreadyRegistered:
         raise HTTPException(
@@ -985,7 +990,16 @@ async def signup(body: SignupRequest, response: Response) -> AuthUser:
 @app.post("/auth/login")
 async def login(body: LoginRequest, response: Response) -> AuthUser:
     user = await asyncio.to_thread(get_user_by_username, body.username)
-    if user is None or not verify_password(body.password, str(user["password_hash"])):
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password",
+        )
+    # bcrypt is CPU-bound - see signup()'s identical reasoning above.
+    password_ok = await asyncio.to_thread(
+        verify_password, body.password, str(user["password_hash"])
+    )
+    if not password_ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",

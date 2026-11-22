@@ -1423,6 +1423,19 @@ def _stops_schedule_cache_return(stops: dict[str, str]) -> AsyncMock:
     )
 
 
+def test_signup_request_rejects_password_over_72_bytes() -> None:
+    # bcrypt's own hard limit - confirmed live this PR to otherwise raise
+    # an uncaught ValueError inside signup() (an unhandled 500) rather
+    # than a clean 422 here at the request-validation boundary.
+    with pytest.raises(ValueError):
+        SignupRequest(email="rider@example.com", username="rider", password="x" * 73)
+
+
+def test_login_request_rejects_password_over_72_bytes() -> None:
+    with pytest.raises(ValueError):
+        LoginRequest(username="rider", password="x" * 73)
+
+
 def test_signup_sets_cookie_and_returns_email(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "src.main.create_user", lambda email, username, password_hash: 1

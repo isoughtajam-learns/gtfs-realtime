@@ -80,11 +80,20 @@ def get_current_session(request: Request) -> SessionClaims:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
         )
-    return SessionClaims(
-        user_id=int(payload["sub"]),
-        email=str(payload["email"]),
-        username=str(payload["username"]),
-    )
+    try:
+        return SessionClaims(
+            user_id=int(payload["sub"]),
+            email=str(payload["email"]),
+            username=str(payload["username"]),
+        )
+    except (TypeError, ValueError):
+        # A signature-valid token whose "sub" claim isn't numeric (a
+        # payload-shape change rolled out while old tokens are still live,
+        # say) is still just an invalid session, not a server error - this
+        # keeps it a clean 401 instead of an uncaught 500.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
+        )
 
 
 def get_current_user(request: Request) -> AuthUser:

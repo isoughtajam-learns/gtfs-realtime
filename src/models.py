@@ -2,7 +2,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
@@ -255,16 +255,34 @@ class AuthUser(BaseModel):
     username: str
 
 
+# bcrypt silently has nothing to do with "72 characters" - it's a hard
+# 72-*byte* ceiling on the UTF-8-encoded input, and bcrypt 5.0.0 raises an
+# uncaught ValueError (not something src/main.py's signup()/login() ever
+# catches) for anything longer, turning an ordinary long passphrase into
+# an unhandled 500 instead of a clean 422. Validated here, once, for both
+# request shapes that carry a password, rather than in src/services/auth.py
+# itself - Pydantic's own validation error is what FastAPI already turns
+# into a 422 automatically, no new exception handling needed downstream.
+def _validate_bcrypt_password_length(password: str) -> str:
+    if len(password.encode("utf-8")) > 72:
+        raise ValueError("password must be at most 72 bytes")
+    return password
+
+
 class SignupRequest(BaseModel):
     email: str
     username: str = Field(min_length=3, max_length=30)
     password: str
+
+    _validate_password = field_validator("password")(_validate_bcrypt_password_length)
 
 
 class LoginRequest(BaseModel):
     # username, not email - see models.AppUser's own docstring for why.
     username: str
     password: str
+
+    _validate_password = field_validator("password")(_validate_bcrypt_password_length)
 
 
 class SavedStationOut(BaseModel):

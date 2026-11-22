@@ -90,3 +90,18 @@ def test_get_current_session_rejects_garbage_cookie() -> None:
     with pytest.raises(HTTPException) as exc_info:
         get_current_session(_request_with_cookie(SESSION_COOKIE_NAME, "garbage"))
     assert exc_info.value.status_code == 401
+
+
+def test_get_current_session_rejects_non_numeric_sub() -> None:
+    # A signature-valid token whose "sub" claim isn't numeric (a
+    # payload-shape change rolled out while old tokens are still live,
+    # say) should still just be an invalid session, not a 500.
+    settings = get_settings()
+    token = jwt.encode(
+        {"sub": "not-a-number", "email": "rider@example.com", "username": "rider"},
+        settings.secret_key,
+        algorithm="HS256",
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        get_current_session(_request_with_cookie(SESSION_COOKIE_NAME, token))
+    assert exc_info.value.status_code == 401
