@@ -1015,7 +1015,19 @@ async def login(body: LoginRequest, response: Response) -> AuthUser:
 
 @app.post("/auth/logout")
 async def logout(response: Response) -> dict[str, bool]:
-    response.delete_cookie(key=SESSION_COOKIE_NAME)
+    # Must match _set_session_cookie's attributes, not just its name - a
+    # browser silently ignores a Set-Cookie that tries to delete an
+    # existing Secure cookie unless the deleting response is itself marked
+    # Secure too (RFC 6265bis's "Leave Secure Cookies Alone"). Without
+    # this, logout would appear to work (the client clears its own `user`
+    # state) while the actual session cookie survived untouched in prod
+    # until its 30-day expiry.
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        samesite="lax",
+        secure=is_secure_cookie_env(),
+    )
     return {"ok": True}
 
 

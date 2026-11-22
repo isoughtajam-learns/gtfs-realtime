@@ -1431,6 +1431,34 @@ def test_signup_request_rejects_password_over_72_bytes() -> None:
         SignupRequest(email="rider@example.com", username="rider", password="x" * 73)
 
 
+def test_signup_request_rejects_password_under_8_chars() -> None:
+    with pytest.raises(ValueError):
+        SignupRequest(email="rider@example.com", username="rider", password="short")
+
+
+def test_signup_request_strips_username_and_email_whitespace() -> None:
+    body = SignupRequest(
+        email="  rider@example.com  ", username="  rider  ", password="password123"
+    )
+    assert body.email == "rider@example.com"
+    assert body.username == "rider"
+
+
+def test_signup_request_strips_before_enforcing_username_min_length() -> None:
+    # Stripped first, then length-checked - "  ab  " (6 chars) must not
+    # pass min_length=3 only to be trimmed down to "ab" (2 chars)
+    # afterward and stored under that too-short value.
+    with pytest.raises(ValueError):
+        SignupRequest(
+            email="rider@example.com", username="  ab  ", password="password123"
+        )
+
+
+def test_login_request_strips_username_whitespace() -> None:
+    body = LoginRequest(username="  rider  ", password="password123")
+    assert body.username == "rider"
+
+
 def test_login_request_rejects_password_over_72_bytes() -> None:
     with pytest.raises(ValueError):
         LoginRequest(username="rider", password="x" * 73)
@@ -1444,7 +1472,9 @@ def test_signup_sets_cookie_and_returns_email(monkeypatch: pytest.MonkeyPatch) -
 
     result = asyncio.run(
         signup(
-            SignupRequest(email="rider@example.com", username="rider", password="pw"),
+            SignupRequest(
+                email="rider@example.com", username="rider", password="password123"
+            ),
             response,
         )
     )
@@ -1462,7 +1492,9 @@ def test_signup_rejects_duplicate_email(monkeypatch: pytest.MonkeyPatch) -> None
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(
             signup(
-                SignupRequest(email="dup@example.com", username="rider", password="pw"),
+                SignupRequest(
+                    email="dup@example.com", username="rider", password="password123"
+                ),
                 Response(),
             )
         )
@@ -1479,7 +1511,9 @@ def test_signup_rejects_duplicate_username(monkeypatch: pytest.MonkeyPatch) -> N
         asyncio.run(
             signup(
                 SignupRequest(
-                    email="rider@example.com", username="dupname", password="pw"
+                    email="rider@example.com",
+                    username="dupname",
+                    password="password123",
                 ),
                 Response(),
             )
@@ -1496,12 +1530,12 @@ def test_login_succeeds_with_correct_password(monkeypatch: pytest.MonkeyPatch) -
             "id": 1,
             "email": "rider@example.com",
             "username": username,
-            "password_hash": hash_password("pw"),
+            "password_hash": hash_password("password123"),
         },
     )
 
     result = asyncio.run(
-        login(LoginRequest(username="rider", password="pw"), Response())
+        login(LoginRequest(username="rider", password="password123"), Response())
     )
     assert result == AuthUser(email="rider@example.com", username="rider")
 
@@ -1528,7 +1562,9 @@ def test_login_rejects_unknown_username(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr("src.main.get_user_by_username", lambda username: None)
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(login(LoginRequest(username="nobody", password="pw"), Response()))
+        asyncio.run(
+            login(LoginRequest(username="nobody", password="password123"), Response())
+        )
     assert exc_info.value.status_code == 401
 
 
@@ -1536,7 +1572,17 @@ def test_logout_clears_cookie() -> None:
     response = Response()
     result = asyncio.run(logout(response))
     assert result == {"ok": True}
-    assert any(b"session=" in value for _, value in response.raw_headers)
+    set_cookie_values = [
+        value for name, value in response.raw_headers if name == b"set-cookie"
+    ]
+    assert any(b"session=" in value for value in set_cookie_values)
+    # Must match _set_session_cookie's own attributes (httponly/samesite,
+    # and secure in prod) - a browser silently ignores a delete attempt
+    # for an existing Secure cookie unless the deleting response is itself
+    # marked Secure too, so a mismatch here would make logout a no-op in
+    # prod while looking like it worked.
+    assert any(b"httponly" in value.lower() for value in set_cookie_values)
+    assert any(b"samesite=lax" in value.lower() for value in set_cookie_values)
 
 
 def test_me_returns_current_user() -> None:

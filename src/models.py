@@ -269,11 +269,28 @@ def _validate_bcrypt_password_length(password: str) -> str:
     return password
 
 
+# Stripped before any length constraint runs (mode="before"), not after -
+# otherwise e.g. a 3-char username padded to 5 chars with spaces would
+# pass Field's own min_length=3 check first and only get trimmed back
+# below that minimum afterward, silently storing a too-short value Field
+# was supposed to reject.
+def _strip_whitespace(value: str) -> str:
+    return value.strip()
+
+
 class SignupRequest(BaseModel):
     email: str
     username: str = Field(min_length=3, max_length=30)
-    password: str
+    # min_length only here, not on LoginRequest below - this rejects a
+    # weak/empty password at account creation without also locking out
+    # login for some hypothetical already-existing short password (there
+    # is no "change password" flow yet to fix such an account into
+    # compliance, so login must keep verifying whatever hash is on file
+    # regardless of the plaintext's length).
+    password: str = Field(min_length=8)
 
+    _strip_email = field_validator("email", mode="before")(_strip_whitespace)
+    _strip_username = field_validator("username", mode="before")(_strip_whitespace)
     _validate_password = field_validator("password")(_validate_bcrypt_password_length)
 
 
@@ -282,6 +299,11 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+    # Stripped the same way SignupRequest.username is, so a trailing space
+    # left over from a copy-paste doesn't fail an otherwise-correct login -
+    # get_user_by_username's own lookup is already case-insensitive for the
+    # identical reason.
+    _strip_username = field_validator("username", mode="before")(_strip_whitespace)
     _validate_password = field_validator("password")(_validate_bcrypt_password_length)
 
 
