@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import requests
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from fastapi.sse import ServerSentEvent
 from google.protobuf.message import DecodeError
 
@@ -13,11 +13,20 @@ from generated import gtfs_realtime_pb2
 from src.main import (
     _entity_trip_id,
     _fetch_feed,
+    get_all_saved_stations,
     get_lines,
+    get_saved_stations,
     get_stops,
     get_transit_system_detail,
     get_transit_systems,
+    login,
+    logout,
+    me,
+    patch_saved_station,
+    remove_saved_station,
+    save_station,
     service_alerts,
+    signup,
     transit_feed,
     trip_detail,
 )
@@ -25,9 +34,20 @@ from src.models import (
     AffectedRoute,
     AffectedTrip,
     AlertActivePeriod,
+    AuthUser,
+    LoginRequest,
+    SavedStationCreate,
+    SavedStationUpdate,
+    SignupRequest,
     Status,
     TripPosition,
 )
+from src.services.saved_stations import (
+    SavedStationAlreadyExists,
+    SavedStationNotFound,
+    UnknownStopName,
+)
+from src.services.users import EmailAlreadyRegistered, UsernameAlreadyRegistered
 from src.services.realtime_feed_cache import RealtimeFeedCache
 from src.services.recent_events_cache import RecentEventsCache
 from src.services.schedule_cache import ScheduleCache
@@ -81,6 +101,7 @@ async def _first_event(transit_system: str) -> ServerSentEvent:
 
 def _mock_transit_system_config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
+        "id": 1,
         "realtime_url": "http://example.com/feed",
         "schedule_url": "http://example.com/gtfs.zip",
         "timezone": None,
@@ -1375,3 +1396,391 @@ def test_get_stops_returns_distinct_sorted_names(
     monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
 
     assert asyncio.run(get_stops("BART")) == ["Daly City", "Richmond"]
+
+
+# --- Phase 4 (.claude/plans/development.md): auth + saved stations ---
+
+
+def _stops_schedule_cache_return(stops: dict[str, str]) -> AsyncMock:
+    return AsyncMock(
+        return_value=(
+            {},
+            stops,
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            {},
+            [],
+            [],
+            {},
+        )
+    )
+
+
+def test_signup_request_rejects_password_over_72_bytes() -> None:
+    # bcrypt's own hard limit - confirmed live this PR to otherwise raise
+    # an uncaught ValueError inside signup() (an unhandled 500) rather
+    # than a clean 422 here at the request-validation boundary.
+    with pytest.raises(ValueError):
+        SignupRequest(email="rider@example.com", username="rider", password="x" * 73)
+
+
+def test_signup_request_rejects_password_under_8_chars() -> None:
+    with pytest.raises(ValueError):
+        SignupRequest(email="rider@example.com", username="rider", password="short")
+
+
+def test_signup_request_strips_username_and_email_whitespace() -> None:
+    body = SignupRequest(
+        email="  rider@example.com  ", username="  rider  ", password="password123"
+    )
+    assert body.email == "rider@example.com"
+    assert body.username == "rider"
+
+
+def test_signup_request_strips_before_enforcing_username_min_length() -> None:
+    # Stripped first, then length-checked - "  ab  " (6 chars) must not
+    # pass min_length=3 only to be trimmed down to "ab" (2 chars)
+    # afterward and stored under that too-short value.
+    with pytest.raises(ValueError):
+        SignupRequest(
+            email="rider@example.com", username="  ab  ", password="password123"
+        )
+
+
+def test_signup_request_rejects_non_ascii_username() -> None:
+    # get_user_by_username matches case-insensitively via SQL lower()
+    # (Postgres) vs. Python's str.lower() - two case-folding tables that
+    # can disagree on non-ASCII input on this project's musl-based
+    # Postgres image. ASCII-only sidesteps the mismatch entirely.
+    with pytest.raises(ValueError):
+        SignupRequest(
+            email="rider@example.com", username="Émile", password="password123"
+        )
+
+
+def test_login_request_strips_username_whitespace() -> None:
+    body = LoginRequest(username="  rider  ", password="password123")
+    assert body.username == "rider"
+
+
+def test_login_request_rejects_password_over_72_bytes() -> None:
+    with pytest.raises(ValueError):
+        LoginRequest(username="rider", password="x" * 73)
+
+
+def test_signup_sets_cookie_and_returns_email(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.main.create_user", lambda email, username, password_hash: 1
+    )
+    response = Response()
+
+    result = asyncio.run(
+        signup(
+            SignupRequest(
+                email="rider@example.com", username="rider", password="password123"
+            ),
+            response,
+        )
+    )
+
+    assert result == AuthUser(email="rider@example.com", username="rider")
+    set_cookie_values = [
+        value for name, value in response.raw_headers if name == b"set-cookie"
+    ]
+    assert any(b"session=" in value for value in set_cookie_values)
+    # Derived from SESSION_TTL (see main.py's _set_session_cookie) - not a
+    # separately-maintained literal that could silently drift from the
+    # JWT's own exp claim.
+    from src.services.auth import SESSION_TTL
+
+    expected_max_age = f"max-age={int(SESSION_TTL.total_seconds())}".encode()
+    assert any(expected_max_age in value.lower() for value in set_cookie_values)
+
+
+def test_signup_rejects_duplicate_email(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(email: str, username: str, password_hash: str) -> int:
+        raise EmailAlreadyRegistered(email)
+
+    monkeypatch.setattr("src.main.create_user", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            signup(
+                SignupRequest(
+                    email="dup@example.com", username="rider", password="password123"
+                ),
+                Response(),
+            )
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_signup_rejects_duplicate_username(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(email: str, username: str, password_hash: str) -> int:
+        raise UsernameAlreadyRegistered(username)
+
+    monkeypatch.setattr("src.main.create_user", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            signup(
+                SignupRequest(
+                    email="rider@example.com",
+                    username="dupname",
+                    password="password123",
+                ),
+                Response(),
+            )
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_login_succeeds_with_correct_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.services.auth import hash_password
+
+    monkeypatch.setattr(
+        "src.main.get_user_by_username",
+        lambda username: {
+            "id": 1,
+            "email": "rider@example.com",
+            "username": username,
+            "password_hash": hash_password("password123"),
+        },
+    )
+
+    result = asyncio.run(
+        login(LoginRequest(username="rider", password="password123"), Response())
+    )
+    assert result == AuthUser(email="rider@example.com", username="rider")
+
+
+def test_login_rejects_wrong_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.services.auth import hash_password
+
+    monkeypatch.setattr(
+        "src.main.get_user_by_username",
+        lambda username: {
+            "id": 1,
+            "email": "rider@example.com",
+            "username": username,
+            "password_hash": hash_password("pw"),
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(login(LoginRequest(username="rider", password="wrong"), Response()))
+    assert exc_info.value.status_code == 401
+
+
+def test_login_rejects_unknown_username(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_user_by_username", lambda username: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            login(LoginRequest(username="nobody", password="password123"), Response())
+        )
+    assert exc_info.value.status_code == 401
+
+
+def test_logout_clears_cookie() -> None:
+    response = Response()
+    result = asyncio.run(logout(response))
+    assert result == {"ok": True}
+    set_cookie_values = [
+        value for name, value in response.raw_headers if name == b"set-cookie"
+    ]
+    assert any(b"session=" in value for value in set_cookie_values)
+    # Must match _set_session_cookie's own attributes (httponly/samesite,
+    # and secure in prod) - a browser silently ignores a delete attempt
+    # for an existing Secure cookie unless the deleting response is itself
+    # marked Secure too, so a mismatch here would make logout a no-op in
+    # prod while looking like it worked.
+    assert any(b"httponly" in value.lower() for value in set_cookie_values)
+    assert any(b"samesite=lax" in value.lower() for value in set_cookie_values)
+
+
+def test_me_returns_current_user() -> None:
+    user = AuthUser(email="rider@example.com", username="rider")
+    result = asyncio.run(me(user=user))
+    assert result == user
+
+
+def test_save_station_404s_for_unknown_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for())
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            save_station("NotASystem", SavedStationCreate(stop_name="X"), user_id=1)
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_save_station_404s_for_unknown_stop_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr(
+        ScheduleCache, "get", _stops_schedule_cache_return({"S1": "Embarcadero"})
+    )
+
+    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise UnknownStopName("Nowhere")
+
+    monkeypatch.setattr("src.main.create_saved_station", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            save_station("BART", SavedStationCreate(stop_name="Nowhere"), user_id=1)
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_save_station_409s_on_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr(
+        ScheduleCache, "get", _stops_schedule_cache_return({"S1": "Embarcadero"})
+    )
+
+    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise SavedStationAlreadyExists("Embarcadero")
+
+    monkeypatch.setattr("src.main.create_saved_station", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            save_station("BART", SavedStationCreate(stop_name="Embarcadero"), user_id=1)
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_save_station_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr(
+        ScheduleCache, "get", _stops_schedule_cache_return({"S1": "Embarcadero"})
+    )
+    monkeypatch.setattr(
+        "src.main.create_saved_station",
+        lambda *args, **kwargs: {
+            "stop_name": "Embarcadero",
+            "alert_enabled": True,
+            "alert_lead_minutes": 5,
+        },
+    )
+
+    result = asyncio.run(
+        save_station("BART", SavedStationCreate(stop_name="Embarcadero"), user_id=1)
+    )
+    assert result.stop_name == "Embarcadero"
+    assert result.alert_enabled is True
+
+
+def test_get_saved_stations_404s_for_unknown_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for())
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(get_saved_stations("NotASystem", user_id=1))
+    assert exc_info.value.status_code == 404
+
+
+def test_get_saved_stations_returns_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr(
+        "src.main.list_saved_stations_for_system",
+        lambda user_id, transit_system_id: [
+            {"stop_name": "Embarcadero", "alert_enabled": True, "alert_lead_minutes": 5}
+        ],
+    )
+
+    result = asyncio.run(get_saved_stations("BART", user_id=1))
+    assert len(result) == 1
+    assert result[0].stop_name == "Embarcadero"
+
+
+def test_get_all_saved_stations_returns_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.main.list_all_saved_stations",
+        lambda user_id: [
+            {
+                "stop_name": "Embarcadero",
+                "alert_enabled": True,
+                "alert_lead_minutes": 5,
+                "transit_system": "BART",
+            }
+        ],
+    )
+
+    result = asyncio.run(get_all_saved_stations(user_id=1))
+    assert result[0].transit_system == "BART"
+
+
+def test_patch_saved_station_404s_when_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise SavedStationNotFound("Nowhere")
+
+    monkeypatch.setattr("src.main.update_saved_station", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            patch_saved_station(
+                "BART", "Nowhere", SavedStationUpdate(alert_enabled=False), user_id=1
+            )
+        )
+    assert exc_info.value.status_code == 404
+
+
+def test_patch_saved_station_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr(
+        "src.main.update_saved_station",
+        lambda *args, **kwargs: {
+            "stop_name": "Embarcadero",
+            "alert_enabled": False,
+            "alert_lead_minutes": 10,
+        },
+    )
+
+    result = asyncio.run(
+        patch_saved_station(
+            "BART",
+            "Embarcadero",
+            SavedStationUpdate(alert_enabled=False, alert_lead_minutes=10),
+            user_id=1,
+        )
+    )
+    assert result.alert_enabled is False
+    assert result.alert_lead_minutes == 10
+
+
+def test_remove_saved_station_404s_when_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise SavedStationNotFound("Nowhere")
+
+    monkeypatch.setattr("src.main.delete_saved_station", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(remove_saved_station("BART", "Nowhere", user_id=1))
+    assert exc_info.value.status_code == 404
+
+
+def test_remove_saved_station_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr("src.main.delete_saved_station", lambda *args, **kwargs: None)
+
+    assert asyncio.run(remove_saved_station("BART", "Embarcadero", user_id=1)) is None
