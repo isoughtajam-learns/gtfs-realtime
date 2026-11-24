@@ -10,6 +10,7 @@ from src.services.saved_stations import (
     SavedStationAlreadyExists,
     SavedStationNotFound,
     UnknownStopName,
+    UnknownUser,
     create_saved_station,
     delete_saved_station,
     list_all_saved_stations,
@@ -87,6 +88,18 @@ def test_create_rejects_duplicate(user_id: int, transit_system_id: int) -> None:
     with pytest.raises(SavedStationAlreadyExists):
         create_saved_station(
             user_id, transit_system_id, "Powell St", KNOWN_STOPS, True, 5
+        )
+
+
+def test_create_rejects_unknown_user(transit_system_id: int) -> None:
+    # A session cookie's JWT can still decode for a user row that's since
+    # been deleted (get_current_session never hits the DB - see
+    # src/services/auth.py) - this is the FK violation that previously got
+    # mislabeled as SavedStationAlreadyExists by a bare `except
+    # IntegrityError`, rather than surfaced as the dead session it is.
+    with pytest.raises(UnknownUser):
+        create_saved_station(
+            999_999_999, transit_system_id, "Powell St", KNOWN_STOPS, True, 5
         )
 
 
