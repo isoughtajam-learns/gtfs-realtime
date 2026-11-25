@@ -57,6 +57,7 @@ from src.services.saved_stations import (
     SavedStationAlreadyExists,
     SavedStationNotFound,
     UnknownStopName,
+    UnknownUser,
     create_saved_station,
     delete_saved_station,
     list_all_saved_stations,
@@ -1110,6 +1111,14 @@ async def save_station(
     except SavedStationAlreadyExists:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Station already saved"
+        )
+    except UnknownUser:
+        # Same session-is-dead signal get_current_session itself raises
+        # (src/services/auth.py) - a stateless JWT can still decode for a
+        # user row that's since been deleted, and this is the first write
+        # path that would ever notice.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
         )
     return SavedStationOut(**row)
 
