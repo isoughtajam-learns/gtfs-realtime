@@ -10,9 +10,9 @@ from sqlalchemy.exc import IntegrityError
 from src.database import engine
 from src.models import AppUser
 
-EMAIL_UNIQUE_CONSTRAINT = "uq_app_user_email"
-# Index, not a plain UniqueConstraint - see AppUser's own docstring for why
-# username uniqueness/lookup has to be case-insensitive.
+# Both are indexes, not plain UniqueConstraints - see AppUser's own
+# docstring for why email/username uniqueness has to be case-insensitive.
+EMAIL_UNIQUE_CONSTRAINT = "uq_app_user_email_lower"
 USERNAME_UNIQUE_CONSTRAINT = "uq_app_user_username_lower"
 
 
@@ -42,15 +42,21 @@ def create_user(email: str, username: str, password_hash: str) -> int:
             # psycopg2 exposes which unique constraint fired via
             # orig.diag.constraint_name - distinguishing them here gives
             # the endpoint a clean "which field conflicted" 409 instead of
-            # a generic one. Defaults to the email case if the constraint
-            # name is ever missing/unrecognized (e.g. a driver swap) -
-            # still a 409, just a less specific message.
+            # a generic one. Checks both constraint names explicitly rather
+            # than defaulting unrecognized ones to the email case - these
+            # are the only two unique constraints app_user has today, but
+            # a future third one should surface as whatever the caller's
+            # generic exception handling does with an unmapped
+            # IntegrityError, not get silently misreported as "email
+            # already registered".
             constraint_name = getattr(
                 getattr(exc.orig, "diag", None), "constraint_name", None
             )
             if constraint_name == USERNAME_UNIQUE_CONSTRAINT:
                 raise UsernameAlreadyRegistered(username) from exc
-            raise EmailAlreadyRegistered(email) from exc
+            if constraint_name == EMAIL_UNIQUE_CONSTRAINT:
+                raise EmailAlreadyRegistered(email) from exc
+            raise
 
 
 def get_user_by_username(username: str) -> Optional[dict[str, Any]]:

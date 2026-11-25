@@ -338,15 +338,18 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
     if system_timezone is not None:
         try:
             local_tz = ZoneInfo(system_timezone)
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             # agency.txt's agency_timezone is free text, not guaranteed to
             # be the IANA-canonical spelling - AC_Transit's says
             # "US/Pacific" (a legacy backward-compatibility alias for
             # "America/Los_Angeles"), and not every tzdata install ships
-            # those legacy links. Logged once per connection (not inside the
-            # loop below, which would spam this every 30s) and treated the
-            # same as "timezone isn't known at all" - fail open rather than
-            # letting an unresolvable string crash the whole stream.
+            # those legacy links. A malformed/empty string (ValueError,
+            # distinct from ZoneInfoNotFoundError's "well-formed key, just
+            # not found") is just as fail-open a case. Logged once per
+            # connection (not inside the loop below, which would spam this
+            # every 30s) and treated the same as "timezone isn't known at
+            # all" - fail open rather than letting an unresolvable string
+            # crash the whole stream.
             logger.error(
                 f"Unknown IANA timezone {system_timezone!r} for {transit_system}"
             )
@@ -1069,7 +1072,15 @@ async def save_station(
     body: SavedStationCreate,
     user_id: int = Depends(get_current_user_id),
 ) -> SavedStationOut:
-    config = await asyncio.to_thread(get_transit_system_config, transit_system)
+    # Independent of each other - ScheduleCache.get() doesn't need config's
+    # result, and resolves to empty data rather than raising for an
+    # unknown transit_system (see its own _load) - so awaiting them
+    # together costs nothing extra on the 404 path and saves a full round
+    # trip on the common one.
+    config, schedule = await asyncio.gather(
+        asyncio.to_thread(get_transit_system_config, transit_system),
+        ScheduleCache.get(transit_system),
+    )
     if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
@@ -1090,7 +1101,7 @@ async def save_station(
         _calendar_rows,
         _calendar_date_rows,
         _operating_windows_by_service_id,
-    ) = await ScheduleCache.get(transit_system)
+    ) = schedule
     known_stop_names = set(stops.values())
 
     try:
