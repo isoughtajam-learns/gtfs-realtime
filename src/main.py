@@ -1072,19 +1072,19 @@ async def save_station(
     body: SavedStationCreate,
     user_id: int = Depends(get_current_user_id),
 ) -> SavedStationOut:
-    # Independent of each other - ScheduleCache.get() doesn't need config's
-    # result, and resolves to empty data rather than raising for an
-    # unknown transit_system (see its own _load) - so awaiting them
-    # together costs nothing extra on the 404 path and saves a full round
-    # trip on the common one.
-    config, schedule = await asyncio.gather(
-        asyncio.to_thread(get_transit_system_config, transit_system),
-        ScheduleCache.get(transit_system),
-    )
+    config = await asyncio.to_thread(get_transit_system_config, transit_system)
     if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
         )
+    # NOT run concurrently with the config lookup above via asyncio.gather,
+    # despite the two being independent once config is known good - tried
+    # that, and it breaks this function's existing short-circuit: an
+    # unknown transit_system would still call ScheduleCache.get() (and
+    # thus _load(), a real DB query) before the 404 above ever has a
+    # chance to skip it. Confirmed live in CI: a bogus-system test that
+    # only mocks get_transit_system_config started failing with a real
+    # connection error from the now-unconditional ScheduleCache.get() call.
     (
         _trips,
         stops,
@@ -1101,7 +1101,7 @@ async def save_station(
         _calendar_rows,
         _calendar_date_rows,
         _operating_windows_by_service_id,
-    ) = schedule
+    ) = await ScheduleCache.get(transit_system)
     known_stop_names = set(stops.values())
 
     try:
