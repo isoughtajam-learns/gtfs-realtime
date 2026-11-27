@@ -46,6 +46,7 @@ from src.services.saved_stations import (
     SavedStationAlreadyExists,
     SavedStationNotFound,
     UnknownStopName,
+    UnknownUser,
 )
 from src.services.users import EmailAlreadyRegistered, UsernameAlreadyRegistered
 from src.services.realtime_feed_cache import RealtimeFeedCache
@@ -1658,6 +1659,24 @@ def test_save_station_409s_on_duplicate(monkeypatch: pytest.MonkeyPatch) -> None
             save_station("BART", SavedStationCreate(stop_name="Embarcadero"), user_id=1)
         )
     assert exc_info.value.status_code == 409
+
+
+def test_save_station_401s_for_unknown_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.main.get_transit_system_config", _active_for("BART"))
+    monkeypatch.setattr(
+        ScheduleCache, "get", _stops_schedule_cache_return({"S1": "Embarcadero"})
+    )
+
+    def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise UnknownUser(1)
+
+    monkeypatch.setattr("src.main.create_saved_station", _boom)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            save_station("BART", SavedStationCreate(stop_name="Embarcadero"), user_id=1)
+        )
+    assert exc_info.value.status_code == 401
 
 
 def test_save_station_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:

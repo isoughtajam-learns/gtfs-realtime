@@ -32,6 +32,16 @@ class SavedStationNotFound(Exception):
     pass
 
 
+class UnknownUser(Exception):
+    """Raised when user_id's FK fails on insert - a session cookie whose
+    JWT still verifies but whose user row is gone (deleted account, or a
+    stale/forged user_id). get_current_session (src/services/auth.py) is
+    stateless and never checks the DB, so this is the only point that
+    would ever catch it."""
+
+    pass
+
+
 def list_saved_stations_for_system(
     user_id: int, transit_system_id: int
 ) -> list[dict[str, object]]:
@@ -95,7 +105,22 @@ def create_saved_station(
                 )
             )
         except IntegrityError as exc:
-            raise SavedStationAlreadyExists(stop_name) from exc
+            # Not every IntegrityError here is the uniqueness conflict the
+            # endpoint wants to report - psycopg2 names the actual
+            # constraint on exc.orig.diag, so this checks which one
+            # actually fired instead of assuming. Confirmed live: a
+            # session cookie for a since-deleted user hits user_id's FK,
+            # not uq_saved_station, and was previously misreported to the
+            # client as "Station already saved" instead of the real
+            # "this session's user no longer exists".
+            constraint_name = getattr(
+                getattr(exc.orig, "diag", None), "constraint_name", None
+            )
+            if constraint_name == "uq_saved_station":
+                raise SavedStationAlreadyExists(stop_name) from exc
+            if constraint_name == "saved_station_user_id_fkey":
+                raise UnknownUser(user_id) from exc
+            raise
 
     return {
         "stop_name": stop_name,
