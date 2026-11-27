@@ -763,14 +763,16 @@ class AppUser(ORMBase):
     app_user, not user - "user" is a reserved word in Postgres (maps to
     CURRENT_USER) and, while quotable, isn't worth the footgun.
 
-    username uniqueness/lookup is case-insensitive (a functional unique
-    index on lower(username), not a plain UniqueConstraint) - stored
-    casing is preserved for display, but "Alice" and "alice" can't both
-    register, and either logs in as the same account. Confirmed live this
-    was the actual UX bug: a case-sensitive match on a username backfilled
-    from an email's (lowercase) local part rejected any differently-cased
-    login attempt with the same generic 401 as a wrong password, giving
-    no signal that case was the problem."""
+    Both username and email uniqueness/lookup are case-insensitive
+    (functional unique indexes on lower(...), not plain UniqueConstraints)
+    - stored casing is preserved for display, but two differently-cased
+    values for "the same" identifier can't both register. Confirmed live
+    for username this was an actual UX bug: a case-sensitive match on a
+    username backfilled from an email's (lowercase) local part rejected
+    any differently-cased login attempt with the same generic 401 as a
+    wrong password, giving no signal that case was the problem. email has
+    no login-by-email flow yet, but the same bug class applies the moment
+    one exists, so it's made consistent here rather than left to repeat."""
 
     __tablename__ = "app_user"
 
@@ -781,13 +783,14 @@ class AppUser(ORMBase):
     created_at: Mapped[datetime]
 
     __table_args__ = (
-        UniqueConstraint("email", name="uq_app_user_email"),
-        # A plain UniqueConstraint("username", ...) is case-sensitive -
-        # this functional index on lower(username) is what actually makes
-        # uniqueness (and the lookup in get_user_by_username below) treat
-        # "Alice"/"alice" as the same account. References the column by
-        # its string name, not AppUser.username - at this point in the
-        # class body the declarative attribute isn't built yet.
+        # Plain UniqueConstraint("email"/"username", ...) is
+        # case-sensitive - these functional indexes on lower(...) are what
+        # actually make uniqueness (and username's lookup in
+        # get_user_by_username below) treat "Alice"/"alice" as the same
+        # value. Reference the columns by their string names, not
+        # AppUser.email/AppUser.username - at this point in the class body
+        # the declarative attributes aren't built yet.
+        Index("uq_app_user_email_lower", text("lower(email)"), unique=True),
         Index("uq_app_user_username_lower", text("lower(username)"), unique=True),
     )
 

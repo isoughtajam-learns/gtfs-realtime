@@ -144,7 +144,11 @@ def update_saved_station(
 
     with engine.begin() as connection:
         if values:
-            result = connection.execute(
+            # UPDATE...RETURNING in one round trip, same as
+            # create_saved_station's insert above - a separate SELECT
+            # after the UPDATE would cost an avoidable extra query on every
+            # PATCH, and leave a narrow TOCTOU window between the two.
+            row = connection.execute(
                 update(SavedStation)
                 .where(
                     SavedStation.user_id == user_id,
@@ -152,20 +156,26 @@ def update_saved_station(
                     SavedStation.stop_name == stop_name,
                 )
                 .values(**values)
-            )
-            if result.rowcount == 0:
-                raise SavedStationNotFound(stop_name)
-        row = connection.execute(
-            select(
-                SavedStation.stop_name,
-                SavedStation.alert_enabled,
-                SavedStation.alert_lead_minutes,
-            ).where(
-                SavedStation.user_id == user_id,
-                SavedStation.transit_system_id == transit_system_id,
-                SavedStation.stop_name == stop_name,
-            )
-        ).first()
+                .returning(
+                    SavedStation.stop_name,
+                    SavedStation.alert_enabled,
+                    SavedStation.alert_lead_minutes,
+                )
+            ).first()
+        else:
+            # Nothing to update (both fields omitted) - just report the
+            # row's current state, the same as a successful update would.
+            row = connection.execute(
+                select(
+                    SavedStation.stop_name,
+                    SavedStation.alert_enabled,
+                    SavedStation.alert_lead_minutes,
+                ).where(
+                    SavedStation.user_id == user_id,
+                    SavedStation.transit_system_id == transit_system_id,
+                    SavedStation.stop_name == stop_name,
+                )
+            ).first()
     if row is None:
         raise SavedStationNotFound(stop_name)
     return row._asdict()

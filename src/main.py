@@ -339,15 +339,18 @@ async def transit_feed(transit_system: str) -> AsyncGenerator[ServerSentEvent, N
     if system_timezone is not None:
         try:
             local_tz = ZoneInfo(system_timezone)
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             # agency.txt's agency_timezone is free text, not guaranteed to
             # be the IANA-canonical spelling - AC_Transit's says
             # "US/Pacific" (a legacy backward-compatibility alias for
             # "America/Los_Angeles"), and not every tzdata install ships
-            # those legacy links. Logged once per connection (not inside the
-            # loop below, which would spam this every 30s) and treated the
-            # same as "timezone isn't known at all" - fail open rather than
-            # letting an unresolvable string crash the whole stream.
+            # those legacy links. A malformed/empty string (ValueError,
+            # distinct from ZoneInfoNotFoundError's "well-formed key, just
+            # not found") is just as fail-open a case. Logged once per
+            # connection (not inside the loop below, which would spam this
+            # every 30s) and treated the same as "timezone isn't known at
+            # all" - fail open rather than letting an unresolvable string
+            # crash the whole stream.
             logger.error(
                 f"Unknown IANA timezone {system_timezone!r} for {transit_system}"
             )
@@ -1075,6 +1078,14 @@ async def save_station(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Unknown transit system"
         )
+    # NOT run concurrently with the config lookup above via asyncio.gather,
+    # despite the two being independent once config is known good - tried
+    # that, and it breaks this function's existing short-circuit: an
+    # unknown transit_system would still call ScheduleCache.get() (and
+    # thus _load(), a real DB query) before the 404 above ever has a
+    # chance to skip it. Confirmed live in CI: a bogus-system test that
+    # only mocks get_transit_system_config started failing with a real
+    # connection error from the now-unconditional ScheduleCache.get() call.
     (
         _trips,
         stops,
