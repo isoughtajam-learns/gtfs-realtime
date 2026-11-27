@@ -1044,6 +1044,18 @@ class Fetcher:
             return
 
         transit_system_id = self.select_transit_system(connection)
+        if transit_system_id is None:
+            # Unreachable via the real do_upserts() call path, which
+            # already returns early if upsert_transit_system() couldn't
+            # resolve a row (see its docstring) - but select_transit_system
+            # is typed int | None, and writing a row with
+            # transit_system_id=None would otherwise fail the NOT NULL/FK
+            # constraint instead of skipping cleanly, the same way a
+            # missing transfers.txt does above.
+            logger.info(
+                f"No transit system row for {self.transit_system} - skipping transfers upsert"
+            )
+            return
 
         rows_to_write = []
         with open(path, "r", encoding="utf-8-sig") as f:
@@ -1105,6 +1117,12 @@ class Fetcher:
             return
 
         transit_system_id = self.select_transit_system(connection)
+        if transit_system_id is None:
+            # Same unreachable-in-practice guard as upsert_transfers above.
+            logger.info(
+                f"No transit system row for {self.transit_system} - skipping calendar upsert"
+            )
+            return
         weekday_columns = (
             "monday",
             "tuesday",
@@ -1159,6 +1177,12 @@ class Fetcher:
             return
 
         transit_system_id = self.select_transit_system(connection)
+        if transit_system_id is None:
+            # Same unreachable-in-practice guard as upsert_transfers above.
+            logger.info(
+                f"No transit system row for {self.transit_system} - skipping calendar_dates upsert"
+            )
+            return
         rows_to_write = []
         with open(path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
