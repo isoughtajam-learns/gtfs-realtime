@@ -25,6 +25,11 @@ dependencies = [
     "opentelemetry-exporter-otlp",
     "bcrypt>=5.0.0",
     "pyjwt>=2.15.1",
+    # pydantic.EmailStr's runtime format check - already pulled in
+    # transitively via fastapi[standard] -> fastapi-cloud-cli ->
+    # pydantic[email], but declared directly since SignupRequest now
+    # depends on it explicitly, not just incidentally.
+    "email-validator>=2.3.0",
 
     # Debian's own tzdata package (installed via apt by the base image) no
     # longer ships the IANA "backward" compatibility links - zone names

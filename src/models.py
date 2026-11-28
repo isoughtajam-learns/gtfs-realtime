@@ -2,7 +2,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
@@ -279,7 +279,11 @@ def _strip_whitespace(value: str) -> str:
 
 
 class SignupRequest(BaseModel):
-    email: str
+    # EmailStr (needs the email-validator package - see pyproject.toml)
+    # rejects a malformed address at signup time (a 422, same as
+    # username's own charset/length checks below) instead of storing it
+    # as the account's contact/recovery identifier unchecked.
+    email: EmailStr
     # ASCII-only, not just a length bound - get_user_by_username matches
     # case-insensitively via SQL lower() (Postgres) vs. Python's
     # username.lower(), two different case-folding tables that can

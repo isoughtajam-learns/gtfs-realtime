@@ -1437,6 +1437,11 @@ def test_signup_request_rejects_password_under_8_chars() -> None:
         SignupRequest(email="rider@example.com", username="rider", password="short")
 
 
+def test_signup_request_rejects_malformed_email() -> None:
+    with pytest.raises(ValueError):
+        SignupRequest(email="not-an-email", username="rider", password="password123")
+
+
 def test_signup_request_strips_username_and_email_whitespace() -> None:
     body = SignupRequest(
         email="  rider@example.com  ", username="  rider  ", password="password123"
